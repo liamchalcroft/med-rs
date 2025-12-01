@@ -9,213 +9,188 @@ Python API
 Core Functions
 ~~~~~~~~~~~~~~
 
-.. autoclass:: medrs.MedicalImage
-   :members:
-   :undoc-members:
-   :show-inheritance:
+.. py:class:: medrs.MedicalImage
+
+   Core medical image class representing volumetric data with metadata.
+
+   .. py:attribute:: shape
+      :type: tuple
+
+      Image dimensions (D, H, W) or (C, D, H, W).
+
+   .. py:attribute:: spacing
+      :type: tuple
+
+      Voxel spacing in mm.
+
+   .. py:attribute:: affine
+      :type: numpy.ndarray
+
+      4x4 affine transformation matrix.
+
+   .. py:method:: to_numpy()
+
+      Convert to numpy array.
+
+   .. py:method:: to_torch(device=None, dtype=None)
+
+      Convert to PyTorch tensor.
+
+   .. py:method:: save(path)
+
+      Save to NIfTI file.
 
 Loading Functions
 ~~~~~~~~~~~~~~~~~
 
-.. autofunction:: medrs.load
-.. autofunction:: medrs.load_cropped
-.. autofunction:: medrs.load_cropped_to_torch
-.. autofunction:: medrs.load_cropped_to_jax
-.. autofunction:: medrs.load_resampled
+.. py:function:: medrs.load(path)
+
+   Load a NIfTI file.
+
+   :param path: Path to NIfTI file (.nii or .nii.gz)
+   :type path: str
+   :returns: Loaded medical image
+   :rtype: MedicalImage
+
+.. py:function:: medrs.load_cropped(path, crop_offset, crop_shape)
+
+   Load only a cropped region from a NIfTI file.
+
+   :param path: Path to NIfTI file
+   :param crop_offset: Starting coordinates [x, y, z]
+   :param crop_shape: Size of crop region [x, y, z]
+   :returns: Cropped medical image
+
+.. py:function:: medrs.load_to_torch(path, dtype=None, device="cpu")
+
+   Load NIfTI directly to PyTorch tensor.
+
+   :param path: Path to NIfTI file
+   :param dtype: PyTorch dtype (default: float32)
+   :param device: Target device
+   :returns: PyTorch tensor
 
 Transform Functions
 ~~~~~~~~~~~~~~~~~~~
 
-.. autofunction:: medrs.z_normalization
-.. autofunction:: medrs.rescale_intensity
-.. autofunction:: medrs.clamp
-.. autofunction:: medrs.resample
-.. autofunction:: medrs.reorient
-.. autofunction:: medrs.crop_or_pad
+.. py:function:: medrs.z_normalization(image)
 
-Random Augmentation Functions
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   Z-score normalize an image (zero mean, unit variance).
 
-.. autofunction:: medrs.random_flip
-.. autofunction:: medrs.random_gaussian_noise
-.. autofunction:: medrs.random_intensity_scale
-.. autofunction:: medrs.random_intensity_shift
-.. autofunction:: medrs.random_rotate_90
-.. autofunction:: medrs.random_gamma
-.. autofunction:: medrs.random_augment
+.. py:function:: medrs.rescale_intensity(image, output_range=(0.0, 1.0))
+
+   Rescale intensity to the provided range.
+
+.. py:function:: medrs.clamp(image, min_value, max_value)
+
+   Clamp intensity values to a range.
+
+.. py:function:: medrs.resample(image, target_spacing, method=None)
+
+   Resample to target voxel spacing.
+
+.. py:function:: medrs.reorient(image, orientation)
+
+   Reorient to target orientation (e.g., "RAS", "LPS").
+
+.. py:function:: medrs.crop_or_pad(image, target_shape)
+
+   Crop or pad to target shape.
+
+Random Augmentation
+~~~~~~~~~~~~~~~~~~~
+
+.. py:function:: medrs.random_flip(image, axes, prob=0.5, seed=None)
+
+   Random axis flipping.
+
+.. py:function:: medrs.random_gaussian_noise(image, std=0.1, seed=None)
+
+   Add random Gaussian noise.
+
+.. py:function:: medrs.random_intensity_scale(image, scale_range=0.1, seed=None)
+
+   Random intensity scaling.
+
+.. py:function:: medrs.random_intensity_shift(image, shift_range=0.1, seed=None)
+
+   Random intensity shift.
+
+.. py:function:: medrs.random_rotate_90(image, axes, seed=None)
+
+   Random 90-degree rotation.
+
+.. py:function:: medrs.random_gamma(image, gamma_range=(0.7, 1.5), seed=None)
+
+   Random gamma correction.
+
+.. py:function:: medrs.random_augment(image, seed=None)
+
+   Combined random augmentation pipeline.
 
 Transform Pipeline
 ~~~~~~~~~~~~~~~~~~
 
-.. autoclass:: medrs.TransformPipeline
-   :members:
-   :undoc-members:
+.. py:class:: medrs.TransformPipeline(lazy=True)
+
+   Composable transform pipeline with lazy evaluation.
+
+   .. py:method:: z_normalize()
+
+      Add z-score normalization.
+
+   .. py:method:: clamp(min, max)
+
+      Add intensity clamping.
+
+   .. py:method:: resample_to_spacing(spacing)
+
+      Add resampling to target spacing.
+
+   .. py:method:: resample_to_shape(shape)
+
+      Add resampling to target shape.
+
+   .. py:method:: apply(image)
+
+      Apply pipeline to an image.
 
 Training Pipeline
 ~~~~~~~~~~~~~~~~~
 
-.. autoclass:: medrs.PyTrainingDataLoader
-   :members:
-   :undoc-members:
+.. py:class:: medrs.TrainingDataLoader(volumes, patch_size, patches_per_volume, patch_overlap, randomize, cache_size=None)
 
-Exception Hierarchy
-~~~~~~~~~~~~~~~~~~~
+   High-performance training data loader with prefetching and caching.
 
-.. automodule:: medrs.exceptions
-   :members:
-   :undoc-members:
-   :show-inheritance:
+   .. py:method:: next_patch()
 
-Performance Profiling
-~~~~~~~~~~~~~~~~~~~~~
+      Get next training patch.
 
-.. automodule:: medrs.performance_profiler
-   :members:
-   :undoc-members:
+   .. py:method:: reset()
+
+      Reset loader to beginning.
 
 Rust API
 --------
 
-Core Types
-~~~~~~~~~~
+For Rust API documentation, see the generated docs at `docs.rs/medrs <https://docs.rs/medrs>`_.
 
-Medical Image
-^^^^^^^^^^^^^
+Core modules:
 
-.. rust:type:: medrs::core::MedicalImage<T>
+- ``medrs::nifti`` - NIfTI I/O operations
+- ``medrs::transforms`` - Image transformations
+- ``medrs::pipeline`` - Transform pipelines
 
-The core medical image type that represents volumetric medical data with associated metadata.
+Example usage:
 
-**Fields**
+.. code-block:: rust
 
-- ``data``: ``Array3<T>`` - The volumetric data
-- ``spacing``: ``[f64; 3]`` - Voxel spacing in mm [x, y, z]
-- ``orientation``: ``Matrix3<f64>`` - Orientation matrix
-- ``origin``: ``[f64; 3]`` - World coordinates origin
+   use medrs::nifti;
+   use medrs::transforms::z_normalization;
 
-**Examples**
-
-```rust
-use medrs::nifti;
-use medrs::transforms::z_normalization;
-
-// Load a NIfTI file
-let img = nifti::load("brain.nii.gz")?;
-
-// Apply transforms
-let normalized = z_normalization(&img);
-
-println!("Image shape: {:?}", normalized.data.shape());
-println!("Spacing: {:?}", normalized.spacing);
-```
-
-NIfTI Module
-^^^^^^^^^^^^
-
-.. rust:mod:: medrs::nifti
-
-High-performance NIfTI I/O operations with byte-exact loading and crop-first optimization.
-
-**Key Functions**
-
-- ``nifti::load(path: &str) -> Result<MedicalImage<f32>>`` - Load NIfTI file
-- ``nifti::save(img: &MedicalImage<T>, path: &str) -> Result<()>`` - Save NIfTI file
-- ``nifti::load_cropped(path: &str, offset: [usize; 3], shape: [usize; 3]) -> Result<MedicalImage<T>>`` - Crop-first loading
-
-Transforms Module
-^^^^^^^^^^^^^^^^^
-
-.. rust:mod:: medrs::transforms
-
-High-performance image transformations with SIMD optimization.
-
-**Key Functions**
-
-- ``z_normalization(img: &MedicalImage<T>) -> MedicalImage<T>`` - Z-score normalization
-- ``rescale_intensity(img: &MedicalImage<T>, min: T, max: T) -> MedicalImage<T>`` - Intensity rescaling
-- ``resample_to_spacing(img: &MedicalImage<T>, spacing: [f64; 3], interp: Interpolation) -> MedicalImage<T>`` - Resampling
-
-Pipeline Module
-^^^^^^^^^^^^^^^
-
-.. rust:mod:: medrs::pipeline
-
-Memory-optimized data pipelines for training workflows.
-
-**Key Types**
-
-- ``TrainingDataLoader`` - High-throughput data loader with caching
-- ``PatchSampler`` - Configurable patch sampling strategies
-
-Performance Considerations
---------------------------
-
-Memory Efficiency
-~~~~~~~~~~~~~~~~~
-
-medrs is designed for optimal memory usage:
-
-- **Crop-first loading**: Only load the bytes you actually need (40x memory reduction)
-- **Zero-copy operations**: Direct tensor creation without intermediate copies
-- **Memory mapping**: Efficient access to large uncompressed files
-
-Thread Safety
-~~~~~~~~~~~~~
-
-Most operations are thread-safe and designed for parallel processing:
-
-- **SIMD optimization**: Vectorized operations for hot paths
-- **Rayon integration**: Easy parallelization of batch operations
-- **Lock-free data structures**: Minimized contention in multi-threaded scenarios
-
-GPU Integration
-~~~~~~~~~~~~~~~
-
-Direct GPU memory operations:
-
-```python
-# Direct to GPU loading
-tensor = medrs.load_cropped_to_torch(
-    "volume.nii.gz",
-    output_shape=[64, 64, 64],
-    device="cuda",
-    dtype=torch.float16
-)
-```
-
-Error Handling
---------------
-
-medrs uses a structured error hierarchy for actionable error messages:
-
-.. code-block:: python
-
-   try:
-       img = medrs.load("invalid_file.nii.gz")
-   except medrs.exceptions.FileNotFoundError as e:
-       print(f"File not found: {e}")
-       print("Suggestion:", e.suggestions[0])
-
-For complete error handling documentation, see :doc:`../guides/error_handling`.
-
-Type Safety
------------
-
-medrs uses Rust's type system and Python type hints for compile-time safety:
-
-```rust
-// Compile-time guarantee of valid operations
-fn process_image<T: Float + Send + Sync>(img: &MedicalImage<T>) -> MedicalImage<T> {
-    // Type-safe operations
-}
-```
-
-```python
-# Runtime type checking with Python hints
-def load_cropped(
-    path: str,
-    output_shape: Sequence[int],
-    dtype: Optional[torch.dtype] = None
-) -> torch.Tensor:
-    # Type-annotated implementation
-```
+   fn main() -> medrs::Result<()> {
+       let img = nifti::load("brain.nii.gz")?;
+       let normalized = z_normalization(&img);
+       nifti::save(&normalized, "output.nii.gz")?;
+       Ok(())
+   }

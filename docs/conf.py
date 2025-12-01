@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.abspath('../src'))
 # -- Project information -----------------------------------------------------
 
 project = 'medrs'
-copyright = f'{datetime.now().year()}, Liam Chalcroft'
+copyright = f'{datetime.now().year}, Liam Chalcroft'
 author = 'Liam Chalcroft'
 version = '0.1.0'
 release = '0.1.0'
@@ -129,27 +129,13 @@ mathjax_path = 'https://cdn.jsdelivr.net/npm/mathjax@2/es5/Tex-MML-AM_CHTML.js'
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 #
-html_theme = 'sphinx_book_theme'
+html_theme = 'sphinx_rtd_theme'
 
 # Theme options
 html_theme_options = {
-    "repository_url": "https://github.com/username/medrs",
-    "repository_branch": "main",
-    "path_to_docs": "docs",
-    "use_edit_page_button": True,
-    "use_repository_button": True,
-    "use_download_button": True,
-    "use_fullscreen_button": True,
-    "logo": "assets/logo.svg",
-    "title": "medrs Documentation",
-    "nav_footer": "",
-    "home_page_in_toc": True,
-    "extra_footer": "",
     "collapse_navigation": True,
     "navigation_depth": 4,
-    "show_toc_level": 2,
-    "search_bar_text": "Search the docs...",
-    "pygments_style": "default",
+    "titles_only": False,
 }
 
 # Add any paths that contain custom static files (such as style sheets) here,
@@ -218,13 +204,18 @@ myst_enable_extensions = [
     "colon_fence",
     "deflist",
     "html_admonition",
-    "html_attr_list",
-    "linkify",
+    "attrs_inline",
     "replacements",
     "smartquotes",
     "substitution",
     "tasklist",
 ]
+
+# Register source parser for markdown files
+source_suffix = {
+    '.rst': 'restructuredtext',
+    '.md': 'markdown',
+}
 
 # -- Options for copybutton ----------------------------------------------
 
@@ -238,9 +229,9 @@ autosectionlabel_prefix_document = True
 # -- Options for sphinx.ext.extlinks ----------------------------------
 
 extlinks = {
-    'issue': 'https://github.com/username/medrs/issues/%s',
-    'pr': 'https://github.com/username/medrs/pull/%s',
-    'user': 'https://github.com/%s',
+    'issue': ('https://github.com/liamchalcroft/med-rs/issues/%s', 'issue %s'),
+    'pr': ('https://github.com/liamchalcroft/med-rs/pull/%s', 'PR %s'),
+    'user': ('https://github.com/%s', '@%s'),
 }
 
 # -- Custom configuration -------------------------------------------
