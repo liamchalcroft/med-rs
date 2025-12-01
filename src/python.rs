@@ -9,7 +9,7 @@ use pyo3::prelude::*;
 use crate::nifti::image::ArrayData;
 use crate::nifti::DataType;
 use crate::nifti::{self, NiftiImage as RustNiftiImage};
-use crate::pipeline::compose::TransformPipeline as RustTransformPipeline;
+use crate::pipeline::TransformPipeline as RustTransformPipeline;
 use crate::transforms::crop::{
     compute_center_crop_regions, compute_label_aware_crop_regions,
     compute_random_spatial_crop_regions,
