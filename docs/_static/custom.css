@@ -1,0 +1,398 @@
+/* Custom CSS for medrs documentation */
+
+/* =============================================
+   Custom Variables and Theming
+   ============================================= */
+
+:root {
+  --medrs-primary: #2563eb;
+  --medrs-primary-dark: #1e40af;
+  --medrs-secondary: #64748b;
+  --medrs-success: #16a34a;
+  --medrs-warning: #ea580c;
+  --medrs-danger: #dc2626;
+  --medrs-light: #f8fafc;
+  --medrs-dark: #1e293b;
+  --medrs-gradient: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
+/* =============================================
+   Typography
+   ============================================= */
+
+.bd-header-article__title {
+  color: var(--medrs-primary);
+  font-weight: 600;
+}
+
+.bd-header-article__subtitle {
+  color: var(--medrs-secondary);
+  font-size: 1.1rem;
+  margin-top: 0.5rem;
+}
+
+/* =============================================
+   Code Blocks and Syntax Highlighting
+   ============================================= */
+
+.highlight {
+  border-left: 4px solid var(--medrs-primary);
+  border-radius: 0.25rem;
+  margin: 1rem 0;
+  background-color: var(--medrs-light);
+}
+
+.highlight pre {
+  margin: 0;
+  padding: 1rem;
+  border-radius: 0 0.25rem 0.25rem 0;
+}
+
+/* =============================================
+   Buttons and Interactive Elements
+   ============================================= */
+
+.btn-primary {
+  background: var(--medrs-gradient);
+  border: none;
+  color: white;
+  padding: 0.5rem 1rem;
+  border-radius: 0.25rem;
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+
+.btn-primary:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 12px rgba(37, 99, 235, 0.3);
+}
+
+/* =============================================
+   Cards and Containers
+   ============================================= */
+
+.sd-card {
+  border: 1px solid #e2e8f0;
+  border-radius: 0.5rem;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  transition: all 0.2s ease;
+}
+
+.sd-card:hover {
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+  transform: translateY(-2px);
+}
+
+/* =============================================
+   Performance Metrics Tables
+   ============================================= */
+
+.performance-table {
+  border-collapse: separate;
+  border-spacing: 0;
+  margin: 1rem 0;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.performance-table th {
+  background: var(--medrs-gradient);
+  color: white;
+  font-weight: 600;
+  text-align: left;
+  padding: 0.75rem 1rem;
+}
+
+.performance-table td {
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.performance-table tr:last-child td {
+  border-bottom: none;
+}
+
+.performance-table tr:nth-child(even) {
+  background-color: #f8fafc;
+}
+
+.performance-metric {
+  font-weight: 600;
+  color: var(--medrs-primary);
+}
+
+.performance-improvement {
+  color: var(--medrs-success);
+  font-weight: 500;
+}
+
+.performance-regression {
+  color: var(--medrs-danger);
+  font-weight: 500;
+}
+
+/* =============================================
+   Navigation and Sidebar
+   ============================================= */
+
+.bd-sidebar-primary {
+  border-right: 1px solid #e2e8f0;
+}
+
+.bd-sidebar-secondary {
+  border-left: 1px solid #e2e8f0;
+}
+
+.bd-sidenav {
+  font-size: 0.9rem;
+}
+
+.bd-sidenav .current > .reference {
+  background: var(--medrs-gradient);
+  color: white;
+  border-radius: 0.25rem;
+}
+
+/* =============================================
+   Code Examples
+   ============================================= */
+
+.code-example {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+  padding: 1rem;
+  border-radius: 0.5rem;
+  margin: 1rem 0;
+}
+
+.code-example pre {
+  background: rgba(0, 0, 0, 0.2);
+  border-radius: 0.25rem;
+  color: white;
+}
+
+/* =============================================
+   Feature Grid
+   ============================================= */
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1.5rem;
+  margin: 2rem 0;
+}
+
+.feature-card {
+  text-align: center;
+  padding: 2rem;
+  border-radius: 0.5rem;
+  background: white;
+  border: 1px solid #e2e8f0;
+  transition: all 0.3s ease;
+}
+
+.feature-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 8px 25px rgba(0, 0, 0, 0.15);
+}
+
+.feature-icon {
+  font-size: 2rem;
+  margin-bottom: 1rem;
+  color: var(--medrs-primary);
+}
+
+.feature-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--medrs-dark);
+  margin-bottom: 0.5rem;
+}
+
+.feature-description {
+  color: var(--medrs-secondary);
+  line-height: 1.6;
+}
+
+/* =============================================
+   Performance Comparison Charts
+   ============================================= */
+
+.chart-container {
+  margin: 2rem 0;
+  padding: 1.5rem;
+  background: white;
+  border-radius: 0.5rem;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.chart-title {
+  font-size: 1.25rem;
+  font-weight: 600;
+  color: var(--medrs-dark);
+  margin-bottom: 1rem;
+  text-align: center;
+}
+
+/* =============================================
+   Quick Start Cards
+   ============================================= */
+
+.quickstart-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 1rem;
+  margin: 1.5rem 0;
+}
+
+.quickstart-card {
+  background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+  padding: 1.5rem;
+  border-radius: 0.5rem;
+  border: 1px solid #e2e8f0;
+}
+
+.quickstart-number {
+  font-size: 2rem;
+  font-weight: 700;
+  color: var(--medrs-primary);
+  margin-bottom: 0.5rem;
+}
+
+.quickstart-title {
+  font-weight: 600;
+  color: var(--medrs-dark);
+  margin-bottom: 0.5rem;
+}
+
+/* =============================================
+   Alert and Notice Styling
+   ============================================= */
+
+.alert-notice {
+  background: linear-gradient(135deg, #ffecd2 0%, #fcb69f 100%);
+  border-left: 4px solid #f59e0b;
+  padding: 1rem 1.5rem;
+  border-radius: 0.25rem;
+  margin: 1rem 0;
+}
+
+.alert-info {
+  background: linear-gradient(135deg, #e0f2fe 0%, #bae6fd 100%);
+  border-left: 4px solid #0288d1;
+  padding: 1rem 1.5rem;
+  border-radius: 0.25rem;
+  margin: 1rem 0;
+}
+
+.alert-success {
+  background: linear-gradient(135deg, #e8f5e8 0%, #a5d6a7 100%);
+  border-left: 4px solid #2e7d32;
+  padding: 1rem 1.5rem;
+  border-radius: 0.25rem;
+  margin: 1rem 0;
+}
+
+/* =============================================
+   Tabs Navigation
+   ============================================= */
+
+.sphinx-tabs {
+  border-bottom: 2px solid var(--medrs-primary);
+  margin: 1rem 0;
+}
+
+.sphinx-tabs-tab {
+  background: transparent;
+  border: none;
+  padding: 0.75rem 1rem;
+  font-weight: 500;
+  color: var(--medrs-secondary);
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s ease;
+}
+
+.sphinx-tabs-tab[aria-selected="true"] {
+  color: var(--medrs-primary);
+  border-bottom-color: var(--medrs-primary);
+  background: var(--medrs-light);
+}
+
+/* =============================================
+   Responsive Design
+   ============================================= */
+
+@media (max-width: 768px) {
+  .feature-grid {
+    grid-template-columns: 1fr;
+    gap: 1rem;
+  }
+
+  .quickstart-cards {
+    grid-template-columns: 1fr;
+  }
+
+  .performance-table {
+    font-size: 0.9rem;
+  }
+
+  .performance-table th,
+  .performance-table td {
+    padding: 0.5rem;
+  }
+}
+
+/* =============================================
+   Print Styles
+   ============================================= */
+
+@media print {
+  .bd-sidebar,
+  .bd-header,
+  .bd-footer {
+    display: none;
+  }
+
+  .bd-content {
+    margin: 0 !important;
+  }
+
+  .feature-card,
+  .quickstart-card {
+    page-break-inside: avoid;
+  }
+
+  .performance-table {
+    page-break-inside: avoid;
+  }
+}
+
+/* =============================================
+   Dark Mode Support
+   ============================================= */
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --medrs-light: #1e293b;
+    --medrs-dark: #f8fafc;
+  }
+
+  .bd-content {
+    background: #0f172a;
+    color: var(--medrs-dark);
+  }
+
+  .sd-card {
+    background: #1e293b;
+    border-color: #334155;
+  }
+
+  .performance-table tr:nth-child(even) {
+    background: #1e293b;
+  }
+
+  .feature-card,
+  .quickstart-card {
+    background: #1e293b;
+  }
+}

@@ -1,0 +1,96 @@
+[package]
+name = "medrs"
+version = "0.1.0"
+edition = "2021"
+description = "Ultra-high-performance medical imaging I/O for deep learning"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/medrs/medrs"
+homepage = "https://github.com/medrs/medrs"
+documentation = "https://medrs.readthedocs.io"
+authors = ["Liam Chalcroft <liam.chalcroft.20@ucl.ac.uk>"]
+keywords = ["medical-imaging", "nifti", "neuroimaging", "deep-learning", "pytorch"]
+categories = ["science", "multimedia::images", "api-bindings"]
+readme = "README.md"
+
+[lib]
+name = "medrs"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Core
+ndarray = { version = "0.16", features = ["rayon"] }
+num-traits = "0.2"
+byteorder = "1.5"
+thiserror = "2.0"
+half = { version = "2.4", features = ["bytemuck", "num-traits"] }
+
+# Compression
+flate2 = { version = "1.0", features = ["zlib-ng"], default-features = false }
+
+# Parallelism
+rayon = "1.10"
+
+# SIMD
+wide = "0.7"
+
+# Randomization for training pipelines
+rand = "0.8"
+rand_chacha = "0.3"
+
+# Memory mapping
+memmap2 = "0.9"
+libdeflater = "0.14"
+
+# Python bindings (optional)
+pyo3 = { version = "0.23", features = ["extension-module"], optional = true }
+numpy = { version = "0.23", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.14"
+
+[features]
+default = []
+python = ["pyo3", "numpy"]
+
+[[bench]]
+name = "io_benchmark"
+harness = false
+path = "benchmarks/rust/io_benchmark.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+debug = true
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = true
+opt-level = 0
+
+[profile.bench]
+debug = true
+lto = true
+codegen-units = 1
+
+[profile.test]
+debug = true
+opt-level = 1
+
+[workspace]
+resolver = "2"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+cargo = "warn"
+
+[lints]
+workspace = true
