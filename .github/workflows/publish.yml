@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Allow PyO3 to work with newer Python versions via stable ABI
+  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: '1'
+
 jobs:
   # Build wheels for Linux
   linux:
