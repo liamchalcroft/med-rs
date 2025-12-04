@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use byteorder::ByteOrder;
 use half::{bf16, f16};
 use memmap2::Mmap;
-use ndarray::{ArrayD, ArrayViewD, IxDyn};
+use ndarray::{ArrayD, ArrayViewD, IxDyn, ShapeBuilder};
 use num_traits::NumCast;
 use rayon::prelude::*;
 use std::fmt;
@@ -204,8 +204,10 @@ impl NiftiImage {
                     return None;
                 }
                 let ptr = slice.as_ptr() as *const f32;
-                let view =
-                    unsafe { ndarray::ArrayView::from_shape_ptr(IxDyn(&self.shape_cache), ptr) };
+                // NIfTI data is stored in F-order (column-major)
+                let view = unsafe {
+                    ndarray::ArrayView::from_shape_ptr(IxDyn(&self.shape_cache).f(), ptr)
+                };
                 Some(view)
             }
             DataStorage::SharedMmap { mmap, offset, len } => {
@@ -218,8 +220,10 @@ impl NiftiImage {
                     return None;
                 }
                 let ptr = slice.as_ptr() as *const f32;
-                let view =
-                    unsafe { ndarray::ArrayView::from_shape_ptr(IxDyn(&self.shape_cache), ptr) };
+                // NIfTI data is stored in F-order (column-major)
+                let view = unsafe {
+                    ndarray::ArrayView::from_shape_ptr(IxDyn(&self.shape_cache).f(), ptr)
+                };
                 Some(view)
             }
             _ => None,
@@ -287,7 +291,9 @@ impl NiftiImage {
         }
 
         let ptr = slice.as_ptr() as *const T;
-        let view = unsafe { ndarray::ArrayView::from_shape_ptr(IxDyn(&self.shape_cache), ptr) };
+        // NIfTI data is stored in F-order (column-major)
+        let view =
+            unsafe { ndarray::ArrayView::from_shape_ptr(IxDyn(&self.shape_cache).f(), ptr) };
         Some(view)
     }
 
@@ -478,82 +484,55 @@ impl NiftiImage {
     }
 
     /// Serialize image data to bytes (for writing).
+    /// Uses memory order (F-order for NIfTI convention) to write data.
     pub(crate) fn data_to_bytes(&self) -> Vec<u8> {
         use byteorder::{ByteOrder, LittleEndian};
 
+        // Helper macro to serialize using memory order
+        macro_rules! serialize_memory_order {
+            ($arr:expr, $elem_size:expr, $write_fn:expr) => {{
+                let slice = $arr.as_slice_memory_order()
+                    .expect("Array should be contiguous in memory");
+                let mut buf = vec![0u8; slice.len() * $elem_size];
+                for (i, &v) in slice.iter().enumerate() {
+                    $write_fn(&mut buf[i * $elem_size..(i + 1) * $elem_size], v);
+                }
+                buf
+            }};
+        }
+
         match self.materialize_owned() {
-            ArrayData::U8(a) => a.iter().copied().collect(),
-            ArrayData::I8(a) => a.iter().map(|&v| v as u8).collect(),
-            ArrayData::I16(a) => {
-                let mut buf = vec![0u8; a.len() * 2];
-                for (i, &v) in a.iter().enumerate() {
-                    LittleEndian::write_i16(&mut buf[i * 2..(i + 1) * 2], v);
-                }
-                buf
-            }
-            ArrayData::U16(a) => {
-                let mut buf = vec![0u8; a.len() * 2];
-                for (i, &v) in a.iter().enumerate() {
-                    LittleEndian::write_u16(&mut buf[i * 2..(i + 1) * 2], v);
-                }
-                buf
-            }
-            ArrayData::I32(a) => {
-                let mut buf = vec![0u8; a.len() * 4];
-                for (i, &v) in a.iter().enumerate() {
-                    LittleEndian::write_i32(&mut buf[i * 4..(i + 1) * 4], v);
-                }
-                buf
-            }
-            ArrayData::U32(a) => {
-                let mut buf = vec![0u8; a.len() * 4];
-                for (i, &v) in a.iter().enumerate() {
-                    LittleEndian::write_u32(&mut buf[i * 4..(i + 1) * 4], v);
-                }
-                buf
-            }
-            ArrayData::I64(a) => {
-                let mut buf = vec![0u8; a.len() * 8];
-                for (i, &v) in a.iter().enumerate() {
-                    LittleEndian::write_i64(&mut buf[i * 8..(i + 1) * 8], v);
-                }
-                buf
-            }
-            ArrayData::U64(a) => {
-                let mut buf = vec![0u8; a.len() * 8];
-                for (i, &v) in a.iter().enumerate() {
-                    LittleEndian::write_u64(&mut buf[i * 8..(i + 1) * 8], v);
-                }
-                buf
-            }
+            ArrayData::U8(a) => a.as_slice_memory_order()
+                .expect("Array should be contiguous").to_vec(),
+            ArrayData::I8(a) => a.as_slice_memory_order()
+                .expect("Array should be contiguous")
+                .iter().map(|&v| v as u8).collect(),
+            ArrayData::I16(a) => serialize_memory_order!(a, 2, LittleEndian::write_i16),
+            ArrayData::U16(a) => serialize_memory_order!(a, 2, LittleEndian::write_u16),
+            ArrayData::I32(a) => serialize_memory_order!(a, 4, LittleEndian::write_i32),
+            ArrayData::U32(a) => serialize_memory_order!(a, 4, LittleEndian::write_u32),
+            ArrayData::I64(a) => serialize_memory_order!(a, 8, LittleEndian::write_i64),
+            ArrayData::U64(a) => serialize_memory_order!(a, 8, LittleEndian::write_u64),
             ArrayData::F16(a) => {
-                let mut buf = vec![0u8; a.len() * 2];
-                for (i, &v) in a.iter().enumerate() {
+                let slice = a.as_slice_memory_order()
+                    .expect("Array should be contiguous");
+                let mut buf = vec![0u8; slice.len() * 2];
+                for (i, &v) in slice.iter().enumerate() {
                     LittleEndian::write_u16(&mut buf[i * 2..(i + 1) * 2], v.to_bits());
                 }
                 buf
             }
             ArrayData::BF16(a) => {
-                let mut buf = vec![0u8; a.len() * 2];
-                for (i, &v) in a.iter().enumerate() {
+                let slice = a.as_slice_memory_order()
+                    .expect("Array should be contiguous");
+                let mut buf = vec![0u8; slice.len() * 2];
+                for (i, &v) in slice.iter().enumerate() {
                     LittleEndian::write_u16(&mut buf[i * 2..(i + 1) * 2], v.to_bits());
                 }
                 buf
             }
-            ArrayData::F32(a) => {
-                let mut buf = vec![0u8; a.len() * 4];
-                for (i, &v) in a.iter().enumerate() {
-                    LittleEndian::write_f32(&mut buf[i * 4..(i + 1) * 4], v);
-                }
-                buf
-            }
-            ArrayData::F64(a) => {
-                let mut buf = vec![0u8; a.len() * 8];
-                for (i, &v) in a.iter().enumerate() {
-                    LittleEndian::write_f64(&mut buf[i * 8..(i + 1) * 8], v);
-                }
-                buf
-            }
+            ArrayData::F32(a) => serialize_memory_order!(a, 4, LittleEndian::write_f32),
+            ArrayData::F64(a) => serialize_memory_order!(a, 8, LittleEndian::write_f64),
         }
     }
 
@@ -621,7 +600,7 @@ impl NiftiImage {
                             })
                             .collect()
                     };
-                    ArrayD::from_shape_vec(shape, vec)
+                    ArrayD::from_shape_vec(shape.f(), vec)
                         .map(ArrayData::$variant)
                         .map_err(|e| Error::InvalidDimensions(e.to_string()))
                 } else {
@@ -631,7 +610,7 @@ impl NiftiImage {
                     let slice = unsafe { std::slice::from_raw_parts(ptr, num_elems) };
                     let vec: Vec<$ty> = slice.to_vec();
 
-                    ArrayD::from_shape_vec(shape, vec)
+                    ArrayD::from_shape_vec(shape.f(), vec)
                         .map(ArrayData::$variant)
                         .map_err(|e| Error::InvalidDimensions(e.to_string()))
                 }
@@ -641,13 +620,13 @@ impl NiftiImage {
         match self.header.datatype {
             DataType::UInt8 => {
                 let vec = bytes.to_vec();
-                ArrayD::from_shape_vec(shape, vec)
+                ArrayD::from_shape_vec(shape.f(), vec)
                     .map(ArrayData::U8)
                     .map_err(|e| Error::InvalidDimensions(e.to_string()))
             }
             DataType::Int8 => {
                 let vec: Vec<i8> = bytes.iter().map(|&b| b as i8).collect();
-                ArrayD::from_shape_vec(shape, vec)
+                ArrayD::from_shape_vec(shape.f(), vec)
                     .map(ArrayData::I8)
                     .map_err(|e| Error::InvalidDimensions(e.to_string()))
             }
@@ -694,7 +673,7 @@ impl NiftiImage {
                         })
                         .collect()
                 };
-                ArrayD::from_shape_vec(shape, vec)
+                ArrayD::from_shape_vec(shape.f(), vec)
                     .map(ArrayData::$variant)
                     .map_err(|e| Error::InvalidDimensions(e.to_string()))
             }};
@@ -703,7 +682,7 @@ impl NiftiImage {
         match self.header.datatype {
             DataType::UInt8 => {
                 let vec = bytes.to_vec();
-                ArrayD::from_shape_vec(shape, vec)
+                ArrayD::from_shape_vec(shape.f(), vec)
                     .map(ArrayData::U8)
                     .map_err(|e| Error::InvalidDimensions(e.to_string()))
             }
@@ -713,7 +692,7 @@ impl NiftiImage {
                 } else {
                     bytes.iter().map(|&b| b as i8).collect()
                 };
-                ArrayD::from_shape_vec(shape, vec)
+                ArrayD::from_shape_vec(shape.f(), vec)
                     .map(ArrayData::I8)
                     .map_err(|e| Error::InvalidDimensions(e.to_string()))
             }
@@ -785,7 +764,7 @@ impl NiftiImage {
                         })
                         .collect()
                 };
-                ArrayD::from_shape_vec(shape, vec)
+                ArrayD::from_shape_vec(shape.f(), vec)
                     .map(ArrayData::F16)
                     .map_err(|e| Error::InvalidDimensions(e.to_string()))
             }
@@ -815,7 +794,7 @@ impl NiftiImage {
                         })
                         .collect()
                 };
-                ArrayD::from_shape_vec(shape, vec)
+                ArrayD::from_shape_vec(shape.f(), vec)
                     .map(ArrayData::BF16)
                     .map_err(|e| Error::InvalidDimensions(e.to_string()))
             }
@@ -852,7 +831,7 @@ impl NiftiImage {
                 // Aligned: direct reinterpretation
                 let ptr = bytes.as_ptr() as *const f32;
                 let slice = unsafe { std::slice::from_raw_parts(ptr, num_elems) };
-                return ArrayD::from_shape_vec(IxDyn(shape), slice.to_vec())
+                return ArrayD::from_shape_vec(IxDyn(shape).f(), slice.to_vec())
                     .map_err(|e| Error::InvalidDimensions(e.to_string()));
             }
         }
@@ -1052,7 +1031,7 @@ impl NiftiImage {
             }
         };
 
-        ArrayD::from_shape_vec(IxDyn(shape), out)
+        ArrayD::from_shape_vec(IxDyn(shape).f(), out)
             .map_err(|e| Error::InvalidDimensions(e.to_string()))
     }
 }
@@ -1065,9 +1044,12 @@ mod tests {
     #[test]
     fn test_as_view_owned() {
         let data: Vec<u16> = (0..8).collect();
-        let array = ArrayD::from_shape_vec(IxDyn(&[2, 2, 2]), data.clone()).unwrap();
+        // Create F-order array to match NIfTI convention
+        let c_order = ArrayD::from_shape_vec(IxDyn(&[2, 2, 2]), data.clone()).unwrap();
+        let mut f_order: ArrayD<u16> = ArrayD::zeros(IxDyn(&[2, 2, 2]).f());
+        f_order.assign(&c_order);
         let img = NiftiImage::from_array(
-            array,
+            f_order,
             [
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0, 0.0],
@@ -1077,7 +1059,13 @@ mod tests {
         );
         let view = img.as_view_t::<u16>().expect("view should be available");
         assert_eq!(view.len(), 8);
-        assert_eq!(view.as_slice().unwrap(), data.as_slice());
+        // F-order view - check via memory order slice
+        let view_slice = view.as_slice_memory_order().unwrap();
+        let orig = img.materialize_owned();
+        if let ArrayData::U16(arr) = orig {
+            let orig_slice = arr.as_slice_memory_order().unwrap();
+            assert_eq!(view_slice, orig_slice);
+        }
     }
 
     #[test]
@@ -1085,9 +1073,12 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("view.nii");
         let data: Vec<f32> = (0..8).map(|v| v as f32).collect();
-        let array = ArrayD::from_shape_vec(IxDyn(&[2, 2, 2]), data.clone()).unwrap();
+        // Create F-order array to match NIfTI convention
+        let c_order = ArrayD::from_shape_vec(IxDyn(&[2, 2, 2]), data.clone()).unwrap();
+        let mut f_order: ArrayD<f32> = ArrayD::zeros(IxDyn(&[2, 2, 2]).f());
+        f_order.assign(&c_order);
         let img = NiftiImage::from_array(
-            array,
+            f_order.clone(),
             [
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0, 0.0],
@@ -1101,7 +1092,10 @@ mod tests {
             .as_view_f32()
             .expect("view should exist for mmap f32");
         assert_eq!(view.len(), 8);
-        assert_eq!(view.as_slice().unwrap(), data.as_slice());
+        // F-order view - check via memory order slice
+        let view_slice = view.as_slice_memory_order().unwrap();
+        let orig_slice = f_order.as_slice_memory_order().unwrap();
+        assert_eq!(view_slice, orig_slice);
     }
 }
 

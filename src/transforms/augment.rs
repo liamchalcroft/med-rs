@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::nifti::image::ArrayData;
 use crate::nifti::{DataType, NiftiImage};
 use crate::pipeline::acquire_buffer;
-use ndarray::{ArrayD, IxDyn};
+use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -95,7 +95,8 @@ pub fn random_gaussian_noise(
         *out = slice[i] + noise;
     }
 
-    let out_array = ArrayD::from_shape_vec(IxDyn(data.shape()), output).unwrap();
+    // F-order to match NIfTI convention
+    let out_array = ArrayD::from_shape_vec(IxDyn(data.shape()).f(), output).unwrap();
     let mut header = image.header().clone();
     header.datatype = DataType::Float32;
     header.scl_slope = 1.0;
@@ -135,7 +136,8 @@ pub fn random_intensity_scale(
             *out = v * scale;
         });
 
-    let out_array = ArrayD::from_shape_vec(IxDyn(data.shape()), output).unwrap();
+    // F-order to match NIfTI convention
+    let out_array = ArrayD::from_shape_vec(IxDyn(data.shape()).f(), output).unwrap();
     let mut header = image.header().clone();
     header.datatype = DataType::Float32;
     header.scl_slope = 1.0;
@@ -175,7 +177,8 @@ pub fn random_intensity_shift(
             *out = v + shift;
         });
 
-    let out_array = ArrayD::from_shape_vec(IxDyn(data.shape()), output).unwrap();
+    // F-order to match NIfTI convention
+    let out_array = ArrayD::from_shape_vec(IxDyn(data.shape()).f(), output).unwrap();
     let mut header = image.header().clone();
     header.datatype = DataType::Float32;
     header.scl_slope = 1.0;
@@ -318,7 +321,8 @@ pub fn random_gamma(
             *out = v_clamped.powf(gamma);
         });
 
-    let out_array = ArrayD::from_shape_vec(IxDyn(data.shape()), output).unwrap();
+    // F-order to match NIfTI convention
+    let out_array = ArrayD::from_shape_vec(IxDyn(data.shape()).f(), output).unwrap();
     let mut header = image.header().clone();
     header.datatype = DataType::Float32;
     header.scl_slope = 1.0;

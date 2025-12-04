@@ -2,7 +2,7 @@ use crate::nifti::image::ArrayData;
 use crate::nifti::{DataType, NiftiImage};
 use crate::pipeline::acquire_buffer;
 use crate::pipeline::simd_kernels::{parallel_linear_transform_f32, parallel_sum_and_sum_sq_f32};
-use ndarray::{ArrayD, IxDyn};
+use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 use rayon::prelude::*;
 
 /// Normalize image intensity to zero mean and unit variance.
@@ -36,7 +36,8 @@ pub fn z_normalization(image: &NiftiImage) -> NiftiImage {
         let offset = -mean * inv_std;
         parallel_linear_transform_f32(slice, &mut output, inv_std, offset);
 
-        let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()), output).unwrap();
+        // Return result in F-order to match NIfTI convention
+        let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output).unwrap();
         header.datatype = DataType::Float32;
         header.scl_slope = 1.0;
         header.scl_inter = 0.0;
@@ -75,7 +76,8 @@ pub fn z_normalization(image: &NiftiImage) -> NiftiImage {
                     *out = $from_f32((val - mean) * inv_std);
                 });
 
-            let out_array = ArrayD::from_shape_vec(IxDyn($array.shape()), output).unwrap();
+            // F-order to match NIfTI convention
+            let out_array = ArrayD::from_shape_vec(IxDyn($array.shape()).f(), output).unwrap();
             header.datatype = DataType::Float32;
             ArrayData::F32(out_array)
         }};
@@ -118,7 +120,8 @@ pub fn z_normalization(image: &NiftiImage) -> NiftiImage {
                     *out = (v - mean) * inv_std;
                 });
 
-            let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()), output).unwrap();
+            // F-order to match NIfTI convention
+            let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output).unwrap();
             header.datatype = DataType::Float64;
             ArrayData::F64(out_array)
         }
@@ -157,7 +160,8 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Nift
         let mut output = acquire_buffer(slice.len());
         parallel_linear_transform_f32(slice, &mut output, scale, offset);
 
-        let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()), output).unwrap();
+        // F-order to match NIfTI convention
+        let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output).unwrap();
         header.datatype = DataType::Float32;
         header.scl_slope = 1.0;
         header.scl_inter = 0.0;
@@ -196,7 +200,8 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Nift
                     *out = val * scale + offset;
                 });
 
-            let out_array = ArrayD::from_shape_vec(IxDyn($array.shape()), output).unwrap();
+            // F-order to match NIfTI convention
+            let out_array = ArrayD::from_shape_vec(IxDyn($array.shape()).f(), output).unwrap();
             header.datatype = DataType::Float32;
             ArrayData::F32(out_array)
         }};
@@ -235,7 +240,8 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Nift
                     *out = v * scale + offset;
                 });
 
-            let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()), output).unwrap();
+            // F-order to match NIfTI convention
+            let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output).unwrap();
             header.datatype = DataType::Float64;
             ArrayData::F64(out_array)
         }
@@ -265,7 +271,8 @@ pub fn clamp(image: &NiftiImage, min: f64, max: f64) -> NiftiImage {
         let mut output = acquire_buffer(slice.len());
         parallel_linear_transform_clamp_f32(slice, &mut output, 1.0, 0.0, min_f, max_f);
 
-        let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()), output).unwrap();
+        // F-order to match NIfTI convention
+        let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output).unwrap();
         return NiftiImage::from_parts(header, ArrayData::F32(out_array));
     }
 
@@ -324,14 +331,17 @@ mod tests {
     use ndarray::ArrayD;
 
     fn create_test_image(data: Vec<f32>, shape: [usize; 3]) -> NiftiImage {
-        let array = ArrayD::from_shape_vec(shape.to_vec(), data).unwrap();
+        // Create F-order array to match NIfTI convention
+        let c_order = ArrayD::from_shape_vec(shape.to_vec(), data).unwrap();
+        let mut f_order = ArrayD::zeros(IxDyn(&shape).f());
+        f_order.assign(&c_order);
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        NiftiImage::from_array(array, affine)
+        NiftiImage::from_array(f_order, affine)
     }
 
     #[test]
@@ -342,7 +352,7 @@ mod tests {
 
         let normalized = z_normalization(&img);
         let result = normalized.to_f32();
-        let result_slice = result.as_slice().unwrap();
+        let result_slice = result.as_slice_memory_order().unwrap();
 
         // After z-normalization, mean should be ~0 and std should be ~1
         let mean: f32 = result_slice.iter().sum::<f32>() / result_slice.len() as f32;
@@ -362,7 +372,7 @@ mod tests {
 
         let normalized = z_normalization(&img);
         let result = normalized.to_f32();
-        let result_slice = result.as_slice().unwrap();
+        let result_slice = result.as_slice_memory_order().unwrap();
 
         // With zero variance, should handle gracefully (no NaN)
         for &v in result_slice {
@@ -377,7 +387,7 @@ mod tests {
 
         let rescaled = rescale_intensity(&img, 0.0, 1.0);
         let result = rescaled.to_f32();
-        let result_slice = result.as_slice().unwrap();
+        let result_slice = result.as_slice_memory_order().unwrap();
 
         // After rescaling to [0, 1], min should be 0 and max should be 1
         let min = result_slice.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -397,7 +407,7 @@ mod tests {
 
         let rescaled = rescale_intensity(&img, -1.0, 1.0);
         let result = rescaled.to_f32();
-        let result_slice = result.as_slice().unwrap();
+        let result_slice = result.as_slice_memory_order().unwrap();
 
         let min = result_slice.iter().cloned().fold(f32::INFINITY, f32::min);
         let max = result_slice
@@ -417,7 +427,7 @@ mod tests {
 
         let rescaled = rescale_intensity(&img, 0.0, 1.0);
         let result = rescaled.to_f32();
-        let result_slice = result.as_slice().unwrap();
+        let result_slice = result.as_slice_memory_order().unwrap();
 
         // With zero range, should not produce NaN
         for &v in result_slice {
@@ -432,18 +442,27 @@ mod tests {
 
         let clamped = clamp(&img, 0.0, 20.0);
         let result = clamped.to_f32();
-        let result_slice = result.as_slice().unwrap();
+        let result_slice = result.as_slice_memory_order().unwrap();
 
         for &v in result_slice {
             assert!(v >= 0.0, "Value {} should be >= 0", v);
             assert!(v <= 20.0, "Value {} should be <= 20", v);
         }
 
-        // Check specific values
-        assert!((result_slice[0] - 0.0).abs() < 1e-5); // -10 clamped to 0
-        assert!((result_slice[1] - 0.0).abs() < 1e-5); // 0 stays 0
-        assert!((result_slice[2] - 5.0).abs() < 1e-5); // 5 stays 5
-        assert!((result_slice[7] - 20.0).abs() < 1e-5); // 30 clamped to 20
+        // Check that values are properly clamped (don't rely on specific indices
+        // since F-order changes the memory layout)
+        let orig = img.to_f32();
+        let orig_slice = orig.as_slice_memory_order().unwrap();
+        for i in 0..result_slice.len() {
+            let expected = orig_slice[i].max(0.0).min(20.0);
+            assert!(
+                (result_slice[i] - expected).abs() < 1e-5,
+                "Value at {} should be clamped: expected {}, got {}",
+                i,
+                expected,
+                result_slice[i]
+            );
+        }
     }
 
     #[test]
@@ -453,7 +472,7 @@ mod tests {
 
         let clamped = clamp(&img, -3.0, 3.0);
         let result = clamped.to_f32();
-        let result_slice = result.as_slice().unwrap();
+        let result_slice = result.as_slice_memory_order().unwrap();
 
         for &v in result_slice {
             assert!(v >= -3.0, "Value {} should be >= -3", v);

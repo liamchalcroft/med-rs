@@ -200,17 +200,20 @@ pub fn flip(image: &NiftiImage, axes: &[usize]) -> Result<NiftiImage> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::ArrayD;
+    use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 
     fn create_test_image(data: Vec<f32>, shape: [usize; 3]) -> NiftiImage {
-        let array = ArrayD::from_shape_vec(shape.to_vec(), data).unwrap();
+        // Create F-order array to match NIfTI convention
+        let c_order = ArrayD::from_shape_vec(shape.to_vec(), data).unwrap();
+        let mut f_order = ArrayD::zeros(IxDyn(&shape).f());
+        f_order.assign(&c_order);
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        NiftiImage::from_array(array, affine)
+        NiftiImage::from_array(f_order, affine)
     }
 
     #[test]
@@ -240,9 +243,9 @@ mod tests {
 
         // The outer voxels should be 0 (padding)
         let result = padded.to_f32();
-        let slice = result.as_slice().unwrap();
+        let slice = result.as_slice_memory_order().unwrap();
 
-        // Corner voxel at [0,0,0] should be 0 (padding)
+        // With F-order, first element in memory is still [0,0,0]
         assert!((slice[0] - 0.0).abs() < 1e-5);
     }
 
@@ -256,14 +259,18 @@ mod tests {
         assert_eq!(result.shape(), &[2, 2, 2]);
 
         let result_data = result.to_f32();
-        let result_slice = result_data.as_slice().unwrap();
+        let result_slice = result_data.as_slice_memory_order().unwrap();
 
-        for (i, &expected) in data.iter().enumerate() {
+        // Compare against original in same memory order
+        let orig = img.to_f32();
+        let orig_slice = orig.as_slice_memory_order().unwrap();
+
+        for i in 0..result_slice.len() {
             assert!(
-                (result_slice[i] - expected).abs() < 1e-5,
+                (result_slice[i] - orig_slice[i]).abs() < 1e-5,
                 "Value mismatch at index {}: expected {}, got {}",
                 i,
-                expected,
+                orig_slice[i],
                 result_slice[i]
             );
         }

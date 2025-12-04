@@ -6,7 +6,7 @@
 use crate::nifti::image::ArrayData;
 use crate::nifti::{DataType, NiftiImage};
 use crate::pipeline::acquire_buffer;
-use ndarray::{ArrayD, IxDyn};
+use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 use rayon::prelude::*;
 
 /// Interpolation method for resampling.
@@ -158,7 +158,18 @@ impl InterpParams {
 fn resample_trilinear_3d(data: &ArrayD<f32>, new_shape: &[usize]) -> ArrayD<f32> {
     use crate::pipeline::simd_kernels::trilinear_row_simd;
 
-    let old_shape = data.shape();
+    // The SIMD algorithm is optimized for C-order (row-major) data.
+    // If input is F-order, convert to C-order for processing.
+    let data_c: std::borrow::Cow<'_, ArrayD<f32>> = if data.is_standard_layout() {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        // Convert F-order to C-order by creating a new array with standard layout
+        let mut c_order = ArrayD::zeros(IxDyn(data.shape()));
+        c_order.assign(data);
+        std::borrow::Cow::Owned(c_order)
+    };
+
+    let old_shape = data_c.shape();
     let (od, oh, ow) = (old_shape[0], old_shape[1], old_shape[2]);
     let (nd, nh, nw) = (new_shape[0], new_shape[1], new_shape[2]);
 
@@ -167,7 +178,7 @@ fn resample_trilinear_3d(data: &ArrayD<f32>, new_shape: &[usize]) -> ArrayD<f32>
     let y_params = InterpParams::new(nh, oh);
     let x_params = InterpParams::new(nw, ow);
 
-    let src = data.as_slice().unwrap();
+    let src = data_c.as_slice().expect("C-order array should have contiguous slice");
     let stride_z = oh * ow;
     let stride_y = ow;
 
@@ -208,7 +219,11 @@ fn resample_trilinear_3d(data: &ArrayD<f32>, new_shape: &[usize]) -> ArrayD<f32>
             }
         });
 
-    ArrayD::from_shape_vec(IxDyn(&[nd, nh, nw]), output).unwrap()
+    // Output is in C-order. Convert to F-order to match NIfTI convention.
+    let c_order = ArrayD::from_shape_vec(IxDyn(&[nd, nh, nw]), output).unwrap();
+    let mut f_order = ArrayD::zeros(IxDyn(&[nd, nh, nw]).f());
+    f_order.assign(&c_order);
+    f_order
 }
 
 /// Separable trilinear resampling (cache-friendly approach).
@@ -222,7 +237,17 @@ fn resample_trilinear_3d(data: &ArrayD<f32>, new_shape: &[usize]) -> ArrayD<f32>
 fn resample_trilinear_separable(data: &ArrayD<f32>, new_shape: &[usize]) -> ArrayD<f32> {
     use crate::pipeline::simd_kernels::{lerp_1d_simd, SIMD_WIDTH};
 
-    let old_shape = data.shape();
+    // The SIMD algorithm is optimized for C-order (row-major) data.
+    // If input is F-order, convert to C-order for processing.
+    let data_c: std::borrow::Cow<'_, ArrayD<f32>> = if data.is_standard_layout() {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        let mut c_order = ArrayD::zeros(IxDyn(data.shape()));
+        c_order.assign(data);
+        std::borrow::Cow::Owned(c_order)
+    };
+
+    let old_shape = data_c.shape();
     let (od, oh, ow) = (old_shape[0], old_shape[1], old_shape[2]);
     let (nd, nh, nw) = (new_shape[0], new_shape[1], new_shape[2]);
 
@@ -230,6 +255,7 @@ fn resample_trilinear_separable(data: &ArrayD<f32>, new_shape: &[usize]) -> Arra
     let x_params = InterpParams::new(nw, ow);
     let mut temp1: Vec<f32> = acquire_buffer(od * oh * nw);
 
+    let src_slice = data_c.as_slice().expect("C-order array should have contiguous slice");
     temp1
         .par_chunks_mut(nw)
         .enumerate()
@@ -237,7 +263,7 @@ fn resample_trilinear_separable(data: &ArrayD<f32>, new_shape: &[usize]) -> Arra
             let z = idx / oh;
             let y = idx % oh;
             let src_base = z * oh * ow + y * ow;
-            let src_row = &data.as_slice().unwrap()[src_base..src_base + ow];
+            let src_row = &src_slice[src_base..src_base + ow];
 
             // SIMD interpolation along X - process 8 output values at a time
             let chunks = nw / SIMD_WIDTH;
@@ -313,7 +339,11 @@ fn resample_trilinear_separable(data: &ArrayD<f32>, new_shape: &[usize]) -> Arra
             lerp_1d_simd(slice0, slice1, f, out_slice);
         });
 
-    ArrayD::from_shape_vec(IxDyn(&[nd, nh, nw]), output).unwrap()
+    // Output is in C-order. Convert to F-order to match NIfTI convention.
+    let c_order = ArrayD::from_shape_vec(IxDyn(&[nd, nh, nw]), output).unwrap();
+    let mut f_order = ArrayD::zeros(IxDyn(&[nd, nh, nw]).f());
+    f_order.assign(&c_order);
+    f_order
 }
 
 /// Choose between direct and separable resampling based on volume size.
@@ -331,7 +361,17 @@ fn resample_trilinear_adaptive(data: &ArrayD<f32>, new_shape: &[usize]) -> Array
 
 #[allow(clippy::similar_names)]
 fn resample_nearest_3d(data: &ArrayD<f32>, new_shape: &[usize]) -> ArrayD<f32> {
-    let old_shape = data.shape();
+    // The algorithm is optimized for C-order (row-major) data.
+    // If input is F-order, convert to C-order for processing.
+    let data_c: std::borrow::Cow<'_, ArrayD<f32>> = if data.is_standard_layout() {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        let mut c_order = ArrayD::zeros(IxDyn(data.shape()));
+        c_order.assign(data);
+        std::borrow::Cow::Owned(c_order)
+    };
+
+    let old_shape = data_c.shape();
     let (od, oh, ow) = (old_shape[0], old_shape[1], old_shape[2]);
     let (nd, nh, nw) = (new_shape[0], new_shape[1], new_shape[2]);
 
@@ -350,7 +390,7 @@ fn resample_nearest_3d(data: &ArrayD<f32>, new_shape: &[usize]) -> ArrayD<f32> {
         .map(|w| (((w as f32 + 0.5) * scale_w) as usize).min(ow - 1))
         .collect();
 
-    let src = data.as_slice().unwrap();
+    let src = data_c.as_slice().expect("C-order array should have contiguous slice");
     let stride_z = oh * ow;
     let stride_y = ow;
 
@@ -372,7 +412,11 @@ fn resample_nearest_3d(data: &ArrayD<f32>, new_shape: &[usize]) -> ArrayD<f32> {
             }
         });
 
-    ArrayD::from_shape_vec(IxDyn(&[nd, nh, nw]), output).unwrap()
+    // Output is in C-order. Convert to F-order to match NIfTI convention.
+    let c_order = ArrayD::from_shape_vec(IxDyn(&[nd, nh, nw]), output).unwrap();
+    let mut f_order = ArrayD::zeros(IxDyn(&[nd, nh, nw]).f());
+    f_order.assign(&c_order);
+    f_order
 }
 
 #[cfg(test)]
@@ -385,14 +429,17 @@ mod tests {
         shape: [usize; 3],
         spacing: [f32; 3],
     ) -> NiftiImage {
-        let array = ArrayD::from_shape_vec(shape.to_vec(), data).unwrap();
+        // Create F-order array to match NIfTI convention
+        let c_order = ArrayD::from_shape_vec(shape.to_vec(), data).unwrap();
+        let mut f_order = ArrayD::zeros(IxDyn(&shape).f());
+        f_order.assign(&c_order);
         let affine = [
             [spacing[0], 0.0, 0.0, 0.0],
             [0.0, spacing[1], 0.0, 0.0],
             [0.0, 0.0, spacing[2], 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        NiftiImage::from_array(array, affine)
+        NiftiImage::from_array(f_order, affine)
     }
 
     fn create_test_image(data: Vec<f32>, shape: [usize; 3]) -> NiftiImage {
@@ -450,7 +497,7 @@ mod tests {
 
         // Result should only contain values from original set
         let result = resampled.to_f32();
-        let slice = result.as_slice().unwrap();
+        let slice = result.as_slice_memory_order().unwrap();
         for &v in slice {
             assert!(
                 (1.0..=8.0).contains(&v),
@@ -491,7 +538,7 @@ mod tests {
         // Resample
         let resampled = resample_to_shape(&img, [8, 8, 8], Interpolation::Trilinear);
         let result = resampled.to_f32();
-        let slice = result.as_slice().unwrap();
+        let slice = result.as_slice_memory_order().unwrap();
 
         // Trilinear should not extrapolate, so values should be in [0, 1]
         for &v in slice {
@@ -512,7 +559,7 @@ mod tests {
         // Resample should preserve constant value
         let resampled = resample_to_shape(&img, [8, 8, 8], Interpolation::Trilinear);
         let result = resampled.to_f32();
-        let slice = result.as_slice().unwrap();
+        let slice = result.as_slice_memory_order().unwrap();
 
         for &v in slice {
             assert!((v - 5.0).abs() < 1e-4, "Expected 5.0, got {}", v);
@@ -527,15 +574,18 @@ mod tests {
 
         let resampled = resample_to_shape(&img, [4, 4, 4], Interpolation::Trilinear);
         let result = resampled.to_f32();
-        let result_slice = result.as_slice().unwrap();
+        let result_slice = result.as_slice_memory_order().unwrap();
 
-        // Values should be very close to original
-        for (i, &expected) in data.iter().enumerate() {
+        // Compare values - note that both are in F-order so indices match
+        let orig = img.to_f32();
+        let orig_slice = orig.as_slice_memory_order().unwrap();
+
+        for i in 0..result_slice.len() {
             assert!(
-                (result_slice[i] - expected).abs() < 0.5,
+                (result_slice[i] - orig_slice[i]).abs() < 0.5,
                 "Value at {} too different: expected {}, got {}",
                 i,
-                expected,
+                orig_slice[i],
                 result_slice[i]
             );
         }

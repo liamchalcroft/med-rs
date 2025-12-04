@@ -1,6 +1,6 @@
 [package]
 name = "medrs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Ultra-high-performance medical imaging I/O for deep learning"
 license = "MIT OR Apache-2.0"

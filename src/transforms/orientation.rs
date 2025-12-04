@@ -5,7 +5,7 @@
 
 use crate::nifti::image::ArrayData;
 use crate::nifti::{DataType, NiftiImage};
-use ndarray::{ArrayD, IxDyn};
+use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 
 /// Standard anatomical orientation codes.
 ///
@@ -268,8 +268,17 @@ pub fn reorient(image: &NiftiImage, target: Orientation) -> NiftiImage {
 
 fn permute_axes(data: &ArrayD<f32>, perm: &[usize; 3], new_shape: &[usize]) -> ArrayD<f32> {
     let old_shape = data.shape();
-    let src = data.as_slice().unwrap();
 
+    // Convert F-order to C-order for processing if needed
+    let data_c: std::borrow::Cow<'_, ArrayD<f32>> = if data.is_standard_layout() {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        let mut c_order = ArrayD::zeros(IxDyn(old_shape));
+        c_order.assign(data);
+        std::borrow::Cow::Owned(c_order)
+    };
+
+    let src = data_c.as_slice().expect("C-order array should have contiguous slice");
     let mut output = vec![0.0f32; new_shape.iter().product()];
     let (nd, nh, nw) = (new_shape[0], new_shape[1], new_shape[2]);
     let old_strides = [old_shape[1] * old_shape[2], old_shape[2], 1];
@@ -294,13 +303,26 @@ fn permute_axes(data: &ArrayD<f32>, perm: &[usize; 3], new_shape: &[usize]) -> A
         }
     }
 
-    ArrayD::from_shape_vec(IxDyn(new_shape), output).unwrap()
+    // Output is in C-order. Convert to F-order to match NIfTI convention.
+    let c_order = ArrayD::from_shape_vec(IxDyn(new_shape), output).unwrap();
+    let mut f_order = ArrayD::zeros(IxDyn(new_shape).f());
+    f_order.assign(&c_order);
+    f_order
 }
 
 fn flip_axis(data: &ArrayD<f32>, axis: usize) -> ArrayD<f32> {
     let shape = data.shape();
-    let src = data.as_slice().unwrap();
 
+    // Convert F-order to C-order for processing if needed
+    let data_c: std::borrow::Cow<'_, ArrayD<f32>> = if data.is_standard_layout() {
+        std::borrow::Cow::Borrowed(data)
+    } else {
+        let mut c_order = ArrayD::zeros(IxDyn(shape));
+        c_order.assign(data);
+        std::borrow::Cow::Owned(c_order)
+    };
+
+    let src = data_c.as_slice().expect("C-order array should have contiguous slice");
     let mut output = vec![0.0f32; src.len()];
     let (d, h, w) = (shape[0], shape[1], shape[2]);
 
@@ -321,7 +343,11 @@ fn flip_axis(data: &ArrayD<f32>, axis: usize) -> ArrayD<f32> {
         }
     }
 
-    ArrayD::from_shape_vec(IxDyn(shape), output).unwrap()
+    // Output is in C-order. Convert to F-order to match NIfTI convention.
+    let c_order = ArrayD::from_shape_vec(IxDyn(shape), output).unwrap();
+    let mut f_order = ArrayD::zeros(IxDyn(shape).f());
+    f_order.assign(&c_order);
+    f_order
 }
 
 #[cfg(test)]

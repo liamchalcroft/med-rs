@@ -327,22 +327,26 @@ fn copy_cropped_region(
     }
 
     let elem_size = header.datatype.size();
-    let _depth = full_shape[0] as usize;
-    let height = full_shape.get(1).copied().unwrap_or(1) as usize;
-    let width = full_shape.get(2).copied().unwrap_or(1) as usize;
+    let dim0 = full_shape[0] as usize;  // First dimension (fastest changing in F-order)
+    let dim1 = full_shape.get(1).copied().unwrap_or(1) as usize;
+    let _dim2 = full_shape.get(2).copied().unwrap_or(1) as usize;
 
     // Allocate contiguous buffer for cropped block
     let total_elements = crop_shape[0] * crop_shape[1] * crop_shape[2];
     let mut buffer = vec![0u8; total_elements * elem_size];
 
+    // NIfTI uses F-order (column-major): first index changes fastest
+    // F-order linear index = x + y * dim0 + z * dim0 * dim1
     let mut dst_cursor = 0;
-    for z in 0..crop_shape[0] {
-        let src_z = crop_offset[0] + z;
+    for z in 0..crop_shape[2] {
+        let src_z = crop_offset[2] + z;
         for y in 0..crop_shape[1] {
             let src_y = crop_offset[1] + y;
-            let src_index = (src_z * height + src_y) * width + crop_offset[2];
+            // F-order: index = x + y * dim0 + z * dim0 * dim1
+            // We copy a contiguous run along the first axis (x)
+            let src_index = crop_offset[0] + src_y * dim0 + src_z * dim0 * dim1;
             let src_byte = data_offset + src_index * elem_size;
-            let row_bytes = crop_shape[2] * elem_size;
+            let row_bytes = crop_shape[0] * elem_size;  // First dimension is contiguous
             let src_slice = mmap.get(src_byte..src_byte + row_bytes).ok_or_else(|| {
                 Error::InvalidDimensions("Crop region exceeds file size".to_string())
             })?;
@@ -882,16 +886,23 @@ mod tests {
     use super::*;
     use ndarray::s;
     use ndarray::ArrayD;
+    use ndarray::ShapeBuilder;
     use tempfile::tempdir;
+
+    fn create_f_order_array(data: Vec<f32>, shape: Vec<usize>) -> ArrayD<f32> {
+        let c_order = ArrayD::from_shape_vec(shape.clone(), data).unwrap();
+        let mut f_order = ArrayD::zeros(ndarray::IxDyn(&shape).f());
+        f_order.assign(&c_order);
+        f_order
+    }
 
     #[test]
     fn test_roundtrip_uncompressed() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.nii");
 
-        // Create test image
-        let data = ArrayD::from_shape_vec(vec![10, 10, 10], (0..1000).map(|i| i as f32).collect())
-            .unwrap();
+        // Create test image with F-order
+        let data = create_f_order_array((0..1000).map(|i| i as f32).collect(), vec![10, 10, 10]);
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -905,7 +916,12 @@ mod tests {
         let loaded = load(&path).unwrap();
 
         assert_eq!(loaded.shape(), &[10, 10, 10]);
-        assert_eq!(loaded.to_f32(), data);
+        // Compare in memory order
+        let loaded_data = loaded.to_f32();
+        assert_eq!(
+            loaded_data.as_slice_memory_order().unwrap(),
+            data.as_slice_memory_order().unwrap()
+        );
     }
 
     #[test]
@@ -913,8 +929,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.nii.gz");
 
-        let data = ArrayD::from_shape_vec(vec![10, 10, 10], (0..1000).map(|i| i as f32).collect())
-            .unwrap();
+        let data = create_f_order_array((0..1000).map(|i| i as f32).collect(), vec![10, 10, 10]);
         let affine = [
             [2.0, 0.0, 0.0, -10.0],
             [0.0, 2.0, 0.0, -10.0],
@@ -928,7 +943,12 @@ mod tests {
 
         assert_eq!(loaded.shape(), &[10, 10, 10]);
         assert_eq!(loaded.affine(), affine);
-        assert_eq!(loaded.to_f32(), data);
+        // Compare in memory order
+        let loaded_data = loaded.to_f32();
+        assert_eq!(
+            loaded_data.as_slice_memory_order().unwrap(),
+            data.as_slice_memory_order().unwrap()
+        );
     }
 
     #[test]
@@ -936,10 +956,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.nii");
 
-        // Create a larger test image for cropping
-        let data =
-            ArrayD::from_shape_vec(vec![64, 64, 32], (0..131072).map(|i| i as f32).collect())
-                .unwrap();
+        // Create a larger test image for cropping with F-order
+        let data = create_f_order_array(
+            (0..131072).map(|i| i as f32).collect(),
+            vec![64, 64, 32],
+        );
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -958,11 +979,22 @@ mod tests {
 
         // Verify the cropped data matches the expected region
         let original_slice = data.slice(s![16..48, 16..48, 8..24]).to_owned();
-        let cropped_data = cropped
-            .to_f32()
-            .into_dimensionality::<ndarray::Ix3>()
-            .unwrap();
-        assert_eq!(cropped_data, original_slice);
+        let cropped_data = cropped.to_f32();
+
+        // Compare by iterating over logical coordinates
+        for x in 0..32 {
+            for y in 0..32 {
+                for z in 0..16 {
+                    let expected = original_slice[[x, y, z]];
+                    let actual = cropped_data[[x, y, z]];
+                    assert!(
+                        (expected - actual).abs() < 1e-5,
+                        "Mismatch at [{},{},{}]: expected {}, got {}",
+                        x, y, z, expected, actual
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -971,8 +1003,7 @@ mod tests {
         let path = dir.path().join("test.nii");
 
         // Create test image with uniform spacing
-        let data = ArrayD::from_shape_vec(vec![32, 32, 16], (0..16384).map(|i| i as f32).collect())
-            .unwrap();
+        let data = create_f_order_array((0..16384).map(|i| i as f32).collect(), vec![32, 32, 16]);
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -1003,11 +1034,10 @@ mod tests {
         // Create test volumes
         for (i, path) in paths.iter().enumerate() {
             let size = 64 * 64 * 32;
-            let data = ArrayD::from_shape_vec(
-                vec![64, 64, 32],
+            let data = create_f_order_array(
                 ((i * size)..((i + 1) * size)).map(|v| v as f32).collect(),
-            )
-            .unwrap();
+                vec![64, 64, 32],
+            );
             let affine = [
                 [1.0, 0.0, 0.0, 0.0],
                 [0.0, 1.0, 0.0, 0.0],
@@ -1046,10 +1076,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.nii");
 
-        // Create test volume
-        let data =
-            ArrayD::from_shape_vec(vec![64, 64, 32], (0..131072).map(|i| i as f32).collect())
-                .unwrap();
+        // Create test volume with F-order
+        let data = create_f_order_array(
+            (0..131072).map(|i| i as f32).collect(),
+            vec![64, 64, 32],
+        );
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -1139,8 +1170,7 @@ mod tests {
     fn training_data_loader_rejects_invalid_overlap() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_invalid.nii");
-        let data = ArrayD::from_shape_vec(vec![16, 16, 16], (0..4096).map(|i| i as f32).collect())
-            .unwrap();
+        let data = create_f_order_array((0..4096).map(|i| i as f32).collect(), vec![16, 16, 16]);
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -1166,12 +1196,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("large_test.nii");
 
-        // Create a large test image (256x256x64)
-        let data = ArrayD::from_shape_vec(
-            vec![256, 256, 64],
+        // Create a large test image (256x256x64) with F-order
+        let data = create_f_order_array(
             (0..(256 * 256 * 64)).map(|i| i as f32).collect(),
-        )
-        .unwrap();
+            vec![256, 256, 64],
+        );
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -1189,13 +1218,24 @@ mod tests {
         let cropped = load_cropped(&path, crop_offset, crop_shape).unwrap();
         assert_eq!(cropped.shape(), crop_shape);
 
-        // Verify data matches expected region
+        // Verify data matches expected region using logical indexing
         let original_slice = data.slice(s![64..128, 64..128, 16..48]).to_owned();
-        let cropped_data = cropped
-            .to_f32()
-            .into_dimensionality::<ndarray::Ix3>()
-            .unwrap();
-        assert_eq!(cropped_data, original_slice);
+        let cropped_data = cropped.to_f32();
+
+        // Compare by iterating over logical coordinates
+        for x in 0..64 {
+            for y in 0..64 {
+                for z in 0..32 {
+                    let expected = original_slice[[x, y, z]];
+                    let actual = cropped_data[[x, y, z]];
+                    assert!(
+                        (expected - actual).abs() < 1e-5,
+                        "Mismatch at [{},{},{}]: expected {}, got {}",
+                        x, y, z, expected, actual
+                    );
+                }
+            }
+        }
 
         // Memory usage should be proportional to crop size, not full image size
         let full_size_bytes = 256 * 256 * 64 * 4; // f32 = 4 bytes

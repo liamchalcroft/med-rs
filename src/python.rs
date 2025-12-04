@@ -5,6 +5,7 @@ use ndarray::{ArrayD, IxDyn};
 use numpy::{IntoPyArray, PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::IntoPyDict;
 
 use crate::nifti::image::ArrayData;
 use crate::nifti::DataType;
@@ -323,6 +324,8 @@ impl PyNiftiImage {
         data: PyReadonlyArrayDyn<'py, f32>,
         affine: Option<[[f32; 4]; 4]>,
     ) -> PyResult<Self> {
+        use ndarray::ShapeBuilder;
+
         let arr = data.as_array();
         let shape = arr.shape();
 
@@ -332,9 +335,30 @@ impl PyNiftiImage {
             ));
         }
 
-        let data_vec: Vec<f32> = arr.iter().copied().collect();
-        let array = ArrayD::from_shape_vec(shape.to_vec(), data_vec)
-            .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?;
+        // Create F-order array to match NIfTI convention
+        // Use as_slice_memory_order to get data in physical layout
+        let data_vec: Vec<f32> = if let Some(slice) = arr.as_slice_memory_order() {
+            slice.to_vec()
+        } else {
+            // Fallback: iterate in logical order and create C-order, then convert
+            arr.iter().copied().collect()
+        };
+
+        // Determine if input is F-order
+        let is_f_order = arr.is_standard_layout() == false && arr.as_slice_memory_order().is_some();
+
+        let array = if is_f_order {
+            // Input was F-order, data_vec is in F-order
+            ArrayD::from_shape_vec(ndarray::IxDyn(shape).f(), data_vec)
+                .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?
+        } else {
+            // Input was C-order, convert to F-order
+            let c_order = ArrayD::from_shape_vec(shape.to_vec(), data_vec)
+                .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?;
+            let mut f_order = ArrayD::zeros(ndarray::IxDyn(shape).f());
+            f_order.assign(&c_order);
+            f_order
+        };
 
         let affine = affine.unwrap_or([
             [1.0, 0.0, 0.0, 0.0],
@@ -1424,8 +1448,26 @@ fn to_numpy_view<'py>(
 
 fn to_numpy_array<'py>(py: Python<'py>, image: &RustNiftiImage) -> Bound<'py, PyArrayDyn<f32>> {
     let data = image.to_f32();
-    let (vec, _offset) = data.into_raw_vec_and_offset();
-    vec.into_pyarray(py).reshape(IxDyn(image.shape())).unwrap()
+    let shape: Vec<usize> = data.shape().to_vec();
+
+    // Data is in F-order (column-major) layout in memory
+    // Use as_slice_memory_order to get bytes in physical order
+    let slice = data.as_slice_memory_order().expect("Array should be contiguous");
+    let np = py.import("numpy").expect("numpy import failed");
+
+    // Create 1D array from F-order bytes
+    let flat = slice.to_vec().into_pyarray(py);
+
+    // Reshape with order='F' to interpret the flat data as F-order
+    // This creates an F-contiguous array matching NIfTI convention
+    np.call_method(
+        "reshape",
+        (flat, &shape),
+        Some(&[("order", "F")].into_py_dict(py).expect("dict failed")),
+    )
+    .expect("reshape failed")
+    .extract::<Bound<'py, PyArrayDyn<f32>>>()
+    .expect("extract failed")
 }
 
 fn to_numpy_view_native<'py>(py: Python<'py>, image: &RustNiftiImage) -> Option<PyObject> {
