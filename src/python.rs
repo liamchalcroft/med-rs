@@ -3,11 +3,52 @@
 
 use ndarray::{ArrayD, IxDyn};
 use numpy::{IntoPyArray, PyArrayDyn, PyArrayMethods, PyReadonlyArrayDyn};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{
+    PyFileNotFoundError, PyIOError, PyMemoryError, PyStopIteration, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::types::IntoPyDict;
 
+use crate::error::Error as MedrsError;
 use crate::nifti::image::ArrayData;
+
+/// Convert a medrs Error to the appropriate Python exception.
+/// This provides proper exception types for different error conditions.
+fn to_py_err(e: MedrsError, context: &str) -> PyErr {
+    match &e {
+        MedrsError::Io(io_err) => {
+            // Map I/O errors to PyIOError
+            PyIOError::new_err(format!("{}: {}", context, io_err))
+        }
+        MedrsError::MemoryAllocation(msg) => {
+            PyMemoryError::new_err(format!("{}: {}", context, msg))
+        }
+        MedrsError::InvalidDimensions(msg)
+        | MedrsError::InvalidAffine(msg)
+        | MedrsError::InvalidCropRegion(msg)
+        | MedrsError::ShapeMismatch(msg)
+        | MedrsError::InvalidFileFormat(msg)
+        | MedrsError::InvalidOrientation(msg)
+        | MedrsError::NonContiguousArray(msg)
+        | MedrsError::Configuration(msg)
+        | MedrsError::Decompression(msg)
+        | MedrsError::Exhausted(msg) => PyValueError::new_err(format!("{}: {}", context, msg)),
+        MedrsError::InvalidMagic(magic) => PyValueError::new_err(format!(
+            "{}: invalid NIfTI magic bytes {:?}",
+            context, magic
+        )),
+        MedrsError::UnsupportedDataType(code) => {
+            PyValueError::new_err(format!("{}: unsupported data type code {}", context, code))
+        }
+        MedrsError::DataTypeMismatch { expected, got } => PyValueError::new_err(format!(
+            "{}: data type mismatch (expected {}, got {})",
+            context, expected, got
+        )),
+        MedrsError::TransformError { operation, reason } => {
+            PyValueError::new_err(format!("{}: {} failed: {}", context, operation, reason))
+        }
+    }
+}
 use crate::nifti::DataType;
 use crate::nifti::{self, NiftiImage as RustNiftiImage};
 use crate::pipeline::TransformPipeline as RustTransformPipeline;
@@ -16,6 +57,222 @@ use crate::transforms::crop::{
     compute_random_spatial_crop_regions,
 };
 use crate::transforms::{self, Interpolation, Orientation};
+
+// ============================================================================
+// Validation helpers for Python boundary
+// ============================================================================
+
+/// Validate shape array has positive dimensions.
+fn validate_shape(shape: &[usize; 3], name: &str) -> PyResult<()> {
+    for (i, &dim) in shape.iter().enumerate() {
+        if dim == 0 {
+            return Err(PyValueError::new_err(format!(
+                "{} dimension {} must be positive (got 0)",
+                name, i
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate spacing array has positive values.
+fn validate_spacing(spacing: &[f32; 3], name: &str) -> PyResult<()> {
+    for (i, &s) in spacing.iter().enumerate() {
+        if s <= 0.0 {
+            return Err(PyValueError::new_err(format!(
+                "{} dimension {} must be positive (got {})",
+                name, i, s
+            )));
+        }
+        if !s.is_finite() {
+            return Err(PyValueError::new_err(format!(
+                "{} dimension {} must be finite (got {})",
+                name, i, s
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a 3-element shape vector and return it as an array.
+fn parse_shape3(values: &[usize], name: &str) -> PyResult<[usize; 3]> {
+    if values.len() != 3 {
+        return Err(PyValueError::new_err(format!(
+            "{} must be a 3-element sequence (got {})",
+            name,
+            values.len()
+        )));
+    }
+    let shape = [values[0], values[1], values[2]];
+    validate_shape(&shape, name)?;
+    Ok(shape)
+}
+
+/// Validate file path is safe and exists.
+fn validate_file_path(path: &str, operation: &str) -> PyResult<std::path::PathBuf> {
+    if path.is_empty() {
+        return Err(PyValueError::new_err(format!(
+            "{}: file path cannot be empty",
+            operation
+        )));
+    }
+
+    // Check for null bytes (prevents injection in C APIs)
+    if path.contains('\0') {
+        return Err(PyValueError::new_err(format!(
+            "{}: file path cannot contain null bytes",
+            operation
+        )));
+    }
+
+    let path_buf = std::path::PathBuf::from(path);
+
+    // For loading operations, check if file exists
+    if operation.contains("load") || operation.contains("read") {
+        if !path_buf.exists() {
+            return Err(PyFileNotFoundError::new_err(format!(
+                "{}: file not found: {}",
+                operation, path
+            )));
+        }
+
+        if !path_buf.is_file() {
+            return Err(PyValueError::new_err(format!(
+                "{}: path is not a file: {}",
+                operation, path
+            )));
+        }
+    }
+
+    // For saving operations, check if parent directory exists
+    if operation.contains("save") || operation.contains("write") {
+        if let Some(parent) = path_buf.parent() {
+            if !parent.exists() {
+                return Err(PyFileNotFoundError::new_err(format!(
+                    "{}: parent directory does not exist: {}",
+                    operation,
+                    parent.display()
+                )));
+            }
+        }
+    }
+
+    Ok(path_buf)
+}
+
+/// Validate intensity range parameters.
+fn validate_intensity_range(min: f64, max: f64, param_name: &str) -> PyResult<()> {
+    if !min.is_finite() {
+        return Err(PyValueError::new_err(format!(
+            "{}: min value must be finite (got {})",
+            param_name, min
+        )));
+    }
+    if !max.is_finite() {
+        return Err(PyValueError::new_err(format!(
+            "{}: max value must be finite (got {})",
+            param_name, max
+        )));
+    }
+    if min > max {
+        return Err(PyValueError::new_err(format!(
+            "{}: min ({}) cannot be greater than max ({})",
+            param_name, min, max
+        )));
+    }
+    Ok(())
+}
+
+/// Validate probability value (0.0 to 1.0).
+fn validate_probability(p: f64, param_name: &str) -> PyResult<()> {
+    if !p.is_finite() {
+        return Err(PyValueError::new_err(format!(
+            "{}: probability must be finite (got {})",
+            param_name, p
+        )));
+    }
+    if !(0.0..=1.0).contains(&p) {
+        return Err(PyValueError::new_err(format!(
+            "{}: probability must be between 0.0 and 1.0 (got {})",
+            param_name, p
+        )));
+    }
+    Ok(())
+}
+
+/// Shared helper for creating NiftiImage from numpy array.
+/// Handles F-order conversion and validation.
+fn create_nifti_from_numpy_array(
+    arr: ndarray::ArrayViewD<'_, f32>,
+    affine: Option<[[f32; 4]; 4]>,
+) -> PyResult<RustNiftiImage> {
+    use ndarray::ShapeBuilder;
+
+    let shape = arr.shape();
+
+    if shape.len() < 3 {
+        return Err(PyValueError::new_err(
+            "Array must have at least 3 dimensions (D,H,W)",
+        ));
+    }
+
+    // Validate that no dimension is zero
+    for (i, &dim) in shape.iter().enumerate() {
+        if dim == 0 {
+            return Err(PyValueError::new_err(format!(
+                "Array dimension {} cannot be 0",
+                i
+            )));
+        }
+    }
+
+    // Check for integer overflow when casting to u16 (NIfTI header limitation)
+    for (i, &dim) in shape.iter().enumerate() {
+        if dim > u16::MAX as usize {
+            return Err(PyValueError::new_err(format!(
+                "Array dimension {} ({}) exceeds maximum NIfTI dimension size ({})",
+                i,
+                dim,
+                u16::MAX
+            )));
+        }
+    }
+
+    // Create F-order array to match NIfTI convention
+    // Use as_slice_memory_order to get data in physical layout
+    #[allow(clippy::option_if_let_else)]
+    let data_vec: Vec<f32> = if let Some(slice) = arr.as_slice_memory_order() {
+        slice.to_vec()
+    } else {
+        // Fallback: iterate in logical order
+        arr.iter().copied().collect()
+    };
+
+    // Determine if input is F-order
+    let is_f_order = !arr.is_standard_layout() && arr.as_slice_memory_order().is_some();
+
+    let array = if is_f_order {
+        // Input was F-order, data_vec is in F-order
+        ArrayD::from_shape_vec(IxDyn(shape).f(), data_vec)
+            .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?
+    } else {
+        // Input was C-order, convert to F-order
+        let c_order = ArrayD::from_shape_vec(shape.to_vec(), data_vec)
+            .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?;
+        let mut f_order = ArrayD::zeros(IxDyn(shape).f());
+        f_order.assign(&c_order);
+        f_order
+    };
+
+    let affine = affine.unwrap_or([
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]);
+
+    Ok(RustNiftiImage::from_array(array, affine))
+}
 
 /// A NIfTI image with header metadata and voxel data.
 ///
@@ -39,33 +296,9 @@ impl PyNiftiImage {
     ///     affine: 4x4 affine transformation matrix (optional)
     #[new]
     #[pyo3(signature = (data, affine=None))]
-    fn new<'py>(
-        data: PyReadonlyArrayDyn<'py, f32>,
-        affine: Option<[[f32; 4]; 4]>,
-    ) -> PyResult<Self> {
-        let arr = data.as_array();
-        let shape = arr.shape();
-
-        if shape.len() < 3 {
-            return Err(PyValueError::new_err(
-                "Array must have at least 3 dimensions (D,H,W)",
-            ));
-        }
-
-        let data_vec: Vec<f32> = arr.iter().copied().collect();
-        let array = ArrayD::from_shape_vec(shape.to_vec(), data_vec)
-            .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?;
-
-        let affine = affine.unwrap_or([
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ]);
-
-        Ok(Self {
-            inner: RustNiftiImage::from_array(array, affine),
-        })
+    fn new(data: PyReadonlyArrayDyn<'_, f32>, affine: Option<[[f32; 4]; 4]>) -> PyResult<Self> {
+        let inner = create_nifti_from_numpy_array(data.as_array(), affine)?;
+        Ok(Self { inner })
     }
 
     /// Image shape as (depth, height, width).
@@ -115,7 +348,7 @@ impl PyNiftiImage {
     ///
     /// Uses zero-copy views when possible; may fall back to a copy for non-contiguous data.
     #[getter]
-    fn data<'py>(&self, py: Python<'py>) -> Bound<'py, PyArrayDyn<f32>> {
+    fn data<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
         self.to_numpy(py)
     }
 
@@ -123,24 +356,25 @@ impl PyNiftiImage {
     ///
     /// Similar to nibabel's get_fdata(). Applies scaling factors if present.
     /// Supports arbitrary ndim.
-    fn to_numpy<'py>(&self, py: Python<'py>) -> Bound<'py, PyArrayDyn<f32>> {
+    fn to_numpy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
         if let Some(arr) = to_numpy_view(py, &self.inner) {
-            return arr;
+            return Ok(arr);
         }
         to_numpy_array(py, &self.inner)
     }
 
     /// Get image data as numpy view when possible (may fall back to copy).
-    fn to_numpy_view<'py>(&self, py: Python<'py>) -> Bound<'py, PyArrayDyn<f32>> {
+    #[allow(clippy::option_if_let_else)]
+    fn to_numpy_view<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
         if let Some(arr) = to_numpy_view(py, &self.inner) {
-            arr
+            Ok(arr)
         } else {
             to_numpy_array(py, &self.inner)
         }
     }
 
     /// Get image data as a torch tensor (shares memory when possible).
-    fn to_torch<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    fn to_torch(&self, py: Python<'_>) -> PyResult<PyObject> {
         let torch = py.import("torch")?;
         let dtype = torch_dtype(py, self.inner.dtype());
         let has_dtype = dtype.is_some();
@@ -150,10 +384,17 @@ impl PyNiftiImage {
             if let Some(np_view) = to_numpy_view_native(py, &self.inner) {
                 np_view
             } else {
-                arraydata_to_numpy(py, &self.inner.owned_data(), self.inner.shape())?
+                arraydata_to_numpy(
+                    py,
+                    &self
+                        .inner
+                        .owned_data()
+                        .map_err(|e| to_py_err(e, "to_torch owned_data"))?,
+                    self.inner.shape(),
+                )?
             }
         } else {
-            to_numpy_array(py, &self.inner)
+            to_numpy_array(py, &self.inner)?
                 .into_pyobject(py)?
                 .into_any()
                 .unbind()
@@ -170,9 +411,9 @@ impl PyNiftiImage {
     }
 
     /// Get image data as a JAX array (shares memory via numpy when possible).
-    fn to_jax<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
+    fn to_jax(&self, py: Python<'_>) -> PyResult<PyObject> {
         let jnp = py.import("jax.numpy")?;
-        let np_obj = to_numpy_array(py, &self.inner);
+        let np_obj = to_numpy_array(py, &self.inner)?;
         let arr = jnp.getattr("array")?.call1((np_obj,))?;
         Ok(arr.unbind())
     }
@@ -182,9 +423,9 @@ impl PyNiftiImage {
     /// This is the most efficient way to load medical imaging data directly
     /// into PyTorch with the target precision and device placement.
     #[pyo3(signature = (dtype=None, device=None))]
-    fn to_torch_with_dtype_and_device<'py>(
+    fn to_torch_with_dtype_and_device(
         &self,
-        py: Python<'py>,
+        py: Python<'_>,
         dtype: Option<PyObject>,
         device: Option<&str>,
     ) -> PyResult<PyObject> {
@@ -195,7 +436,7 @@ impl PyNiftiImage {
         let np_obj = if let Some(np_view) = to_numpy_view_native(py, &self.inner) {
             np_view
         } else {
-            to_numpy_array(py, &self.inner)
+            to_numpy_array(py, &self.inner)?
                 .into_pyobject(py)?
                 .into_any()
                 .unbind()
@@ -220,10 +461,11 @@ impl PyNiftiImage {
     ///
     /// This is the most efficient way to load medical imaging data directly
     /// into JAX with the target precision and device placement.
+    #[allow(clippy::useless_let_if_seq)]
     #[pyo3(signature = (dtype=None, device=None))]
-    fn to_jax_with_dtype_and_device<'py>(
+    fn to_jax_with_dtype_and_device(
         &self,
-        py: Python<'py>,
+        py: Python<'_>,
         dtype: Option<PyObject>,
         device: Option<&str>,
     ) -> PyResult<PyObject> {
@@ -231,24 +473,23 @@ impl PyNiftiImage {
         let jax = py.import("jax")?;
         let _jnp = py.import("jax.numpy")?;
 
-        // Get device object
+        // Get device object using correct JAX API
         let device_obj = if device_str == "cpu" {
-            jax.getattr("devices")?.call1((0,))?
-        } else if device_str.starts_with("cuda") {
-            let cuda_devices = jax.getattr("devices")?.call1(("cuda",))?;
-            if device_str == "cuda" {
-                cuda_devices.get_item(0)?
-            } else {
-                let device_id: usize = device_str
-                    .strip_prefix("cuda:")
-                    .unwrap_or("0")
-                    .parse()
-                    .unwrap_or(0);
-                cuda_devices.get_item(device_id)?
-            }
+            let cpu_devices = jax.getattr("devices")?.call1(("cpu",))?;
+            cpu_devices.get_item(0)?
+        } else if device_str.starts_with("cuda") || device_str.starts_with("gpu") {
+            // JAX uses "gpu" not "cuda" for CUDA devices
+            let gpu_devices = jax.getattr("devices")?.call1(("gpu",))?;
+            let device_id: usize = device_str
+                .strip_prefix("cuda:")
+                .or_else(|| device_str.strip_prefix("gpu:"))
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            gpu_devices.get_item(device_id)?
         } else {
             return Err(PyValueError::new_err(format!(
-                "Unsupported device: {}",
+                "Unsupported device: {}. Use 'cpu', 'cuda', 'cuda:N', 'gpu', or 'gpu:N'",
                 device_str
             )));
         };
@@ -275,7 +516,7 @@ impl PyNiftiImage {
         }
 
         // Fallback to regular numpy array with efficient transfer
-        let np_obj = to_numpy_array(py, &self.inner);
+        let np_obj = to_numpy_array(py, &self.inner)?;
         let mut arr = jnp.getattr("array")?.call1((np_obj,))?;
 
         // Apply dtype if specified
@@ -293,12 +534,15 @@ impl PyNiftiImage {
     /// Get image data as a numpy array with native dtype.
     ///
     /// Half/bfloat16 are returned as float32 for compatibility.
-    fn to_numpy_native<'py>(&self, py: Python<'py>) -> PyResult<PyObject> {
-        Ok(arraydata_to_numpy(
+    fn to_numpy_native(&self, py: Python<'_>) -> PyResult<PyObject> {
+        arraydata_to_numpy(
             py,
-            &self.inner.owned_data(),
+            &self
+                .inner
+                .owned_data()
+                .map_err(|e| to_py_err(e, "to_numpy_native"))?,
             self.inner.shape(),
-        )?)
+        )
     }
 
     /// Create a new NiftiImage from a numpy array.
@@ -324,59 +568,75 @@ impl PyNiftiImage {
         data: PyReadonlyArrayDyn<'py, f32>,
         affine: Option<[[f32; 4]; 4]>,
     ) -> PyResult<Self> {
-        use ndarray::ShapeBuilder;
-
-        let arr = data.as_array();
-        let shape = arr.shape();
-
-        if shape.len() < 3 {
-            return Err(PyValueError::new_err(
-                "Array must have at least 3 dimensions (D,H,W)",
-            ));
-        }
-
-        // Create F-order array to match NIfTI convention
-        // Use as_slice_memory_order to get data in physical layout
-        let data_vec: Vec<f32> = if let Some(slice) = arr.as_slice_memory_order() {
-            slice.to_vec()
-        } else {
-            // Fallback: iterate in logical order and create C-order, then convert
-            arr.iter().copied().collect()
-        };
-
-        // Determine if input is F-order
-        let is_f_order = arr.is_standard_layout() == false && arr.as_slice_memory_order().is_some();
-
-        let array = if is_f_order {
-            // Input was F-order, data_vec is in F-order
-            ArrayD::from_shape_vec(ndarray::IxDyn(shape).f(), data_vec)
-                .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?
-        } else {
-            // Input was C-order, convert to F-order
-            let c_order = ArrayD::from_shape_vec(shape.to_vec(), data_vec)
-                .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?;
-            let mut f_order = ArrayD::zeros(ndarray::IxDyn(shape).f());
-            f_order.assign(&c_order);
-            f_order
-        };
-
-        let affine = affine.unwrap_or([
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ]);
-
-        Ok(Self {
-            inner: RustNiftiImage::from_array(array, affine),
-        })
+        let inner = create_nifti_from_numpy_array(data.as_array(), affine)?;
+        Ok(Self { inner })
     }
 
     /// Save image to file.
     ///
     /// Format is determined by extension (.nii or .nii.gz).
     fn save(&self, path: &str) -> PyResult<()> {
-        nifti::save(&self.inner, path).map_err(|e| PyValueError::new_err(e.to_string()))
+        let validated_path = validate_file_path(path, "save")?;
+        let path_str = validated_path
+            .to_str()
+            .ok_or_else(|| PyValueError::new_err("path contains invalid UTF-8"))?;
+        nifti::save(&self.inner, path_str)
+            .map_err(|e| to_py_err(e, &format!("Failed to save {}", path)))
+    }
+
+    /// Convert image to a different data type.
+    ///
+    /// This is useful for reducing file size when saving. For example,
+    /// converting from float32 to bfloat16 reduces storage by 50%.
+    ///
+    /// Args:
+    ///     dtype: Target dtype as string. Supported values:
+    ///         - "float32", "f32" - 32-bit float (default)
+    ///         - "float64", "f64" - 64-bit float
+    ///         - "float16", "f16" - IEEE 754 half precision
+    ///         - "bfloat16", "bf16" - Brain floating point 16-bit
+    ///         - "int8", "i8" - Signed 8-bit integer
+    ///         - "uint8", "u8" - Unsigned 8-bit integer
+    ///         - "int16", "i16" - Signed 16-bit integer
+    ///         - "uint16", "u16" - Unsigned 16-bit integer
+    ///         - "int32", "i32" - Signed 32-bit integer
+    ///         - "uint32", "u32" - Unsigned 32-bit integer
+    ///         - "int64", "i64" - Signed 64-bit integer
+    ///         - "uint64", "u64" - Unsigned 64-bit integer
+    ///
+    /// Returns:
+    ///     New MedicalImage with converted dtype
+    ///
+    /// Example:
+    ///     >>> img = medrs.load("volume.nii.gz")
+    ///     >>> img_bf16 = img.with_dtype("bfloat16")
+    ///     >>> img_bf16.save("volume_bf16.nii.gz")  # 50% smaller file
+    fn with_dtype(&self, dtype: &str) -> PyResult<Self> {
+        let target_dtype = match dtype.to_lowercase().as_str() {
+            "float32" | "f32" => nifti::DataType::Float32,
+            "float64" | "f64" => nifti::DataType::Float64,
+            "float16" | "f16" => nifti::DataType::Float16,
+            "bfloat16" | "bf16" => nifti::DataType::BFloat16,
+            "int8" | "i8" => nifti::DataType::Int8,
+            "uint8" | "u8" => nifti::DataType::UInt8,
+            "int16" | "i16" => nifti::DataType::Int16,
+            "uint16" | "u16" => nifti::DataType::UInt16,
+            "int32" | "i32" => nifti::DataType::Int32,
+            "uint32" | "u32" => nifti::DataType::UInt32,
+            "int64" | "i64" => nifti::DataType::Int64,
+            "uint64" | "u64" => nifti::DataType::UInt64,
+            _ => return Err(PyValueError::new_err(format!(
+                "Unsupported dtype '{}'. Use: float32, float64, float16, bfloat16, int8, uint8, int16, uint16, int32, uint32, int64, uint64",
+                dtype
+            ))),
+        };
+
+        Ok(Self {
+            inner: self
+                .inner
+                .with_dtype(target_dtype)
+                .map_err(|e| to_py_err(e, "with_dtype"))?,
+        })
     }
 
     /// Resample to target voxel spacing.
@@ -400,9 +660,9 @@ impl PyNiftiImage {
             }
         };
 
-        Ok(Self {
-            inner: transforms::resample_to_spacing(&self.inner, spacing, interp),
-        })
+        let resampled = transforms::resample_to_spacing(&self.inner, spacing, interp)
+            .map_err(|e| PyValueError::new_err(format!("Resampling failed: {}", e)))?;
+        Ok(Self { inner: resampled })
     }
 
     /// Resample to target shape.
@@ -426,9 +686,9 @@ impl PyNiftiImage {
             }
         };
 
-        Ok(Self {
-            inner: transforms::resample_to_shape(&self.inner, shape, interp),
-        })
+        let resampled = transforms::resample_to_shape(&self.inner, shape, interp)
+            .map_err(|e| PyValueError::new_err(format!("Resampling failed: {}", e)))?;
+        Ok(Self { inner: resampled })
     }
 
     /// Reorient to target orientation.
@@ -439,12 +699,13 @@ impl PyNiftiImage {
     /// Returns:
     ///     New NiftiImage (supports method chaining)
     fn reorient(&self, orientation: &str) -> PyResult<Self> {
-        let target = Orientation::from_str(orientation).ok_or_else(|| {
-            PyValueError::new_err(format!("Invalid orientation code: {}. Valid codes: RAS, LAS, LPI, RPI, ASL, ARS, ALI, ARI, IPL, SPR, IAR, SAR, IPR, SPL, IAL, SAL", orientation))
-        })?;
+        let target: Orientation = orientation
+            .parse()
+            .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
 
         Ok(Self {
-            inner: transforms::reorient(&self.inner, target),
+            inner: transforms::reorient(&self.inner, target)
+                .map_err(|e| PyValueError::new_err(format!("Reorientation failed: {}", e)))?,
         })
     }
 
@@ -452,10 +713,11 @@ impl PyNiftiImage {
     ///
     /// Returns:
     ///     New NiftiImage (supports method chaining)
-    fn z_normalize(&self) -> Self {
-        Self {
-            inner: transforms::z_normalization(&self.inner),
-        }
+    fn z_normalize(&self) -> PyResult<Self> {
+        Ok(Self {
+            inner: transforms::z_normalization(&self.inner)
+                .map_err(|e| to_py_err(e, "z_normalize"))?,
+        })
     }
 
     /// Rescale intensity to range [min, max].
@@ -466,10 +728,11 @@ impl PyNiftiImage {
     ///
     /// Returns:
     ///     New NiftiImage (supports method chaining)
-    fn rescale(&self, out_min: f64, out_max: f64) -> Self {
-        Self {
-            inner: transforms::rescale_intensity(&self.inner, out_min, out_max),
-        }
+    fn rescale(&self, out_min: f64, out_max: f64) -> PyResult<Self> {
+        Ok(Self {
+            inner: transforms::rescale_intensity(&self.inner, out_min, out_max)
+                .map_err(|e| to_py_err(e, "rescale"))?,
+        })
     }
 
     /// Clamp intensity values to range [min, max].
@@ -480,10 +743,10 @@ impl PyNiftiImage {
     ///
     /// Returns:
     ///     New NiftiImage (supports method chaining)
-    fn clamp(&self, min: f64, max: f64) -> Self {
-        Self {
-            inner: transforms::clamp(&self.inner, min, max),
-        }
+    fn clamp(&self, min: f64, max: f64) -> PyResult<Self> {
+        Ok(Self {
+            inner: transforms::clamp(&self.inner, min, max).map_err(|e| to_py_err(e, "clamp"))?,
+        })
     }
 
     /// Crop or pad to target shape.
@@ -534,10 +797,13 @@ impl PyNiftiImage {
     ///     >>> img = medrs.load("brain.nii.gz").materialize()
     ///     >>> # Now transforms are fast as data is in memory
     ///     >>> processed = img.z_normalize().rescale(0, 1).flip([0])
-    fn materialize(&self) -> Self {
-        Self {
-            inner: self.inner.materialize(),
-        }
+    fn materialize(&self) -> PyResult<Self> {
+        Ok(Self {
+            inner: self
+                .inner
+                .materialize()
+                .map_err(|e| to_py_err(e, "materialize"))?,
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -553,28 +819,32 @@ impl PyNiftiImage {
 
 /// Z-score normalize an image (zero mean, unit variance).
 #[pyfunction]
-fn z_normalization(image: &PyNiftiImage) -> PyNiftiImage {
-    PyNiftiImage {
-        inner: transforms::z_normalization(&image.inner),
-    }
+fn z_normalization(image: &PyNiftiImage) -> PyResult<PyNiftiImage> {
+    Ok(PyNiftiImage {
+        inner: transforms::z_normalization(&image.inner)
+            .map_err(|e| to_py_err(e, "z_normalization"))?,
+    })
 }
 
 /// Rescale intensity to the provided range.
 #[pyfunction]
 #[pyo3(signature = (image, output_range=(0.0, 1.0)))]
-fn rescale_intensity(image: &PyNiftiImage, output_range: (f64, f64)) -> PyNiftiImage {
+fn rescale_intensity(image: &PyNiftiImage, output_range: (f64, f64)) -> PyResult<PyNiftiImage> {
     let (out_min, out_max) = output_range;
-    PyNiftiImage {
-        inner: transforms::rescale_intensity(&image.inner, out_min, out_max),
-    }
+    Ok(PyNiftiImage {
+        inner: transforms::rescale_intensity(&image.inner, out_min, out_max)
+            .map_err(|e| to_py_err(e, "rescale_intensity"))?,
+    })
 }
 
 /// Clamp intensity values into a fixed range.
 #[pyfunction]
-fn clamp(image: &PyNiftiImage, min_value: f64, max_value: f64) -> PyNiftiImage {
-    PyNiftiImage {
-        inner: transforms::clamp(&image.inner, min_value, max_value),
-    }
+fn clamp(image: &PyNiftiImage, min_value: f64, max_value: f64) -> PyResult<PyNiftiImage> {
+    validate_intensity_range(min_value, max_value, "clamp")?;
+    Ok(PyNiftiImage {
+        inner: transforms::clamp(&image.inner, min_value, max_value)
+            .map_err(|e| to_py_err(e, "clamp"))?,
+    })
 }
 
 /// Crop or pad an image to the target shape.
@@ -613,23 +883,21 @@ fn resample(
 
     let spacing = [target_spacing.0, target_spacing.1, target_spacing.2];
 
-    Ok(PyNiftiImage {
-        inner: transforms::resample_to_spacing(&image.inner, spacing, interp),
-    })
+    let resampled = transforms::resample_to_spacing(&image.inner, spacing, interp)
+        .map_err(|e| PyValueError::new_err(format!("Resampling failed: {}", e)))?;
+    Ok(PyNiftiImage { inner: resampled })
 }
 
 /// Reorient an image to the target orientation code (e.g., RAS or LPS).
 #[pyfunction]
 fn reorient(image: &PyNiftiImage, orientation: &str) -> PyResult<PyNiftiImage> {
-    let target = Orientation::from_str(orientation).ok_or_else(|| {
-        PyValueError::new_err(format!(
-            "Invalid orientation code: {}. Expected three-letter code like RAS or LPS",
-            orientation
-        ))
-    })?;
+    let target: Orientation = orientation
+        .parse()
+        .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
 
     Ok(PyNiftiImage {
-        inner: transforms::reorient(&image.inner, target),
+        inner: transforms::reorient(&image.inner, target)
+            .map_err(|e| PyValueError::new_err(format!("Reorientation failed: {}", e)))?,
     })
 }
 
@@ -647,9 +915,13 @@ fn reorient(image: &PyNiftiImage, orientation: &str) -> PyResult<PyNiftiImage> {
 ///     >>> img = medrs.load("brain.nii.gz")
 #[pyfunction]
 fn load(path: &str) -> PyResult<PyNiftiImage> {
-    nifti::load(path)
+    let validated_path = validate_file_path(path, "load")?;
+    let path_str = validated_path
+        .to_str()
+        .ok_or_else(|| PyValueError::new_err("path contains invalid UTF-8"))?;
+    nifti::load(path_str)
         .map(|inner| PyNiftiImage { inner })
-        .map_err(|e| PyValueError::new_err(format!("Failed to load {}: {}", path, e)))
+        .map_err(|e| to_py_err(e, &format!("Failed to load {}", path)))
 }
 
 /// Load a NIfTI image directly to a PyTorch tensor.
@@ -677,8 +949,7 @@ fn load_to_torch(
     device: &str,
 ) -> PyResult<PyObject> {
     // Load image using medrs
-    let img = nifti::load(path)
-        .map_err(|e| PyValueError::new_err(format!("Failed to load {}: {}", path, e)))?;
+    let img = nifti::load(path).map_err(|e| to_py_err(e, &format!("Failed to load {}", path)))?;
 
     // Convert to PyTorch tensor directly
     let py_img = PyNiftiImage { inner: img };
@@ -709,7 +980,7 @@ fn load_cropped(
 ) -> PyResult<PyNiftiImage> {
     nifti::load_cropped(path, crop_offset, crop_shape)
         .map(|inner| PyNiftiImage { inner })
-        .map_err(|e| PyValueError::new_err(format!("Failed to load cropped {}: {}", path, e)))
+        .map_err(|e| to_py_err(e, &format!("Failed to load cropped {}", path)))
 }
 
 /// Load a cropped region with optional reorientation and resampling.
@@ -748,8 +1019,8 @@ fn load_resampled(
 
     let orientation = match target_orientation {
         Some(s) => Some(
-            Orientation::from_str(&s)
-                .ok_or_else(|| PyValueError::new_err(format!("Invalid orientation: {}", s)))?,
+            s.parse::<Orientation>()
+                .map_err(|e| PyValueError::new_err(format!("{}", e)))?,
         ),
         None => None,
     };
@@ -763,7 +1034,7 @@ fn load_resampled(
 
     nifti::load_cropped_config(path, config)
         .map(|inner| PyNiftiImage { inner })
-        .map_err(|e| PyValueError::new_err(format!("Failed to load cropped {}: {}", path, e)))
+        .map_err(|e| to_py_err(e, &format!("Failed to load cropped {}", path)))
 }
 
 /// Load a cropped region directly into a PyTorch tensor without numpy intermediate.
@@ -796,6 +1067,7 @@ fn load_resampled(
 ///     ... )
 #[pyfunction]
 #[pyo3(signature = (path, output_shape, target_spacing=None, target_orientation=None, output_offset=None, dtype=None, device="cpu"))]
+#[allow(clippy::too_many_arguments)]
 fn load_cropped_to_torch(
     py: Python<'_>,
     path: &str,
@@ -808,11 +1080,17 @@ fn load_cropped_to_torch(
 ) -> PyResult<PyObject> {
     use crate::transforms::Orientation;
 
+    // Validate inputs at Python boundary
+    validate_shape(&output_shape, "output_shape")?;
+    if let Some(ref spacing) = target_spacing {
+        validate_spacing(spacing, "target_spacing")?;
+    }
+
     // Load image using our I/O-optimized function
     let orientation = match target_orientation {
         Some(s) => Some(
-            Orientation::from_str(&s)
-                .ok_or_else(|| PyValueError::new_err(format!("Invalid orientation: {}", s)))?,
+            s.parse::<Orientation>()
+                .map_err(|e| PyValueError::new_err(format!("{}", e)))?,
         ),
         None => None,
     };
@@ -825,7 +1103,7 @@ fn load_cropped_to_torch(
     };
 
     let img = nifti::load_cropped_config(path, config)
-        .map_err(|e| PyValueError::new_err(format!("Failed to load cropped {}: {}", path, e)))?;
+        .map_err(|e| to_py_err(e, &format!("Failed to load cropped {}", path)))?;
 
     // Convert to PyTorch tensor directly using our optimized I/O + tensor conversion
     let py_img = PyNiftiImage { inner: img };
@@ -862,6 +1140,7 @@ fn load_cropped_to_torch(
 ///     ... )
 #[pyfunction]
 #[pyo3(signature = (path, output_shape, target_spacing=None, target_orientation=None, output_offset=None, dtype=None, device="cpu"))]
+#[allow(clippy::too_many_arguments)]
 fn load_cropped_to_jax(
     py: Python<'_>,
     path: &str,
@@ -874,11 +1153,17 @@ fn load_cropped_to_jax(
 ) -> PyResult<PyObject> {
     use crate::transforms::Orientation;
 
+    // Validate inputs at Python boundary
+    validate_shape(&output_shape, "output_shape")?;
+    if let Some(ref spacing) = target_spacing {
+        validate_spacing(spacing, "target_spacing")?;
+    }
+
     // Load image using our I/O-optimized function
     let orientation = match target_orientation {
         Some(s) => Some(
-            Orientation::from_str(&s)
-                .ok_or_else(|| PyValueError::new_err(format!("Invalid orientation: {}", s)))?,
+            s.parse::<Orientation>()
+                .map_err(|e| PyValueError::new_err(format!("{}", e)))?,
         ),
         None => None,
     };
@@ -891,7 +1176,7 @@ fn load_cropped_to_jax(
     };
 
     let img = nifti::load_cropped_config(path, config)
-        .map_err(|e| PyValueError::new_err(format!("Failed to load cropped {}: {}", path, e)))?;
+        .map_err(|e| to_py_err(e, &format!("Failed to load cropped {}", path)))?;
 
     // Convert to JAX array directly using our optimized I/O + array conversion
     let py_img = PyNiftiImage { inner: img };
@@ -902,7 +1187,7 @@ fn load_cropped_to_jax(
 ///
 /// This is the most efficient way to load training patches from multiple volumes.
 /// Maintains an LRU cache and prefetches upcoming data to maximize throughput.
-#[pyclass]
+#[pyclass(name = "TrainingDataLoader")]
 pub struct PyTrainingDataLoader {
     loader: nifti::TrainingDataLoader,
 }
@@ -920,15 +1205,17 @@ impl PyTrainingDataLoader {
     ///     cache_size: Maximum number of patches to cache
     ///
     /// Example:
-    ///     >>> loader = medrs.TrainingDataLoader(
-    ///     ...     volumes=["vol1.nii", "vol2.nii"],
-    ///     ...     patch_size=[64, 64, 64],
-    ///     ...     patches_per_volume=4,
-    ///     ...     patch_overlap=[0, 0, 0],
-    ///     ...     randomize=True,
-    ///     ...     cache_size=1000
-    ///     ... )
-    ///     >>> patch = loader.next_patch()
+    ///     ```python
+    ///     loader = medrs.TrainingDataLoader(
+    ///         volumes=["vol1.nii", "vol2.nii"],
+    ///         patch_size=[64, 64, 64],
+    ///         patches_per_volume=4,
+    ///         patch_overlap=[0, 0, 0],
+    ///         randomize=True,
+    ///         cache_size=1000
+    ///     )
+    ///     patch = loader.next_patch()
+    ///     ```
     #[new]
     #[pyo3(signature = (volumes, patch_size, patches_per_volume, patch_overlap, randomize, cache_size=None))]
     fn new(
@@ -966,10 +1253,11 @@ impl PyTrainingDataLoader {
     /// Returns the next training patch with automatic prefetching.
     /// Raises StopIteration when all patches are processed.
     fn next_patch(&mut self) -> PyResult<PyNiftiImage> {
-        self.loader
-            .next_patch()
-            .map(|inner| PyNiftiImage { inner })
-            .map_err(|e| PyValueError::new_err(format!("Failed to get next patch: {}", e)))
+        match self.loader.next_patch() {
+            Ok(inner) => Ok(PyNiftiImage { inner }),
+            Err(MedrsError::Exhausted(msg)) => Err(PyStopIteration::new_err(msg)),
+            Err(e) => Err(to_py_err(e, "next_patch")),
+        }
     }
 
     fn __len__(&self) -> usize {
@@ -983,8 +1271,12 @@ impl PyTrainingDataLoader {
         Ok(slf)
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> Option<PyNiftiImage> {
-        slf.next_patch().ok()
+    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<PyNiftiImage>> {
+        match slf.loader.next_patch() {
+            Ok(img) => Ok(Some(PyNiftiImage { inner: img })),
+            Err(MedrsError::Exhausted(_)) => Ok(None),
+            Err(e) => Err(to_py_err(e, "iterator")),
+        }
     }
 
     /// Get performance statistics.
@@ -1124,12 +1416,18 @@ impl PyTransformPipeline {
     ///
     /// Returns:
     ///     Transformed NiftiImage
-    fn apply(&self, image: &PyNiftiImage) -> PyNiftiImage {
-        PyNiftiImage {
-            inner: self.inner.apply(&image.inner),
-        }
+    ///
+    /// Raises:
+    ///     ValueError: If the pipeline fails to apply
+    fn apply(&self, image: &PyNiftiImage) -> PyResult<PyNiftiImage> {
+        let result = self
+            .inner
+            .apply(&image.inner)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(PyNiftiImage { inner: result })
     }
 
+    #[allow(clippy::unused_self)]
     fn __repr__(&self) -> String {
         "TransformPipeline(...)".to_string()
     }
@@ -1158,6 +1456,21 @@ fn random_flip(
     prob: Option<f32>,
     seed: Option<u64>,
 ) -> PyResult<PyNiftiImage> {
+    // Validate probability if provided
+    if let Some(p) = prob {
+        validate_probability(p as f64, "random_flip")?;
+    }
+
+    // Validate axes
+    for &axis in &axes {
+        if axis >= 3 {
+            return Err(PyValueError::new_err(format!(
+                "random_flip: axis {} is out of range (must be 0, 1, or 2)",
+                axis
+            )));
+        }
+    }
+
     Ok(PyNiftiImage {
         inner: transforms::random_flip(&image.inner, &axes, prob, seed)
             .map_err(|e| PyValueError::new_err(e.to_string()))?,
@@ -1179,10 +1492,11 @@ fn random_gaussian_noise(
     image: &PyNiftiImage,
     std: Option<f32>,
     seed: Option<u64>,
-) -> PyNiftiImage {
-    PyNiftiImage {
-        inner: transforms::random_gaussian_noise(&image.inner, std, seed),
-    }
+) -> PyResult<PyNiftiImage> {
+    Ok(PyNiftiImage {
+        inner: transforms::random_gaussian_noise(&image.inner, std, seed)
+            .map_err(|e| to_py_err(e, "random_gaussian_noise"))?,
+    })
 }
 
 /// Randomly scale image intensity.
@@ -1202,10 +1516,11 @@ fn random_intensity_scale(
     image: &PyNiftiImage,
     scale_range: Option<f32>,
     seed: Option<u64>,
-) -> PyNiftiImage {
-    PyNiftiImage {
-        inner: transforms::random_intensity_scale(&image.inner, scale_range, seed),
-    }
+) -> PyResult<PyNiftiImage> {
+    Ok(PyNiftiImage {
+        inner: transforms::random_intensity_scale(&image.inner, scale_range, seed)
+            .map_err(|e| to_py_err(e, "random_intensity_scale"))?,
+    })
 }
 
 /// Randomly shift image intensity.
@@ -1225,10 +1540,11 @@ fn random_intensity_shift(
     image: &PyNiftiImage,
     shift_range: Option<f32>,
     seed: Option<u64>,
-) -> PyNiftiImage {
-    PyNiftiImage {
-        inner: transforms::random_intensity_shift(&image.inner, shift_range, seed),
-    }
+) -> PyResult<PyNiftiImage> {
+    Ok(PyNiftiImage {
+        inner: transforms::random_intensity_shift(&image.inner, shift_range, seed)
+            .map_err(|e| to_py_err(e, "random_intensity_shift"))?,
+    })
 }
 
 /// Randomly rotate the image by 90-degree increments.
@@ -1272,10 +1588,11 @@ fn random_gamma(
     image: &PyNiftiImage,
     gamma_range: Option<(f32, f32)>,
     seed: Option<u64>,
-) -> PyNiftiImage {
-    PyNiftiImage {
-        inner: transforms::random_gamma(&image.inner, gamma_range, seed),
-    }
+) -> PyResult<PyNiftiImage> {
+    Ok(PyNiftiImage {
+        inner: transforms::random_gamma(&image.inner, gamma_range, seed)
+            .map_err(|e| to_py_err(e, "random_gamma"))?,
+    })
 }
 
 /// Apply a random combination of common augmentations.
@@ -1352,11 +1669,7 @@ fn _medrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     Ok(())
 }
 
-fn arraydata_to_numpy<'py>(
-    py: Python<'py>,
-    data: &ArrayData,
-    shape: &[usize],
-) -> PyResult<PyObject> {
+fn arraydata_to_numpy(py: Python<'_>, data: &ArrayData, shape: &[usize]) -> PyResult<PyObject> {
     let dyn_shape = IxDyn(shape);
     Ok(match data {
         ArrayData::U8(a) => a
@@ -1446,31 +1759,36 @@ fn to_numpy_view<'py>(
     None
 }
 
-fn to_numpy_array<'py>(py: Python<'py>, image: &RustNiftiImage) -> Bound<'py, PyArrayDyn<f32>> {
-    let data = image.to_f32();
+fn to_numpy_array<'py>(
+    py: Python<'py>,
+    image: &RustNiftiImage,
+) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
+    let data = image.to_f32().map_err(|e| to_py_err(e, "to_f32"))?;
     let shape: Vec<usize> = data.shape().to_vec();
 
     // Data is in F-order (column-major) layout in memory
     // Use as_slice_memory_order to get bytes in physical order
-    let slice = data.as_slice_memory_order().expect("Array should be contiguous");
-    let np = py.import("numpy").expect("numpy import failed");
+    let slice = data
+        .as_slice_memory_order()
+        .ok_or_else(|| PyValueError::new_err("Array is not contiguous in memory"))?;
+    let np = py.import("numpy")?;
 
     // Create 1D array from F-order bytes
     let flat = slice.to_vec().into_pyarray(py);
 
     // Reshape with order='F' to interpret the flat data as F-order
     // This creates an F-contiguous array matching NIfTI convention
-    np.call_method(
-        "reshape",
-        (flat, &shape),
-        Some(&[("order", "F")].into_py_dict(py).expect("dict failed")),
-    )
-    .expect("reshape failed")
-    .extract::<Bound<'py, PyArrayDyn<f32>>>()
-    .expect("extract failed")
+    let kwargs = [("order", "F")].into_py_dict(py)?;
+    let reshaped = np
+        .call_method("reshape", (flat, &shape), Some(&kwargs))
+        .map_err(|e| PyValueError::new_err(format!("Failed to reshape array: {}", e)))?;
+
+    reshaped
+        .extract::<Bound<'py, PyArrayDyn<f32>>>()
+        .map_err(|e| PyValueError::new_err(format!("Failed to extract array: {}", e)))
 }
 
-fn to_numpy_view_native<'py>(py: Python<'py>, image: &RustNiftiImage) -> Option<PyObject> {
+fn to_numpy_view_native(py: Python<'_>, image: &RustNiftiImage) -> Option<PyObject> {
     let arr_obj = match image.dtype() {
         DataType::UInt8 => image
             .as_view_t::<u8>()
@@ -1496,8 +1814,8 @@ fn to_numpy_view_native<'py>(py: Python<'py>, image: &RustNiftiImage) -> Option<
         DataType::UInt64 => image
             .as_view_t::<u64>()
             .map(|v| PyArrayDyn::from_array(py, &v).unbind().into_any()),
-        DataType::Float16 => None, // numpy crate lacks f16 Element impl, fall back to f32
-        DataType::BFloat16 => None, // numpy lacks bf16
+        // numpy crate lacks f16/bf16 Element impl, fall back to f32
+        DataType::Float16 | DataType::BFloat16 => None,
         DataType::Float32 => image
             .as_view_t::<f32>()
             .map(|v| PyArrayDyn::from_array(py, &v).unbind().into_any()),
@@ -1514,15 +1832,14 @@ fn torch_dtype(py: Python<'_>, dtype: DataType) -> Option<PyObject> {
         DataType::UInt8 => "uint8",
         DataType::Int8 => "int8",
         DataType::Int16 => "int16",
-        DataType::UInt16 => return None,
         DataType::Int32 => "int32",
-        DataType::UInt32 => return None,
         DataType::Int64 => "int64",
-        DataType::UInt64 => return None,
         DataType::Float16 => "float16",
         DataType::BFloat16 => "bfloat16",
         DataType::Float32 => "float32",
         DataType::Float64 => "float64",
+        // PyTorch doesn't support unsigned 16/32/64-bit integers
+        DataType::UInt16 | DataType::UInt32 | DataType::UInt64 => return None,
     };
     torch.getattr(dt).ok().map(|o| o.unbind())
 }
@@ -1555,6 +1872,8 @@ fn load_label_aware_cropped(
     min_pos_samples: Option<usize>,
     seed: Option<u64>,
 ) -> PyResult<(PyNiftiImage, PyNiftiImage)> {
+    let patch_size = parse_shape3(&patch_size, "patch_size")?;
+
     // Load full images first (this could be optimized further)
     let image = nifti::load(image_path).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to load image: {}", e))
@@ -1565,7 +1884,7 @@ fn load_label_aware_cropped(
 
     // Configure cropping
     let config = transforms::RandCropByPosNegLabelConfig {
-        patch_size: [patch_size[0], patch_size[1], patch_size[2]],
+        patch_size,
         pos_neg_ratio: pos_neg_ratio.unwrap_or(1.0) as f32,
         min_pos_samples: min_pos_samples.unwrap_or(4),
         seed,
@@ -1573,7 +1892,8 @@ fn load_label_aware_cropped(
     };
 
     // Compute crop regions (this is fast, operates on labels only)
-    let crop_regions = compute_label_aware_crop_regions(&config, &image, &label, 1);
+    let crop_regions = compute_label_aware_crop_regions(&config, &image, &label, 1)
+        .map_err(|e| to_py_err(e, "compute_label_aware_crop_regions"))?;
 
     if crop_regions.is_empty() {
         return Err(PyValueError::new_err("No valid crop regions found"));
@@ -1626,6 +1946,7 @@ fn load_label_aware_cropped(
 ///     List of crop regions as dictionaries with 'start', 'end', and 'size' keys
 #[pyfunction]
 #[pyo3(signature = (image_path, label_path, patch_size, num_samples, pos_neg_ratio=None, min_pos_samples=None, seed=None))]
+#[allow(clippy::too_many_arguments)]
 fn compute_crop_regions(
     py: Python<'_>,
     image_path: &str,
@@ -1636,6 +1957,8 @@ fn compute_crop_regions(
     min_pos_samples: Option<usize>,
     seed: Option<u64>,
 ) -> PyResult<Vec<PyObject>> {
+    let patch_size = parse_shape3(&patch_size, "patch_size")?;
+
     // Load images to get shape information
     let image = nifti::load(image_path).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to load image: {}", e))
@@ -1646,7 +1969,7 @@ fn compute_crop_regions(
 
     // Configure cropping
     let config = transforms::RandCropByPosNegLabelConfig {
-        patch_size: [patch_size[0], patch_size[1], patch_size[2]],
+        patch_size,
         pos_neg_ratio: pos_neg_ratio.unwrap_or(1.0) as f32,
         min_pos_samples: min_pos_samples.unwrap_or(4),
         seed,
@@ -1654,7 +1977,8 @@ fn compute_crop_regions(
     };
 
     // Compute crop regions
-    let crop_regions = compute_label_aware_crop_regions(&config, &image, &label, num_samples);
+    let crop_regions = compute_label_aware_crop_regions(&config, &image, &label, num_samples)
+        .map_err(|e| to_py_err(e, "compute_label_aware_crop_regions"))?;
 
     // Convert to Python dictionaries
     let mut regions_py = Vec::new();
@@ -1693,6 +2017,8 @@ fn compute_random_spatial_crops(
     seed: Option<u64>,
     allow_smaller: Option<bool>,
 ) -> PyResult<Vec<PyObject>> {
+    let patch_size = parse_shape3(&patch_size, "patch_size")?;
+
     // Load image to get shape information
     let image = nifti::load(image_path).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to load image: {}", e))
@@ -1700,7 +2026,7 @@ fn compute_random_spatial_crops(
 
     // Configure cropping
     let config = transforms::SpatialCropConfig {
-        patch_size: [patch_size[0], patch_size[1], patch_size[2]],
+        patch_size,
         seed,
         allow_smaller: allow_smaller.unwrap_or(false),
     };
@@ -1738,13 +2064,15 @@ fn compute_center_crop(
     image_path: &str,
     patch_size: Vec<usize>,
 ) -> PyResult<PyObject> {
+    let patch_size = parse_shape3(&patch_size, "patch_size")?;
+
     // Load image to get shape information
     let image = nifti::load(image_path).map_err(|e| {
         PyErr::new::<pyo3::exceptions::PyIOError, _>(format!("Failed to load image: {}", e))
     })?;
 
     // Compute center crop
-    let region = compute_center_crop_regions([patch_size[0], patch_size[1], patch_size[2]], &image);
+    let region = compute_center_crop_regions(patch_size, &image);
 
     // Convert to Python dictionary
     let region_dict = pyo3::types::PyDict::new(py);

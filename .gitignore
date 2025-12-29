@@ -182,3 +182,7 @@ dmypy.json
 
 # Test output
 tests/output/
+
+# Benchmark outputs
+/benchmarks/results*.json
+/benchmarks/*_results.json

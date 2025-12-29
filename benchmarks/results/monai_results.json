@@ -1,0 +1,399 @@
+{
+  "library": "monai",
+  "config": {
+    "sizes": [
+      [
+        64,
+        64,
+        64
+      ],
+      [
+        128,
+        128,
+        128
+      ],
+      [
+        256,
+        256,
+        256
+      ],
+      [
+        512,
+        512,
+        512
+      ]
+    ],
+    "dtypes": [
+      "float32"
+    ],
+    "warmup_iterations": 3,
+    "benchmark_iterations": 20,
+    "crop_size": [
+      64,
+      64,
+      64
+    ]
+  },
+  "results": [
+    {
+      "library": "monai",
+      "operation": "load",
+      "size": [
+        64,
+        64,
+        64
+      ],
+      "dtype": "float32",
+      "mean_ms": 2.142,
+      "std_ms": 1.631,
+      "min_ms": 1.227,
+      "max_ms": 6.15,
+      "median_ms": 1.341,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": ""
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped",
+      "size": [
+        64,
+        64,
+        64
+      ],
+      "dtype": "float32",
+      "mean_ms": 2.798,
+      "std_ms": 1.915,
+      "min_ms": 1.505,
+      "max_ms": 8.051,
+      "median_ms": 1.746,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64)"
+    },
+    {
+      "library": "monai",
+      "operation": "load_resampled",
+      "size": [
+        64,
+        64,
+        64
+      ],
+      "dtype": "float32",
+      "mean_ms": 3.044,
+      "std_ms": 1.984,
+      "min_ms": 1.781,
+      "max_ms": 7.301,
+      "median_ms": 1.929,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "target=[32, 32, 32]"
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped_to_torch",
+      "size": [
+        64,
+        64,
+        64
+      ],
+      "dtype": "float32",
+      "mean_ms": 2.069,
+      "std_ms": 1.309,
+      "min_ms": 1.476,
+      "max_ms": 6.16,
+      "median_ms": 1.577,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64)"
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped_normalized",
+      "size": [
+        64,
+        64,
+        64
+      ],
+      "dtype": "float32",
+      "mean_ms": 3.082,
+      "std_ms": 1.856,
+      "min_ms": 2.037,
+      "max_ms": 7.185,
+      "median_ms": 2.151,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64),normalize=True"
+    },
+    {
+      "library": "monai",
+      "operation": "load",
+      "size": [
+        128,
+        128,
+        128
+      ],
+      "dtype": "float32",
+      "mean_ms": 5.571,
+      "std_ms": 1.801,
+      "min_ms": 4.13,
+      "max_ms": 9.21,
+      "median_ms": 4.545,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": ""
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped",
+      "size": [
+        128,
+        128,
+        128
+      ],
+      "dtype": "float32",
+      "mean_ms": 5.4,
+      "std_ms": 1.688,
+      "min_ms": 4.377,
+      "max_ms": 9.577,
+      "median_ms": 4.68,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64)"
+    },
+    {
+      "library": "monai",
+      "operation": "load_resampled",
+      "size": [
+        128,
+        128,
+        128
+      ],
+      "dtype": "float32",
+      "mean_ms": 8.869,
+      "std_ms": 4.574,
+      "min_ms": 6.249,
+      "max_ms": 26.857,
+      "median_ms": 6.876,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "target=[64, 64, 64]"
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped_to_torch",
+      "size": [
+        128,
+        128,
+        128
+      ],
+      "dtype": "float32",
+      "mean_ms": 5.936,
+      "std_ms": 1.778,
+      "min_ms": 4.421,
+      "max_ms": 10.273,
+      "median_ms": 5.143,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64)"
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped_normalized",
+      "size": [
+        128,
+        128,
+        128
+      ],
+      "dtype": "float32",
+      "mean_ms": 5.839,
+      "std_ms": 1.424,
+      "min_ms": 4.984,
+      "max_ms": 10.929,
+      "median_ms": 5.362,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64),normalize=True"
+    },
+    {
+      "library": "monai",
+      "operation": "load",
+      "size": [
+        256,
+        256,
+        256
+      ],
+      "dtype": "float32",
+      "mean_ms": 161.272,
+      "std_ms": 9.523,
+      "min_ms": 149.418,
+      "max_ms": 184.844,
+      "median_ms": 159.113,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": ""
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped",
+      "size": [
+        256,
+        256,
+        256
+      ],
+      "dtype": "float32",
+      "mean_ms": 148.128,
+      "std_ms": 19.411,
+      "min_ms": 109.021,
+      "max_ms": 178.523,
+      "median_ms": 154.862,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64)"
+    },
+    {
+      "library": "monai",
+      "operation": "load_resampled",
+      "size": [
+        256,
+        256,
+        256
+      ],
+      "dtype": "float32",
+      "mean_ms": 182.385,
+      "std_ms": 10.682,
+      "min_ms": 166.545,
+      "max_ms": 214.237,
+      "median_ms": 178.874,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "target=[128, 128, 128]"
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped_to_torch",
+      "size": [
+        256,
+        256,
+        256
+      ],
+      "dtype": "float32",
+      "mean_ms": 165.453,
+      "std_ms": 10.298,
+      "min_ms": 150.206,
+      "max_ms": 186.502,
+      "median_ms": 162.776,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64)"
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped_normalized",
+      "size": [
+        256,
+        256,
+        256
+      ],
+      "dtype": "float32",
+      "mean_ms": 160.44,
+      "std_ms": 18.484,
+      "min_ms": 122.055,
+      "max_ms": 184.177,
+      "median_ms": 163.38,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64),normalize=True"
+    },
+    {
+      "library": "monai",
+      "operation": "load",
+      "size": [
+        512,
+        512,
+        512
+      ],
+      "dtype": "float32",
+      "mean_ms": 4951.059,
+      "std_ms": 161.742,
+      "min_ms": 4558.67,
+      "max_ms": 5151.255,
+      "median_ms": 5006.756,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": ""
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped",
+      "size": [
+        512,
+        512,
+        512
+      ],
+      "dtype": "float32",
+      "mean_ms": 4963.798,
+      "std_ms": 279.132,
+      "min_ms": 3839.302,
+      "max_ms": 5141.522,
+      "median_ms": 5041.416,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64)"
+    },
+    {
+      "library": "monai",
+      "operation": "load_resampled",
+      "size": [
+        512,
+        512,
+        512
+      ],
+      "dtype": "float32",
+      "mean_ms": 5797.038,
+      "std_ms": 424.596,
+      "min_ms": 4549.396,
+      "max_ms": 6130.892,
+      "median_ms": 5960.931,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "target=[256, 256, 256]"
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped_to_torch",
+      "size": [
+        512,
+        512,
+        512
+      ],
+      "dtype": "float32",
+      "mean_ms": 5345.816,
+      "std_ms": 945.16,
+      "min_ms": 3236.498,
+      "max_ms": 6129.831,
+      "median_ms": 5864.846,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64)"
+    },
+    {
+      "library": "monai",
+      "operation": "load_cropped_normalized",
+      "size": [
+        512,
+        512,
+        512
+      ],
+      "dtype": "float32",
+      "mean_ms": 3666.431,
+      "std_ms": 773.995,
+      "min_ms": 2465.79,
+      "max_ms": 6208.606,
+      "median_ms": 3735.311,
+      "iterations": 20,
+      "memory_mb": null,
+      "notes": "crop=(64, 64, 64),normalize=True"
+    }
+  ]
+}

@@ -5,6 +5,61 @@
 use crate::error::{Error, Result};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
+/// NIfTI-1 header field byte offsets.
+///
+/// These constants define the byte positions of each field in the 348-byte NIfTI-1 header.
+/// See: <https://nifti.nimh.nih.gov/nifti-1/documentation/nifti1fields>
+mod offsets {
+    /// sizeof_hdr: must be 348 for NIfTI-1
+    pub const SIZEOF_HDR: usize = 0;
+    /// dim[0..7]: array dimensions (i16 × 8, but dim[0] is ndim)
+    pub const DIM: usize = 40;
+    /// intent_code: statistical intent (i16)
+    pub const INTENT_CODE: usize = 68;
+    /// datatype: data type code (i16)
+    pub const DATATYPE: usize = 70;
+    /// bitpix: bits per voxel (i16)
+    pub const BITPIX: usize = 72;
+    /// pixdim[0..7]: qfac + voxel dimensions (f32 × 8)
+    pub const PIXDIM: usize = 76;
+    /// vox_offset: byte offset to data (f32)
+    pub const VOX_OFFSET: usize = 108;
+    /// scl_slope: intensity scaling slope (f32)
+    pub const SCL_SLOPE: usize = 112;
+    /// scl_inter: intensity scaling intercept (f32)
+    pub const SCL_INTER: usize = 116;
+    /// xyzt_units: spatial/temporal units (u8)
+    pub const XYZT_UNITS: usize = 123;
+    /// descrip: description string (80 bytes)
+    pub const DESCRIP: usize = 148;
+    /// aux_file: auxiliary filename (24 bytes)
+    pub const AUX_FILE: usize = 228;
+    /// qform_code: qform transform code (i16)
+    pub const QFORM_CODE: usize = 252;
+    /// sform_code: sform transform code (i16)
+    pub const SFORM_CODE: usize = 254;
+    /// quatern_b: quaternion b parameter (f32)
+    pub const QUATERN_B: usize = 256;
+    /// quatern_c: quaternion c parameter (f32)
+    pub const QUATERN_C: usize = 260;
+    /// quatern_d: quaternion d parameter (f32)
+    pub const QUATERN_D: usize = 264;
+    /// qoffset_x: quaternion x offset (f32)
+    pub const QOFFSET_X: usize = 268;
+    /// qoffset_y: quaternion y offset (f32)
+    pub const QOFFSET_Y: usize = 272;
+    /// qoffset_z: quaternion z offset (f32)
+    pub const QOFFSET_Z: usize = 276;
+    /// srow_x: sform row x (f32 × 4)
+    pub const SROW_X: usize = 280;
+    /// srow_y: sform row y (f32 × 4)
+    pub const SROW_Y: usize = 296;
+    /// srow_z: sform row z (f32 × 4)
+    pub const SROW_Z: usize = 312;
+    /// magic: NIfTI magic bytes ("n+1\0" or "ni1\0")
+    pub const MAGIC: usize = 344;
+}
+
 /// `NIfTI` data type codes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i16)]
@@ -139,10 +194,11 @@ pub enum TemporalUnits {
 
 impl TemporalUnits {
     fn from_code(code: u8) -> Self {
-        match (code >> 3) & 0x07 {
-            8 => Self::Second,
-            16 => Self::Millisecond,
-            24 => Self::Microsecond,
+        // Temporal units are in bits 3-5 of xyzt_units (mask 0x38 = 0b00111000)
+        match code & 0x38 {
+            0x08 => Self::Second,      // NIFTI_UNITS_SEC
+            0x10 => Self::Millisecond, // NIFTI_UNITS_MSEC
+            0x18 => Self::Microsecond, // NIFTI_UNITS_USEC
             _ => Self::Unknown,
         }
     }
@@ -150,9 +206,9 @@ impl TemporalUnits {
     fn to_code(self) -> u8 {
         match self {
             Self::Unknown => 0,
-            Self::Second => 8,
-            Self::Millisecond => 16,
-            Self::Microsecond => 24,
+            Self::Second => 0x08,      // NIFTI_UNITS_SEC
+            Self::Millisecond => 0x10, // NIFTI_UNITS_MSEC
+            Self::Microsecond => 0x18, // NIFTI_UNITS_USEC
         }
     }
 }
@@ -166,8 +222,8 @@ pub struct NiftiHeader {
     pub dim: [u16; 7],
     /// Data type.
     pub datatype: DataType,
-    /// Voxel sizes (pixdim[1..=ndim]).
-    pub pixdim: [f32; 7],
+    /// Voxel sizes (pixdim[1..=ndim]) and qfac at index 0.
+    pub pixdim: [f32; 8],
     /// Data offset in file.
     pub vox_offset: f32,
     /// Data scaling slope.
@@ -208,7 +264,7 @@ impl Default for NiftiHeader {
             ndim: 3,
             dim: [1, 1, 1, 1, 1, 1, 1],
             datatype: DataType::Float32,
-            pixdim: [1.0; 7],
+            pixdim: [1.0; 8],
             vox_offset: 352.0,
             scl_slope: 1.0,
             scl_inter: 0.0,
@@ -253,35 +309,53 @@ impl NiftiHeader {
         }
     }
 
+    #[allow(clippy::wildcard_imports)] // Local module with 20+ related constants
     fn parse<E: ByteOrder>(bytes: &[u8], little_endian: bool) -> Result<Self> {
+        use offsets::*;
+
         // Validate magic
-        let magic = &bytes[344..348];
+        let magic = &bytes[MAGIC..MAGIC + 4];
         if magic != b"n+1\0" && magic != b"ni1\0" {
             return Err(Error::InvalidMagic([
                 magic[0], magic[1], magic[2], magic[3],
             ]));
         }
 
-        let ndim = E::read_i16(&bytes[40..42]) as u8;
+        let ndim_raw = E::read_i16(&bytes[DIM..DIM + 2]);
+        if !(1..=7).contains(&ndim_raw) {
+            return Err(Error::InvalidDimensions(format!(
+                "ndim must be 1..=7, got {} (raw i16 value)",
+                ndim_raw
+            )));
+        }
+        let ndim = ndim_raw as u8;
         let mut dim = [0u16; 7];
-        for i in 0..7 {
-            dim[i] = E::read_i16(&bytes[42 + i * 2..44 + i * 2]) as u16;
+        for (i, dim_val) in dim.iter_mut().enumerate() {
+            let offset = DIM + 2 + i * 2;
+            let dim_raw = E::read_i16(&bytes[offset..offset + 2]);
+            if dim_raw < 0 {
+                return Err(Error::InvalidDimensions(format!(
+                    "dimension {} has negative value: {}",
+                    i, dim_raw
+                )));
+            }
+            *dim_val = dim_raw as u16;
         }
 
-        let datatype = DataType::from_code(E::read_i16(&bytes[70..72]))?;
+        let datatype = DataType::from_code(E::read_i16(&bytes[DATATYPE..DATATYPE + 2]))?;
 
-        let mut pixdim = [0.0f32; 7];
-        for i in 0..7 {
-            // pixdim array starts at byte 76 (inclusive) with 8 floats
-            pixdim[i] = E::read_f32(&bytes[76 + i * 4..80 + i * 4]);
+        let mut pixdim = [0.0f32; 8];
+        for (i, pix_val) in pixdim.iter_mut().enumerate() {
+            let offset = PIXDIM + i * 4;
+            *pix_val = E::read_f32(&bytes[offset..offset + 4]);
         }
 
-        let xyzt_units = bytes[123];
+        let xyzt_units = bytes[XYZT_UNITS];
 
-        let descrip = String::from_utf8_lossy(&bytes[148..228])
+        let descrip = String::from_utf8_lossy(&bytes[DESCRIP..AUX_FILE])
             .trim_end_matches('\0')
             .to_string();
-        let aux_file = String::from_utf8_lossy(&bytes[228..252])
+        let aux_file = String::from_utf8_lossy(&bytes[AUX_FILE..QFORM_CODE])
             .trim_end_matches('\0')
             .to_string();
 
@@ -290,43 +364,43 @@ impl NiftiHeader {
             dim,
             datatype,
             pixdim,
-            vox_offset: E::read_f32(&bytes[108..112]),
-            scl_slope: E::read_f32(&bytes[112..116]),
-            scl_inter: E::read_f32(&bytes[116..120]),
+            vox_offset: E::read_f32(&bytes[VOX_OFFSET..VOX_OFFSET + 4]),
+            scl_slope: E::read_f32(&bytes[SCL_SLOPE..SCL_SLOPE + 4]),
+            scl_inter: E::read_f32(&bytes[SCL_INTER..SCL_INTER + 4]),
             spatial_units: SpatialUnits::from_code(xyzt_units),
             temporal_units: TemporalUnits::from_code(xyzt_units),
-            intent_code: E::read_i16(&bytes[68..70]),
+            intent_code: E::read_i16(&bytes[INTENT_CODE..INTENT_CODE + 2]),
             descrip,
             aux_file,
-            qform_code: E::read_i16(&bytes[252..254]),
-            sform_code: E::read_i16(&bytes[254..256]),
+            qform_code: E::read_i16(&bytes[QFORM_CODE..QFORM_CODE + 2]),
+            sform_code: E::read_i16(&bytes[SFORM_CODE..SFORM_CODE + 2]),
             quatern: [
-                E::read_f32(&bytes[256..260]),
-                E::read_f32(&bytes[260..264]),
-                E::read_f32(&bytes[264..268]),
+                E::read_f32(&bytes[QUATERN_B..QUATERN_B + 4]),
+                E::read_f32(&bytes[QUATERN_C..QUATERN_C + 4]),
+                E::read_f32(&bytes[QUATERN_D..QUATERN_D + 4]),
             ],
             qoffset: [
-                E::read_f32(&bytes[268..272]),
-                E::read_f32(&bytes[272..276]),
-                E::read_f32(&bytes[276..280]),
+                E::read_f32(&bytes[QOFFSET_X..QOFFSET_X + 4]),
+                E::read_f32(&bytes[QOFFSET_Y..QOFFSET_Y + 4]),
+                E::read_f32(&bytes[QOFFSET_Z..QOFFSET_Z + 4]),
             ],
             srow_x: [
-                E::read_f32(&bytes[280..284]),
-                E::read_f32(&bytes[284..288]),
-                E::read_f32(&bytes[288..292]),
-                E::read_f32(&bytes[292..296]),
+                E::read_f32(&bytes[SROW_X..SROW_X + 4]),
+                E::read_f32(&bytes[SROW_X + 4..SROW_X + 8]),
+                E::read_f32(&bytes[SROW_X + 8..SROW_X + 12]),
+                E::read_f32(&bytes[SROW_X + 12..SROW_X + 16]),
             ],
             srow_y: [
-                E::read_f32(&bytes[296..300]),
-                E::read_f32(&bytes[300..304]),
-                E::read_f32(&bytes[304..308]),
-                E::read_f32(&bytes[308..312]),
+                E::read_f32(&bytes[SROW_Y..SROW_Y + 4]),
+                E::read_f32(&bytes[SROW_Y + 4..SROW_Y + 8]),
+                E::read_f32(&bytes[SROW_Y + 8..SROW_Y + 12]),
+                E::read_f32(&bytes[SROW_Y + 12..SROW_Y + 16]),
             ],
             srow_z: [
-                E::read_f32(&bytes[312..316]),
-                E::read_f32(&bytes[316..320]),
-                E::read_f32(&bytes[320..324]),
-                E::read_f32(&bytes[324..328]),
+                E::read_f32(&bytes[SROW_Z..SROW_Z + 4]),
+                E::read_f32(&bytes[SROW_Z + 4..SROW_Z + 8]),
+                E::read_f32(&bytes[SROW_Z + 8..SROW_Z + 12]),
+                E::read_f32(&bytes[SROW_Z + 12..SROW_Z + 16]),
             ],
             little_endian,
         })
@@ -337,74 +411,85 @@ impl NiftiHeader {
     }
 
     /// Write header to bytes.
+    #[allow(clippy::wildcard_imports)] // Local module with 20+ related constants
     pub fn to_bytes(&self) -> Vec<u8> {
+        use offsets::*;
+
         let mut buf = vec![0u8; Self::SIZE];
 
         // sizeof_hdr
-        LittleEndian::write_i32(&mut buf[0..4], 348);
+        LittleEndian::write_i32(&mut buf[SIZEOF_HDR..SIZEOF_HDR + 4], 348);
 
         // dim
-        LittleEndian::write_i16(&mut buf[40..42], self.ndim as i16);
+        LittleEndian::write_i16(&mut buf[DIM..DIM + 2], self.ndim as i16);
         for i in 0..7 {
-            LittleEndian::write_i16(&mut buf[42 + i * 2..44 + i * 2], self.dim[i] as i16);
+            let offset = DIM + 2 + i * 2;
+            LittleEndian::write_i16(&mut buf[offset..offset + 2], self.dim[i] as i16);
         }
 
         // datatype and bitpix
-        LittleEndian::write_i16(&mut buf[70..72], self.datatype as i16);
-        LittleEndian::write_i16(&mut buf[72..74], (self.datatype.byte_size() * 8) as i16);
+        LittleEndian::write_i16(&mut buf[DATATYPE..DATATYPE + 2], self.datatype as i16);
+        LittleEndian::write_i16(
+            &mut buf[BITPIX..BITPIX + 2],
+            (self.datatype.byte_size() * 8) as i16,
+        );
 
         // pixdim
-        for i in 0..7 {
-            LittleEndian::write_f32(&mut buf[76 + i * 4..80 + i * 4], self.pixdim[i]);
+        for (i, &value) in self.pixdim.iter().enumerate() {
+            let offset = PIXDIM + i * 4;
+            LittleEndian::write_f32(&mut buf[offset..offset + 4], value);
         }
 
         // vox_offset
-        LittleEndian::write_f32(&mut buf[108..112], self.vox_offset);
+        LittleEndian::write_f32(&mut buf[VOX_OFFSET..VOX_OFFSET + 4], self.vox_offset);
 
         // scl_slope, scl_inter
-        LittleEndian::write_f32(&mut buf[112..116], self.scl_slope);
-        LittleEndian::write_f32(&mut buf[116..120], self.scl_inter);
+        LittleEndian::write_f32(&mut buf[SCL_SLOPE..SCL_SLOPE + 4], self.scl_slope);
+        LittleEndian::write_f32(&mut buf[SCL_INTER..SCL_INTER + 4], self.scl_inter);
 
         // xyzt_units
-        buf[123] = self.spatial_units.to_code() | self.temporal_units.to_code();
+        buf[XYZT_UNITS] = self.spatial_units.to_code() | self.temporal_units.to_code();
 
-        // descrip
+        // descrip (80 bytes, from DESCRIP to AUX_FILE)
         let descrip_bytes = self.descrip.as_bytes();
         let len = descrip_bytes.len().min(79);
-        buf[148..148 + len].copy_from_slice(&descrip_bytes[..len]);
+        buf[DESCRIP..DESCRIP + len].copy_from_slice(&descrip_bytes[..len]);
 
-        // aux_file
+        // aux_file (24 bytes, from AUX_FILE to QFORM_CODE)
         let aux_bytes = self.aux_file.as_bytes();
         let len = aux_bytes.len().min(23);
-        buf[228..228 + len].copy_from_slice(&aux_bytes[..len]);
+        buf[AUX_FILE..AUX_FILE + len].copy_from_slice(&aux_bytes[..len]);
 
         // qform_code, sform_code
-        LittleEndian::write_i16(&mut buf[252..254], self.qform_code);
-        LittleEndian::write_i16(&mut buf[254..256], self.sform_code);
+        LittleEndian::write_i16(&mut buf[QFORM_CODE..QFORM_CODE + 2], self.qform_code);
+        LittleEndian::write_i16(&mut buf[SFORM_CODE..SFORM_CODE + 2], self.sform_code);
 
         // quatern
-        LittleEndian::write_f32(&mut buf[256..260], self.quatern[0]);
-        LittleEndian::write_f32(&mut buf[260..264], self.quatern[1]);
-        LittleEndian::write_f32(&mut buf[264..268], self.quatern[2]);
+        LittleEndian::write_f32(&mut buf[QUATERN_B..QUATERN_B + 4], self.quatern[0]);
+        LittleEndian::write_f32(&mut buf[QUATERN_C..QUATERN_C + 4], self.quatern[1]);
+        LittleEndian::write_f32(&mut buf[QUATERN_D..QUATERN_D + 4], self.quatern[2]);
 
         // qoffset
-        LittleEndian::write_f32(&mut buf[268..272], self.qoffset[0]);
-        LittleEndian::write_f32(&mut buf[272..276], self.qoffset[1]);
-        LittleEndian::write_f32(&mut buf[276..280], self.qoffset[2]);
+        LittleEndian::write_f32(&mut buf[QOFFSET_X..QOFFSET_X + 4], self.qoffset[0]);
+        LittleEndian::write_f32(&mut buf[QOFFSET_Y..QOFFSET_Y + 4], self.qoffset[1]);
+        LittleEndian::write_f32(&mut buf[QOFFSET_Z..QOFFSET_Z + 4], self.qoffset[2]);
 
         // srow_x, srow_y, srow_z
         for (i, &v) in self.srow_x.iter().enumerate() {
-            LittleEndian::write_f32(&mut buf[280 + i * 4..284 + i * 4], v);
+            let offset = SROW_X + i * 4;
+            LittleEndian::write_f32(&mut buf[offset..offset + 4], v);
         }
         for (i, &v) in self.srow_y.iter().enumerate() {
-            LittleEndian::write_f32(&mut buf[296 + i * 4..300 + i * 4], v);
+            let offset = SROW_Y + i * 4;
+            LittleEndian::write_f32(&mut buf[offset..offset + 4], v);
         }
         for (i, &v) in self.srow_z.iter().enumerate() {
-            LittleEndian::write_f32(&mut buf[312 + i * 4..316 + i * 4], v);
+            let offset = SROW_Z + i * 4;
+            LittleEndian::write_f32(&mut buf[offset..offset + 4], v);
         }
 
         // magic
-        buf[344..348].copy_from_slice(b"n+1\0");
+        buf[MAGIC..MAGIC + 4].copy_from_slice(b"n+1\0");
 
         buf
     }
@@ -416,11 +501,11 @@ impl NiftiHeader {
         } else if self.qform_code > 0 {
             self.qform_to_affine()
         } else {
-            // Default: identity scaled by pixdim
+            // Default: identity scaled by pixdim (skip qfac at index 0)
             [
-                [self.pixdim[0], 0.0, 0.0, 0.0],
-                [0.0, self.pixdim[1], 0.0, 0.0],
-                [0.0, 0.0, self.pixdim[2], 0.0],
+                [self.pixdim[1], 0.0, 0.0, 0.0],
+                [0.0, self.pixdim[2], 0.0, 0.0],
+                [0.0, 0.0, self.pixdim[3], 0.0],
                 [0.0, 0.0, 0.0, 1.0],
             ]
         }
@@ -441,7 +526,7 @@ impl NiftiHeader {
         let a = (1.0 - b * b - c * c - d * d).max(0.0).sqrt();
 
         let qfac = if self.pixdim[0] < 0.0 { -1.0 } else { 1.0 };
-        let [i, j, k] = [self.pixdim[0].abs(), self.pixdim[1], self.pixdim[2] * qfac];
+        let [i, j, k] = [self.pixdim[1].abs(), self.pixdim[2], self.pixdim[3] * qfac];
 
         [
             [
@@ -473,7 +558,8 @@ impl NiftiHeader {
 
     /// Get voxel spacing as a slice (up to ndim elements).
     pub fn spacing(&self) -> &[f32] {
-        &self.pixdim[..self.ndim as usize]
+        let end = (self.ndim as usize + 1).min(self.pixdim.len());
+        &self.pixdim[1.min(end)..end]
     }
 
     /// Total number of voxels.
@@ -507,6 +593,28 @@ impl NiftiHeader {
             if self.dim[i] == 0 {
                 return Err(Error::InvalidDimensions(format!("dimension {} is zero", i)));
             }
+            let spacing = self.pixdim[i + 1];
+            if !spacing.is_finite() || spacing <= 0.0 {
+                return Err(Error::InvalidDimensions(format!(
+                    "pixdim[{}] must be finite and > 0, got {}",
+                    i + 1,
+                    spacing
+                )));
+            }
+        }
+
+        if !self.vox_offset.is_finite() {
+            return Err(Error::InvalidDimensions(format!(
+                "vox_offset must be finite, got {}",
+                self.vox_offset
+            )));
+        }
+
+        if self.vox_offset.fract() != 0.0 {
+            return Err(Error::InvalidDimensions(format!(
+                "vox_offset must be an integer number of bytes, got {}",
+                self.vox_offset
+            )));
         }
 
         if self.vox_offset < Self::SIZE as f32 {
@@ -530,15 +638,86 @@ impl NiftiHeader {
             .ok_or_else(|| Error::InvalidDimensions("data size overflow".into()))?;
 
         // vox_offset should be aligned to element size for mmap compatibility
-        let byte_size = self.datatype.byte_size() as f32;
-        if (self.vox_offset / byte_size).fract() != 0.0 {
+        // Use integer modulo to avoid float precision issues
+        let vox_offset_int = self.vox_offset as usize;
+        let byte_size = self.datatype.byte_size();
+        if vox_offset_int % byte_size != 0 {
             return Err(Error::InvalidDimensions(format!(
                 "vox_offset {} not aligned to element size {}",
-                self.vox_offset,
-                self.datatype.byte_size()
+                self.vox_offset, byte_size
             )));
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_temporal_units_from_code() {
+        // Test that temporal units are correctly parsed from xyzt_units byte
+        // Temporal units are stored in bits 3-5 (mask 0x38)
+        assert_eq!(TemporalUnits::from_code(0x08), TemporalUnits::Second);
+        assert_eq!(TemporalUnits::from_code(0x10), TemporalUnits::Millisecond);
+        assert_eq!(TemporalUnits::from_code(0x18), TemporalUnits::Microsecond);
+        assert_eq!(TemporalUnits::from_code(0x00), TemporalUnits::Unknown);
+
+        // Test combined with spatial units (spatial units in bits 0-2)
+        // mm (0x02) + second (0x08) = 0x0A
+        assert_eq!(TemporalUnits::from_code(0x0A), TemporalUnits::Second);
+        // meter (0x01) + millisecond (0x10) = 0x11
+        assert_eq!(TemporalUnits::from_code(0x11), TemporalUnits::Millisecond);
+    }
+
+    #[test]
+    fn test_temporal_units_to_code() {
+        assert_eq!(TemporalUnits::Second.to_code(), 0x08);
+        assert_eq!(TemporalUnits::Millisecond.to_code(), 0x10);
+        assert_eq!(TemporalUnits::Microsecond.to_code(), 0x18);
+        assert_eq!(TemporalUnits::Unknown.to_code(), 0x00);
+    }
+
+    #[test]
+    fn test_temporal_units_roundtrip() {
+        for unit in [
+            TemporalUnits::Unknown,
+            TemporalUnits::Second,
+            TemporalUnits::Millisecond,
+            TemporalUnits::Microsecond,
+        ] {
+            let code = unit.to_code();
+            assert_eq!(TemporalUnits::from_code(code), unit);
+        }
+    }
+
+    #[test]
+    fn test_spatial_units_from_code() {
+        assert_eq!(SpatialUnits::from_code(0x00), SpatialUnits::Unknown);
+        assert_eq!(SpatialUnits::from_code(0x01), SpatialUnits::Meter);
+        assert_eq!(SpatialUnits::from_code(0x02), SpatialUnits::Millimeter);
+        assert_eq!(SpatialUnits::from_code(0x03), SpatialUnits::Micrometer);
+    }
+
+    #[test]
+    fn test_spacing_skips_qfac() {
+        let mut header = NiftiHeader::default();
+        header.ndim = 3;
+        header.pixdim = [-1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0];
+        assert_eq!(header.spacing(), &[2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_pixdim_roundtrip_includes_qfac_and_dim7() {
+        let mut header = NiftiHeader::default();
+        header.ndim = 7;
+        header.pixdim = [-1.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+
+        let bytes = header.to_bytes();
+        let parsed = NiftiHeader::from_bytes(&bytes).unwrap();
+
+        assert_eq!(parsed.pixdim, header.pixdim);
     }
 }

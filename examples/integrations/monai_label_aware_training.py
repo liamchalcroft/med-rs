@@ -26,7 +26,7 @@ class MedrsLabelAwareCropd:
     """
     High-performance replacement for MONAI's RandCropByPosNegLabeld.
 
-    Uses medrs crop-first I/O to achieve 40x memory reduction and 200x speedup
+    Uses medrs crop-first I/O for faster loading with reduced memory usage
     while maintaining label-aware sampling for segmentation tasks.
     """
 
@@ -111,7 +111,7 @@ def example_usage():
     transform = create_training_pipeline()
 
     print("Created medrs + MONAI training pipeline:")
-    print("- medrs crop-first loading (40x memory reduction)")
+    print("- medrs crop-first loading (reduced memory usage)")
     print("- Label-aware sampling for segmentation")
     print("- Full MONAI transform compatibility")
 
@@ -127,4 +127,4 @@ if __name__ == "__main__":
     print("1. Replace: LoadImaged + RandCropByPosNegLabeld")
     print("   With: MedrsLabelAwareCropd")
     print("2. Keep: All other MONAI transforms")
-    print("3. Result: High-performance training with 40x memory reduction")
+    print("3. Result: High-performance training with reduced memory usage")

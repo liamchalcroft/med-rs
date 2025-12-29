@@ -120,25 +120,53 @@ class MedrsMetaTensorConverter:
         return metadata
 
     @staticmethod
+    def _orientation_to_direction(orientation: str) -> np.ndarray:
+        """Convert orientation code to direction matrix.
+
+        Orientation codes use R/L (right/left), A/P (anterior/posterior),
+        S/I (superior/inferior) to indicate axis directions.
+        """
+        # Direction vectors for each axis letter
+        axis_map = {
+            'R': (0, 1), 'L': (0, -1),   # Right/Left -> X axis
+            'A': (1, 1), 'P': (1, -1),   # Anterior/Posterior -> Y axis
+            'S': (2, 1), 'I': (2, -1),   # Superior/Inferior -> Z axis
+        }
+
+        direction = np.zeros((3, 3), dtype=np.float64)
+        orientation = orientation.upper()[:3]
+
+        for i, letter in enumerate(orientation):
+            if letter in axis_map:
+                axis_idx, sign = axis_map[letter]
+                direction[axis_idx, i] = sign
+            else:
+                # Default to identity for unknown orientations
+                direction[i, i] = 1.0
+
+        return direction
+
+    @staticmethod
     def _get_affine_matrix(image) -> Optional[np.ndarray]:
         """Get affine matrix from image."""
         if hasattr(image, 'affine') and image.affine is not None:
-            return image.affine
+            return np.array(image.affine, dtype=np.float64)
 
         # Try to construct from orientation and spacing
         if hasattr(image, 'orientation') and hasattr(image, 'spacing'):
-            orientation = image.orientation
-            spacing = image.spacing
-            shape = getattr(image, 'data', (1, 1, 1)).shape
+            orientation = str(image.orientation)
+            spacing = np.array(image.spacing, dtype=np.float64)
+            shape = getattr(image, 'data', np.zeros((1, 1, 1))).shape
 
-            # Construct a basic affine matrix
+            # Get direction matrix from orientation
+            direction = MedrsMetaTensorConverter._orientation_to_direction(orientation)
+
+            # Construct affine: rotation/direction scaled by spacing
             affine = np.eye(4, dtype=np.float64)
-            affine[0, 0] = spacing[0]
-            affine[1, 1] = spacing[1]
-            affine[2, 2] = spacing[2]
+            affine[:3, :3] = direction * spacing
 
-            # Center the image
-            affine[:3, 3] = -(np.array(shape[:3]) * np.array(spacing)) / 2
+            # Center the image in world coordinates
+            affine[:3, 3] = -np.dot(direction * spacing, np.array(shape[:3]) / 2)
             return affine
 
         return None
@@ -210,12 +238,6 @@ class MetaTensorLoader:
             MONAI MetaTensor with metadata
         """
         path = str(path)
-
-        # Check cache
-        if self._metadata_cache and path in self._metadata_cache:
-            cached_metadata = self._metadata_cache[path]
-        else:
-            cached_metadata = None
 
         try:
             # Load with medrs
@@ -437,26 +459,29 @@ class MetaTensorCoordinatedCropLoader:
                         # Handle pre-loaded volume
                         volume = data_dict[key]
                         if hasattr(volume, 'data'):
-                            # Crop the volume and convert to MetaTensor
-                            if hasattr(volume, 'data'):
-                                cropped_data = volume.data[
-                                    crop_offsets[0]:crop_offsets[0] + self.crop_size[0],
-                                    crop_offsets[1]:crop_offsets[1] + self.crop_size[1],
-                                    crop_offsets[2]:crop_offsets[2] + self.crop_size[2]
-                                ]
+                            # Apply crop to the volume data
+                            data = volume.data
+                            x0, y0, z0 = crop_offsets
+                            x1 = x0 + self.crop_size[0]
+                            y1 = y0 + self.crop_size[1]
+                            z1 = z0 + self.crop_size[2]
+                            cropped_data = data[x0:x1, y0:y1, z0:z1]
 
-                                # Create MetaTensor with metadata
-                                metadata = {}
-                                if hasattr(volume, 'spacing'):
-                                    metadata['spacing'] = volume.spacing
-                                if hasattr(volume, 'orientation'):
-                                    metadata['orientation'] = volume.orientation
+                            # Build metadata
+                            metadata = {}
+                            if hasattr(volume, 'spacing'):
+                                metadata['spacing'] = volume.spacing
+                            if hasattr(volume, 'orientation'):
+                                metadata['orientation'] = volume.orientation
 
-                                tensor = volume.to_torch(device=self.device, dtype=self.dtype)
-                                metatensor = MetaTensor(tensor, meta=metadata)
-                            else:
-                                # Fallback
-                                metatensor = volume.to_torch(device=self.device, dtype=self.dtype)
+                            # Convert cropped data to tensor
+                            import torch
+                            tensor = torch.from_numpy(np.ascontiguousarray(cropped_data))
+                            if self.device:
+                                tensor = tensor.to(self.device)
+                            if self.dtype:
+                                tensor = tensor.to(self.dtype)
+                            metatensor = MetaTensor(tensor, meta=metadata)
                         else:
                             # Fallback to file loading
                             metatensor = self.metatensor_loader.load(str(volume))

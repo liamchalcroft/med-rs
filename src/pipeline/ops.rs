@@ -3,6 +3,7 @@
 //! These operations combine multiple transforms into single passes
 //! to minimize memory traffic and improve cache utilization.
 
+use crate::error::Error;
 use ndarray::{ArrayD, IxDyn};
 
 /// A fused intensity operation that combines multiple linear transforms.
@@ -115,10 +116,13 @@ impl FusedIntensityOp {
     }
 
     /// Apply to an ndarray, returning a new array.
-    pub fn apply_array(&self, input: &ArrayD<f32>) -> ArrayD<f32> {
-        let slice = input.as_slice_memory_order().unwrap();
+    pub fn apply_array(&self, input: &ArrayD<f32>) -> Result<ArrayD<f32>, Error> {
+        let slice = input
+            .as_slice_memory_order()
+            .ok_or_else(|| Error::InvalidDimensions("array not in standard memory order".into()))?;
         let output = self.apply_f32_alloc(slice);
-        ArrayD::from_shape_vec(IxDyn(input.shape()), output).unwrap()
+        ArrayD::from_shape_vec(IxDyn(input.shape()), output)
+            .map_err(|_| Error::InvalidDimensions("shape mismatch".into()))
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "medrs"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Ultra-high-performance medical imaging I/O for deep learning"
 license = "MIT OR Apache-2.0"
@@ -32,6 +32,7 @@ num-traits = "0.2"
 byteorder = "1.5"
 thiserror = "2.0"
 half = { version = "2.4", features = ["bytemuck", "num-traits"] }
+bytemuck = { version = "1.14", features = ["derive"] }
 
 # Compression
 flate2 = { version = "1.0", features = ["zlib-ng"], default-features = false }

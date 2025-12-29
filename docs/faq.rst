@@ -8,7 +8,7 @@ General Questions
 
 **What is medrs?**
 
-medrs is a high-performance medical imaging library that combines Rust's performance with Python's ecosystem. It provides ultra-fast NIfTI I/O operations with crop-first loading that achieves 40x memory reduction and 200-3500x speed improvements for deep learning workflows.
+medrs is a medical imaging library that combines Rust's performance with Python's ecosystem. It provides fast NIfTI I/O operations with crop-first loading that significantly reduces memory usage and improves speed for deep learning workflows (see benchmarks in the README for specific numbers).
 
 **What file formats does medrs support?**
 
@@ -49,28 +49,28 @@ Performance Comparison
 
 **How does medrs compare to nibabel?**
 
-medrs is significantly faster for typical deep learning workflows:
+medrs is faster for typical deep learning workflows:
 
 - **Full volume loading**: Similar performance to nibabel
-- **Cropped loading**: 200-3500x faster (medrs reads only cropped region, nibabel loads entire volume)
-- **Memory usage**: 40x reduction for training workflows
+- **Cropped loading**: Significantly faster (medrs reads only cropped region, nibabel loads entire volume)
+- **Memory usage**: Reduced for training workflows (only loads patch, not full volume)
 - **GPU integration**: Direct GPU loading vs CPU then GPU transfer
 
 **How does medrs compare to MONAI?**
 
 medrs complements MONAI by providing optimized I/O:
 
-- **I/O operations**: medrs is 200-3500x faster for cropped loading
+- **I/O operations**: medrs is faster for cropped loading (see README benchmarks)
 - **Transforms**: Use medrs for I/O + MONAI transforms for best performance
-- **Memory**: 40x less memory usage for training pipelines
-- **Integration**: Seamless MONAI compatibility with custom transforms
+- **Memory**: Lower memory usage for training pipelines
+- **Integration**: Provides MONAI-compatible drop-in transforms
 
 **How does medrs compare to torchio?**
 
 Similar to nibabel, torchio loads entire volumes before cropping:
 
-- **Speed**: medrs is 200-3500x faster for patch-based training
-- **Memory**: medrs uses 40x less memory
+- **Speed**: medrs is faster for patch-based training
+- **Memory**: medrs uses less memory (loads patches directly)
 - **Usage**: Replace torchio's `LoadImage` with medrs's crop-first loading
 - **Augmentation**: Combine medrs I/O with torchio augmentations
 
@@ -148,14 +148,16 @@ Usage Questions
 
    import medrs
    from monai.transforms import Compose
-   from medrs.monai_integration import MedrsLoadCroppedd
+   from medrs.monai_compat import MedrsLoadImaged, MedrsRandCropByPosNegLabeld
 
-   # Replace LoadImaged + RandCropByPosNegLabeld
+   # Replace LoadImaged + RandCropByPosNegLabeld with medrs equivalents
    transform = Compose([
-       MedrsLoadCroppedd(
+       MedrsLoadImaged(keys=["image", "label"], ensure_channel_first=True),
+       MedrsRandCropByPosNegLabeld(
            keys=["image", "label"],
-           patch_size=(96, 96, 96),
-           device="cuda"
+           label_key="label",
+           spatial_size=(96, 96, 96),
+           pos=1, neg=1, num_samples=4,
        ),
        # Other MONAI transforms...
    ])
@@ -191,7 +193,8 @@ Reduce memory usage:
    )
 
    # Use CPU for very large operations
-   tensor = medrs.load_cropped_to_torch("volume.nii.gz", device="cpu")
+   # Note: load_cropped requires uncompressed .nii files
+   tensor = medrs.load_cropped_to_torch("volume.nii", [64, 64, 64], device="cpu")
 
 **Loading is slow for the first time**
 
@@ -199,8 +202,8 @@ First load includes compilation cache. Subsequent loads are much faster. To warm
 
 .. code-block:: python
 
-   # Warm up with a small patch
-   _ = medrs.load_cropped("volume.nii.gz", [16, 16, 16], [16, 16, 16])
+   # Warm up with a small patch (requires uncompressed .nii)
+   _ = medrs.load_cropped("volume.nii", [16, 16, 16], [16, 16, 16])
 
 **"File not found" error**
 
@@ -284,7 +287,8 @@ Use the built-in profiler:
 
    with PerformanceProfiler() as profiler:
        for i in range(100):
-           patch = medrs.load_cropped("volume.nii.gz", [32, 32, 32], [64, 64, 64])
+           # Note: load_cropped requires uncompressed .nii files
+           patch = medrs.load_cropped("volume.nii", [32, 32, 32], [64, 64, 64])
            result = model(patch)
 
    summary = profiler.get_summary()
@@ -367,8 +371,8 @@ See the `development/contributing` guide for details.
 .. code-block:: bash
 
    # Clone repository
-   git clone https://github.com/medrs/medrs.git
-   cd medrs
+   git clone https://github.com/liamchalcroft/med-rs.git
+   cd med-rs
 
    # Install development dependencies
    pip install -e ".[dev]"
@@ -391,25 +395,20 @@ Support and Community
 
 **Where can I get help?**
 
-- **GitHub Issues**: https://github.com/medrs/medrs/issues
-- **GitHub Discussions**: https://github.com/medrs/medrs/discussions
+- **GitHub Issues**: https://github.com/liamchalcroft/med-rs/issues
 - **Documentation**: https://medrs.readthedocs.io/
-- **Email**: medrs@example.com
 
 **Is medrs production ready?**
 
-Yes! medrs includes:
+medrs includes:
 - Comprehensive error handling
-- Performance monitoring
-- Production deployment guides
-- Docker containers
+- Extensive testing (Rust and Python)
 - CI/CD pipelines
-- Extensive testing
 
 **What license does medrs use?**
 
-medrs is available under the MIT OR Apache-2.0 license, allowing flexible usage in both academic and commercial projects.
+medrs is dual-licensed under MIT and Apache-2.0, allowing flexible usage in both academic and commercial projects.
 
 ---
 
-Still have questions? Feel free to ask on our `GitHub Discussions <https://github.com/medrs/medrs/discussions>`_ or open an issue!
+Still have questions? Open an issue on `GitHub <https://github.com/liamchalcroft/med-rs/issues>`_.

@@ -22,8 +22,8 @@ We now support **complete MONAI MetaTensor integration** that preserves NIfTI-st
 
 ## Key Benefits
 
-- **200-3500x faster loading**: Byte-exact cropping vs full volume loading
-- **40x memory reduction**: Load only the pixels you need
+- **Up to 40x faster loading**: Crop-first loading vs full volume loading
+- **Reduced memory usage**: Load only the pixels you need
 - **Zero device transfer overhead**: Direct GPU tensor creation
 - **Full MONAI compatibility**: Seamlessly replace I/O components
 - **Clean integration**: Drop-in replacement for critical transforms
@@ -107,7 +107,7 @@ class MedrsLabelAwareCropd:
         image_path = data["image"]
         label_path = data["label"]
 
-        # Load EXACT bytes only (40x less memory!)
+        # Load only the required patch data
         image_tensor, label_tensor = medrs.load_label_aware_cropped(
             image_path, label_path,
             patch_size=self.patch_size,
@@ -118,7 +118,7 @@ class MedrsLabelAwareCropd:
 
 # Combined pipeline - best of both worlds!
 transforms = Compose([
-    MedrsLabelAwareCropd(                           # 40x memory reduction
+    MedrsLabelAwareCropd(                           # Reduced memory usage
         keys=["image", "label"],
         patch_size=(96, 96, 96),
         pos_neg_ratio=2.0,
@@ -132,12 +132,12 @@ transforms = Compose([
 
 ## Performance Comparison
 
-| Operation | Traditional MONAI | medrs Crop-First | Speedup |
-|-----------|------------------|------------------|---------|
-| Load 96^3 patch | ~50ms | ~0.2ms | **250x** |
-| Memory usage | ~1GB | ~25MB | **40x reduction** |
-| GPU transfer | ~10ms | 0ms | **Instant** |
-| Pipeline throughput | 20 patches/sec | 5000 patches/sec | **250x** |
+| Operation | Traditional MONAI | medrs Crop-First | Improvement |
+|-----------|------------------|------------------|-------------|
+| Load 128³ volume | ~7.5ms | ~0.2ms | **41x faster** |
+| Load 64³ patch from 128³ | ~30ms | ~0.8ms | **39x faster** |
+| Memory usage | Full volume | Patch only | **Reduced** |
+| To PyTorch (128³) | ~16ms | ~1.0ms | **16x faster** |
 
 ## Recommended Integration Patterns
 

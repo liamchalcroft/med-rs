@@ -1,12 +1,17 @@
 //! Transform composition for building pipelines.
 
 use super::lazy::{execute_fused_intensity, LazyImage, LazyTransform, PendingOp};
+use crate::error::Result;
 use crate::nifti::NiftiImage;
 
 /// A composable transform that can be applied eagerly or lazily.
 pub trait Transform {
     /// Apply the transform eagerly to an image.
-    fn apply(&self, image: &NiftiImage) -> NiftiImage;
+    ///
+    /// # Errors
+    /// Returns an error if the transform fails (e.g., non-contiguous array,
+    /// memory allocation failure, or invalid data).
+    fn apply(&self, image: &NiftiImage) -> Result<NiftiImage>;
 }
 
 /// A composed pipeline of transforms.
@@ -17,13 +22,13 @@ pub struct Compose {
 
 /// Internal trait for type-erased transforms.
 trait TransformBox: Send + Sync {
-    fn apply_eager(&self, image: &NiftiImage) -> NiftiImage;
+    fn apply_eager(&self, image: &NiftiImage) -> Result<NiftiImage>;
     fn to_pending(&self, image: &LazyImage) -> Option<Vec<PendingOp>>;
     fn requires_data(&self) -> bool;
 }
 
 impl<T: Transform + LazyTransform + Send + Sync + 'static> TransformBox for T {
-    fn apply_eager(&self, image: &NiftiImage) -> NiftiImage {
+    fn apply_eager(&self, image: &NiftiImage) -> Result<NiftiImage> {
         self.apply(image)
     }
 
@@ -69,7 +74,10 @@ impl Compose {
     }
 
     /// Apply the composed transforms to an image.
-    pub fn apply(&self, image: &NiftiImage) -> NiftiImage {
+    ///
+    /// # Errors
+    /// Returns `Err` if any transform fails (I/O error, invalid data, etc.)
+    pub fn apply(&self, image: &NiftiImage) -> Result<NiftiImage> {
         if self.lazy {
             self.apply_lazy(image)
         } else {
@@ -78,27 +86,27 @@ impl Compose {
     }
 
     /// Apply transforms eagerly (one at a time).
-    fn apply_eager(&self, image: &NiftiImage) -> NiftiImage {
+    fn apply_eager(&self, image: &NiftiImage) -> Result<NiftiImage> {
         let mut result = image.clone();
         for transform in &self.transforms {
-            result = transform.apply_eager(&result);
+            result = transform.apply_eager(&result)?;
         }
-        result
+        Ok(result)
     }
 
     /// Apply transforms lazily (accumulate and execute in batches).
-    fn apply_lazy(&self, image: &NiftiImage) -> NiftiImage {
+    fn apply_lazy(&self, image: &NiftiImage) -> Result<NiftiImage> {
         let mut lazy_img = LazyImage::from_image(image.clone());
 
         for transform in &self.transforms {
             if transform.requires_data() {
                 // This transform needs actual data, materialize first
                 if lazy_img.has_pending() {
-                    let img = lazy_img.materialize().expect("Failed to materialize");
-                    let result = transform.apply_eager(&img);
+                    let img = lazy_img.materialize()?;
+                    let result = transform.apply_eager(&img)?;
                     lazy_img = LazyImage::from_image(result);
                 } else if let Some(img) = lazy_img.image.take() {
-                    let result = transform.apply_eager(&img);
+                    let result = transform.apply_eager(&img)?;
                     lazy_img = LazyImage::from_image(result);
                 }
             } else if let Some(ops) = transform.to_pending(&lazy_img) {
@@ -107,8 +115,8 @@ impl Compose {
                 }
             } else {
                 // Transform can't be made lazy, apply eagerly
-                let img = lazy_img.materialize().expect("Failed to materialize");
-                let result = transform.apply_eager(&img);
+                let img = lazy_img.materialize()?;
+                let result = transform.apply_eager(&img)?;
                 lazy_img = LazyImage::from_image(result);
             }
         }
@@ -118,14 +126,12 @@ impl Compose {
             let pending = lazy_img.pending.clone();
             if let Some(img) = &lazy_img.image {
                 if let Some(fused) = execute_fused_intensity(img, &pending) {
-                    return fused;
+                    return Ok(fused);
                 }
             }
         }
 
-        lazy_img
-            .materialize()
-            .expect("Failed to materialize final result")
+        lazy_img.materialize()
     }
 
     /// Get the number of transforms in the pipeline.
@@ -211,7 +217,10 @@ impl TransformPipeline {
     }
 
     /// Apply the pipeline to an image.
-    pub fn apply(&self, image: &NiftiImage) -> NiftiImage {
+    ///
+    /// # Errors
+    /// Returns `Err` if any transform fails (I/O error, invalid data, etc.)
+    pub fn apply(&self, image: &NiftiImage) -> Result<NiftiImage> {
         self.compose.apply(image)
     }
 
@@ -232,7 +241,7 @@ impl Default for TransformPipeline {
 struct ZNormalizeTransform;
 
 impl Transform for ZNormalizeTransform {
-    fn apply(&self, image: &NiftiImage) -> NiftiImage {
+    fn apply(&self, image: &NiftiImage) -> Result<NiftiImage> {
         crate::transforms::z_normalization(image)
     }
 }
@@ -256,7 +265,7 @@ struct RescaleTransform {
 }
 
 impl Transform for RescaleTransform {
-    fn apply(&self, image: &NiftiImage) -> NiftiImage {
+    fn apply(&self, image: &NiftiImage) -> Result<NiftiImage> {
         crate::transforms::rescale_intensity(image, self.out_min as f64, self.out_max as f64)
     }
 }
@@ -278,7 +287,7 @@ struct ClampTransform {
 }
 
 impl Transform for ClampTransform {
-    fn apply(&self, image: &NiftiImage) -> NiftiImage {
+    fn apply(&self, image: &NiftiImage) -> Result<NiftiImage> {
         crate::transforms::clamp(image, self.min as f64, self.max as f64)
     }
 }
@@ -301,7 +310,7 @@ struct ResampleSpacingTransform {
 }
 
 impl Transform for ResampleSpacingTransform {
-    fn apply(&self, image: &NiftiImage) -> NiftiImage {
+    fn apply(&self, image: &NiftiImage) -> Result<NiftiImage> {
         crate::transforms::resample_to_spacing(
             image,
             self.spacing,
@@ -354,7 +363,7 @@ struct ResampleShapeTransform {
 }
 
 impl Transform for ResampleShapeTransform {
-    fn apply(&self, image: &NiftiImage) -> NiftiImage {
+    fn apply(&self, image: &NiftiImage) -> Result<NiftiImage> {
         crate::transforms::resample_to_shape(
             image,
             self.shape,
@@ -399,10 +408,9 @@ struct FlipTransform {
 }
 
 impl Transform for FlipTransform {
-    fn apply(&self, image: &NiftiImage) -> NiftiImage {
+    fn apply(&self, image: &NiftiImage) -> Result<NiftiImage> {
         let axes_vec: Vec<usize> = (0..3).filter(|&i| (self.axes >> i) & 1 == 1).collect();
-        // Safe unwrap: axes are validated at construction
-        crate::transforms::flip(image, &axes_vec).expect("flip axes should be valid")
+        crate::transforms::flip(image, &axes_vec)
     }
 }
 
@@ -423,14 +431,18 @@ mod tests {
     use ndarray::ArrayD;
 
     fn create_test_image(data: Vec<f32>, shape: [usize; 3]) -> NiftiImage {
-        let array = ArrayD::from_shape_vec(shape.to_vec(), data).unwrap();
+        use ndarray::ShapeBuilder;
+        // Create C-order array first, then convert to F-order to match NIfTI convention
+        let c_order = ArrayD::from_shape_vec(shape.to_vec(), data).unwrap();
+        let mut f_order = ArrayD::zeros(ndarray::IxDyn(&shape).f());
+        f_order.assign(&c_order);
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        NiftiImage::from_array(array, affine)
+        NiftiImage::from_array(f_order, affine)
     }
 
     #[test]
@@ -445,7 +457,7 @@ mod tests {
                 max: 2.0,
             });
 
-        let result = pipeline.apply(&img);
+        let result = pipeline.apply(&img).expect("pipeline should succeed");
         assert_eq!(result.shape(), &[4, 4, 4]);
     }
 
@@ -459,14 +471,18 @@ mod tests {
             min: 0.0,
             max: 50.0,
         });
-        let eager_result = eager_pipeline.apply(&img);
+        let eager_result = eager_pipeline
+            .apply(&img)
+            .expect("eager pipeline should succeed");
 
         // Test lazy execution
         let lazy_pipeline = Compose::new().push(ClampTransform {
             min: 0.0,
             max: 50.0,
         });
-        let lazy_result = lazy_pipeline.apply(&img);
+        let lazy_result = lazy_pipeline
+            .apply(&img)
+            .expect("lazy pipeline should succeed");
 
         // Both should produce same shape
         assert_eq!(eager_result.shape(), lazy_result.shape());
@@ -482,7 +498,7 @@ mod tests {
             .clamp(-1.0, 1.0)
             .flip(&[0]);
 
-        let result = pipeline.apply(&img);
+        let result = pipeline.apply(&img).expect("pipeline should succeed");
         assert_eq!(result.shape(), &[4, 4, 4]);
     }
 
@@ -493,7 +509,7 @@ mod tests {
 
         let pipeline = TransformPipeline::new().resample_to_shape([8, 8, 8]);
 
-        let result = pipeline.apply(&img);
+        let result = pipeline.apply(&img).expect("pipeline should succeed");
         assert_eq!(result.shape(), &[8, 8, 8]);
     }
 
@@ -507,7 +523,7 @@ mod tests {
             .resample_to_shape([8, 8, 8])
             .resample_to_shape([16, 16, 16]);
 
-        let result = pipeline.apply(&img);
+        let result = pipeline.apply(&img).expect("pipeline should succeed");
         assert_eq!(result.shape(), &[16, 16, 16]);
     }
 
@@ -521,11 +537,11 @@ mod tests {
             .clamp(-1.0, 1.0)
             .resample_to_shape([8, 8, 8]);
 
-        let result = pipeline.apply(&img);
+        let result = pipeline.apply(&img).expect("pipeline should succeed");
         assert_eq!(result.shape(), &[8, 8, 8]);
 
         // Check values are clamped
-        let data = result.to_f32();
+        let data = result.to_f32().unwrap();
         for &v in data.iter() {
             assert!(v >= -1.0 && v <= 1.0, "Value {} outside clamp range", v);
         }

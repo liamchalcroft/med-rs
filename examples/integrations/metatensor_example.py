@@ -4,10 +4,14 @@ medrs + MONAI MetaTensor Integration Example
 
 Demonstrates how to use medrs with MONAI's MetaTensor to preserve
 NIfTI-style metadata while achieving high performance.
+
+Requirements:
+    pip install medrs torch monai
 """
 
 import torch
 from monai.transforms import Compose, EnsureChannelFirst
+from monai.data import MetaTensor
 
 import medrs
 
@@ -18,22 +22,10 @@ def main():
     print("medrs + MONAI MetaTensor Integration")
     print("===================================")
     print()
-
-    # Check MetaTensor availability
-    if not medrs.is_metatensor_supported():
-        print(" MONAI MetaTensor not available")
-        print(" Install with: pip install monai")
-        return
-
-    try:
-        from monai.data import MetaTensor
-        print(" MONAI MetaTensor available")
-    except ImportError:
-        print(" Cannot import MetaTensor")
-        return
+    print("MONAI MetaTensor available")
 
     # Example 1: Basic MetaTensor Loading
-    print("1. Basic MetaTensor Loading")
+    print("\n1. Basic MetaTensor Loading")
     loader = medrs.create_metatensor_loader(
         device="cuda" if torch.cuda.is_available() else "cpu",
         dtype=torch.float32,
@@ -104,11 +96,11 @@ def main():
         EnsureChannelFirst(keys=["image", "label"]),  # Add channel dim
     ])
 
-    print("   Pipeline: MetaTensor loading  MONAI transforms")
+    print("   Pipeline: MetaTensor loading + MONAI transforms")
     print("   Benefits:")
     print("    Metadata preserved throughout pipeline")
-    print("    350x speedup with medrs")
-    print("    40x memory reduction")
+    print("    Up to 40x faster I/O with medrs")
+    print("    Reduced memory with crop-first loading")
     print("    MONAI ecosystem compatibility")
 
     print("\nKey Advantages:")

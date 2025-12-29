@@ -84,8 +84,8 @@ pip install medrs[torch,monai,jax]
 ## Key Features Demonstrated
 
 ### Performance
-- **40x memory reduction** with crop-first loading
-- **200-3500x faster** than traditional approaches
+- **Reduced memory** with crop-first loading (loads only needed data)
+- **Up to 40x faster** I/O than MONAI for typical training workflows
 - **Direct GPU loading** eliminates CPU-GPU transfers
 
 ### Framework Integration

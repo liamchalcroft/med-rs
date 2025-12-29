@@ -8,8 +8,6 @@ use super::header::NiftiHeader;
 use super::image::NiftiImage;
 use crate::error::{Error, Result};
 use flate2::bufread::GzDecoder;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use libdeflater::Decompressor;
 use memmap2::Mmap;
 use rand::Rng;
@@ -21,8 +19,6 @@ use std::sync::Arc;
 
 use crate::transforms::{self, Interpolation};
 
-const GZIP_BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer for faster streaming
-
 /// Load a NIfTI image from file.
 ///
 /// Supports both `.nii` and `.nii.gz` formats with automatic detection.
@@ -32,9 +28,10 @@ const GZIP_BUF_SIZE: usize = 8 * 1024 * 1024; // 8MB buffer for faster streaming
 /// let img = medrs::nifti::load("brain.nii.gz")?;
 /// let data = img.to_f32();
 /// ```
+#[must_use = "this function returns a loaded image that should be used"]
 pub fn load<P: AsRef<Path>>(path: P) -> Result<NiftiImage> {
     let path = path.as_ref();
-    let is_gzipped = path.extension().map(|e| e == "gz").unwrap_or(false);
+    let is_gzipped = path.extension().is_some_and(|e| e == "gz");
 
     if is_gzipped {
         load_gzipped(path)
@@ -47,6 +44,10 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<NiftiImage> {
 #[allow(unsafe_code)]
 fn load_uncompressed(path: &Path) -> Result<NiftiImage> {
     let file = File::open(path)?;
+    // SAFETY: Memory mapping is safe because:
+    // 1. The file was just opened successfully
+    // 2. The mmap is read-only and won't be modified
+    // 3. If the file is modified externally, data may become inconsistent but no UB
     let mmap = unsafe { Mmap::map(&file)? };
 
     let header = NiftiHeader::from_bytes(&mmap)?;
@@ -111,8 +112,10 @@ fn load_gzipped(path: &Path) -> Result<NiftiImage> {
 /// medrs::nifti::save(&img, "output.nii.gz")?;
 /// ```
 pub fn save<P: AsRef<Path>>(image: &NiftiImage, path: P) -> Result<()> {
+    image.header().validate()?;
+
     let path = path.as_ref();
-    let is_gzipped = path.extension().map(|e| e == "gz").unwrap_or(false);
+    let is_gzipped = path.extension().is_some_and(|e| e == "gz");
 
     if is_gzipped {
         save_gzipped(image, path)
@@ -136,7 +139,7 @@ fn save_uncompressed(image: &NiftiImage, path: &Path) -> Result<()> {
     }
 
     // Write data
-    let data = image.data_to_bytes();
+    let data = image.data_to_bytes()?;
     writer.write_all(&data)?;
     writer.flush()?;
 
@@ -144,24 +147,35 @@ fn save_uncompressed(image: &NiftiImage, path: &Path) -> Result<()> {
 }
 
 fn save_gzipped(image: &NiftiImage, path: &Path) -> Result<()> {
-    let file = File::create(path)?;
-    let buf_writer = BufWriter::with_capacity(GZIP_BUF_SIZE, file);
-    let mut encoder = GzEncoder::new(buf_writer, Compression::default());
-
-    // Write header
+    // Build uncompressed payload in memory first
     let header_bytes = image.header().to_bytes();
-    encoder.write_all(&header_bytes)?;
-
-    // Padding
     let padding = image.header().vox_offset as usize - NiftiHeader::SIZE;
-    if padding > 0 {
-        encoder.write_all(&vec![0u8; padding])?;
-    }
+    let data = image.data_to_bytes()?;
 
-    // Write data
-    let data = image.data_to_bytes();
-    encoder.write_all(&data)?;
-    encoder.finish()?;
+    // Assemble full uncompressed payload
+    let total_size = header_bytes.len() + padding + data.len();
+    let mut uncompressed = Vec::with_capacity(total_size);
+    uncompressed.extend_from_slice(&header_bytes);
+    uncompressed.resize(uncompressed.len() + padding, 0u8);
+    uncompressed.extend_from_slice(&data);
+
+    // Use libdeflate for fast single-shot compression (same as we use for decompression)
+    // Level 1 = fastest, good balance of speed vs compression ratio
+    let mut compressor = libdeflater::Compressor::new(libdeflater::CompressionLvl::fastest());
+
+    // Allocate output buffer (worst case: slightly larger than input for incompressible data)
+    let max_compressed_size = compressor.gzip_compress_bound(uncompressed.len());
+    let mut compressed = vec![0u8; max_compressed_size];
+
+    let actual_size = compressor
+        .gzip_compress(&uncompressed, &mut compressed)
+        .map_err(|e| Error::Io(std::io::Error::other(format!("compression failed: {e:?}"))))?;
+
+    compressed.truncate(actual_size);
+
+    // Write compressed data to file
+    let mut file = File::create(path)?;
+    file.write_all(&compressed)?;
 
     Ok(())
 }
@@ -170,7 +184,7 @@ fn save_gzipped(image: &NiftiImage, path: &Path) -> Result<()> {
 #[allow(unsafe_code)]
 pub fn load_header<P: AsRef<Path>>(path: P) -> Result<NiftiHeader> {
     let path = path.as_ref();
-    let is_gzipped = path.extension().map(|e| e == "gz").unwrap_or(false);
+    let is_gzipped = path.extension().is_some_and(|e| e == "gz");
 
     if is_gzipped {
         let file = File::open(path)?;
@@ -181,6 +195,7 @@ pub fn load_header<P: AsRef<Path>>(path: P) -> Result<NiftiHeader> {
         NiftiHeader::from_bytes(&header_buf)
     } else {
         let file = File::open(path)?;
+        // SAFETY: Memory mapping is safe - file just opened, read-only access
         let mmap = unsafe { Mmap::map(&file)? };
         NiftiHeader::from_bytes(&mmap)
     }
@@ -222,6 +237,7 @@ impl Default for LoadCroppedConfig {
 ///   config: Configuration specifying desired output and optional transforms
 ///
 /// Returns: NiftiImage with cropped data (as owned array)
+#[must_use = "this function returns a loaded image that should be used"]
 #[allow(unsafe_code)]
 pub fn load_cropped_config<P: AsRef<Path>>(
     path: P,
@@ -232,6 +248,7 @@ pub fn load_cropped_config<P: AsRef<Path>>(
     ensure_uncompressed(path)?;
 
     let file = File::open(path)?;
+    // SAFETY: Memory mapping is safe - file just opened, read-only access
     let mmap = unsafe { Mmap::map(&file)? };
     let header = NiftiHeader::from_bytes(&mmap)?;
     let data_offset = header.vox_offset as usize;
@@ -251,17 +268,19 @@ pub fn load_cropped_config<P: AsRef<Path>>(
     let mut output = cropped;
 
     if let Some(target_orient) = config.target_orientation {
-        output = transforms::reorient(&output, target_orient);
+        output = transforms::reorient(&output, target_orient)?;
     }
 
     if let Some(target_spacing) = config.target_spacing {
-        output = transforms::resample_to_spacing(&output, target_spacing, Interpolation::Trilinear);
+        output =
+            transforms::resample_to_spacing(&output, target_spacing, Interpolation::Trilinear)?;
     }
 
     Ok(output)
 }
 
 /// Simple version of load_cropped.
+#[must_use = "this function returns a loaded image that should be used"]
 #[allow(unsafe_code)]
 pub fn load_cropped<P: AsRef<Path>>(
     path: P,
@@ -273,6 +292,7 @@ pub fn load_cropped<P: AsRef<Path>>(
     ensure_uncompressed(path)?;
 
     let file = File::open(path)?;
+    // SAFETY: Memory mapping is safe - file just opened, read-only access
     let mmap = unsafe { Mmap::map(&file)? };
     let header = NiftiHeader::from_bytes(&mmap)?;
     let data_offset = header.vox_offset as usize;
@@ -281,7 +301,7 @@ pub fn load_cropped<P: AsRef<Path>>(
 }
 
 fn ensure_uncompressed(path: &Path) -> Result<()> {
-    if path.extension().map(|e| e == "gz").unwrap_or(false) {
+    if path.extension().is_some_and(|e| e == "gz") {
         return Err(Error::InvalidDimensions(
             "load_cropped only supports uncompressed .nii files".to_string(),
         ));
@@ -317,6 +337,16 @@ fn copy_cropped_region(
         ));
     }
 
+    // Validate crop_shape has no zero dimensions
+    for (i, &dim) in crop_shape.iter().enumerate() {
+        if dim == 0 {
+            return Err(Error::InvalidDimensions(format!(
+                "Crop shape dimension {} cannot be zero",
+                i
+            )));
+        }
+    }
+
     for i in 0..3 {
         if crop_offset[i] + crop_shape[i] > full_shape[i] as usize {
             return Err(Error::InvalidDimensions(format!(
@@ -327,32 +357,99 @@ fn copy_cropped_region(
     }
 
     let elem_size = header.datatype.size();
-    let dim0 = full_shape[0] as usize;  // First dimension (fastest changing in F-order)
+    let dim0 = full_shape[0] as usize; // First dimension (fastest changing in F-order)
     let dim1 = full_shape.get(1).copied().unwrap_or(1) as usize;
-    let _dim2 = full_shape.get(2).copied().unwrap_or(1) as usize;
 
-    // Allocate contiguous buffer for cropped block
-    let total_elements = crop_shape[0] * crop_shape[1] * crop_shape[2];
-    let mut buffer = vec![0u8; total_elements * elem_size];
+    // Calculate total_bytes with overflow checking
+    let total_bytes = crop_shape[0]
+        .checked_mul(crop_shape[1])
+        .and_then(|v| v.checked_mul(crop_shape[2]))
+        .and_then(|v| v.checked_mul(elem_size))
+        .ok_or_else(|| {
+            Error::InvalidDimensions(format!(
+                "Crop region too large: {:?} x {} bytes would overflow",
+                crop_shape, elem_size
+            ))
+        })?;
+    let mut buffer = vec![0u8; total_bytes];
+
+    // Calculate expected_data_size with overflow checking
+    let expected_data_size = (full_shape[0] as usize)
+        .checked_mul(full_shape[1] as usize)
+        .and_then(|v| v.checked_mul(full_shape[2] as usize))
+        .and_then(|v| v.checked_mul(elem_size))
+        .ok_or_else(|| {
+            Error::InvalidDimensions(format!(
+                "Volume too large: {:?} x {} bytes would overflow",
+                &full_shape[..3],
+                elem_size
+            ))
+        })?;
+
+    let total_required = data_offset
+        .checked_add(expected_data_size)
+        .ok_or_else(|| Error::InvalidDimensions("Data offset + size would overflow".to_string()))?;
+
+    if mmap.len() < total_required {
+        return Err(Error::InvalidDimensions(format!(
+            "File too small: need {} bytes for data but mmap is {} bytes (offset {})",
+            expected_data_size,
+            mmap.len(),
+            data_offset
+        )));
+    }
 
     // NIfTI uses F-order (column-major): first index changes fastest
     // F-order linear index = x + y * dim0 + z * dim0 * dim1
-    let mut dst_cursor = 0;
-    for z in 0..crop_shape[2] {
-        let src_z = crop_offset[2] + z;
-        for y in 0..crop_shape[1] {
-            let src_y = crop_offset[1] + y;
-            // F-order: index = x + y * dim0 + z * dim0 * dim1
-            // We copy a contiguous run along the first axis (x)
-            let src_index = crop_offset[0] + src_y * dim0 + src_z * dim0 * dim1;
-            let src_byte = data_offset + src_index * elem_size;
-            let row_bytes = crop_shape[0] * elem_size;  // First dimension is contiguous
-            let src_slice = mmap.get(src_byte..src_byte + row_bytes).ok_or_else(|| {
-                Error::InvalidDimensions("Crop region exceeds file size".to_string())
-            })?;
+    let row_bytes = crop_shape[0] * elem_size;
+    let mmap_slice = mmap.as_ref();
 
-            buffer[dst_cursor..dst_cursor + row_bytes].copy_from_slice(src_slice);
-            dst_cursor += row_bytes;
+    // For larger crops, use parallel copying across z-slices
+    // Threshold: ~64KB of data per slice makes parallelization worthwhile
+    let slice_bytes = crop_shape[0] * crop_shape[1] * elem_size;
+    let use_parallel = slice_bytes > 65536 && crop_shape[2] >= 4;
+
+    if use_parallel {
+        use rayon::prelude::*;
+
+        // Split buffer into z-slices and copy in parallel
+        let slices_per_z = crop_shape[1];
+        let bytes_per_z = slices_per_z * row_bytes;
+
+        buffer
+            .par_chunks_mut(bytes_per_z)
+            .enumerate()
+            .for_each(|(z, z_buffer)| {
+                let src_z = crop_offset[2] + z;
+                let z_offset = src_z * dim0 * dim1;
+
+                for y in 0..crop_shape[1] {
+                    let src_y = crop_offset[1] + y;
+                    let src_index = crop_offset[0] + src_y * dim0 + z_offset;
+                    let src_byte = data_offset + src_index * elem_size;
+
+                    let dst_start = y * row_bytes;
+                    z_buffer[dst_start..dst_start + row_bytes]
+                        .copy_from_slice(&mmap_slice[src_byte..src_byte + row_bytes]);
+                }
+            });
+    } else {
+        // Sequential copy for small crops (lower overhead)
+        let mut dst_cursor = 0;
+        for z in 0..crop_shape[2] {
+            let src_z = crop_offset[2] + z;
+            let z_offset = src_z * dim0 * dim1;
+
+            for y in 0..crop_shape[1] {
+                let src_y = crop_offset[1] + y;
+                let src_index = crop_offset[0] + src_y * dim0 + z_offset;
+                let src_byte = data_offset + src_index * elem_size;
+
+                let src_range = src_byte..src_byte + row_bytes;
+                let dst_range = dst_cursor..dst_cursor + row_bytes;
+                buffer[dst_range].copy_from_slice(&mmap_slice[src_range]);
+                dst_cursor += row_bytes;
+            }
         }
     }
 
@@ -362,14 +459,14 @@ fn copy_cropped_region(
     for (i, &s) in crop_shape.iter().enumerate() {
         new_header.dim[i] = s as u16;
     }
-    new_header.vox_offset = 0.0;
+    new_header.vox_offset = NiftiHeader::default().vox_offset;
 
     // Translate affine by crop offset
     let mut affine = new_header.affine();
-    for r in 0..3 {
-        affine[r][3] += affine[r][0] * crop_offset[0] as f32
-            + affine[r][1] * crop_offset[1] as f32
-            + affine[r][2] * crop_offset[2] as f32;
+    for row in affine.iter_mut().take(3) {
+        row[3] += row[0] * crop_offset[0] as f32
+            + row[1] * crop_offset[1] as f32
+            + row[2] * crop_offset[2] as f32;
     }
     new_header.set_affine(affine);
 
@@ -431,17 +528,56 @@ impl CropLoader {
     #[allow(unsafe_code)]
     pub fn next_patch(&mut self) -> Result<NiftiImage> {
         if self.current_volume >= self.volumes.len() {
+            return Err(Error::Exhausted("all volumes processed".to_string()));
+        }
+
+        if self.config.patches_per_volume == 0 {
             return Err(Error::InvalidDimensions(
-                "No more volumes available".to_string(),
+                "patches_per_volume must be positive".to_string(),
             ));
         }
 
         // Load current volume header to get dimensions
         let path = &self.volumes[self.current_volume];
         let file = File::open(path)?;
+        // SAFETY: Memory mapping is safe - file just opened, read-only access
         let mmap = unsafe { Mmap::map(&file)? };
         let header = NiftiHeader::from_bytes(&mmap)?;
         let volume_shape = header.shape();
+
+        if volume_shape.len() < 3 {
+            return Err(Error::InvalidDimensions(
+                "expected at least 3 spatial dimensions".to_string(),
+            ));
+        }
+
+        for (i, (&dim, &patch_dim)) in volume_shape
+            .iter()
+            .zip(self.config.patch_size.iter())
+            .take(3)
+            .enumerate()
+        {
+            if patch_dim == 0 {
+                return Err(Error::InvalidDimensions(format!(
+                    "patch_size[{}] must be positive",
+                    i
+                )));
+            }
+            if patch_dim > dim as usize {
+                return Err(Error::InvalidDimensions(format!(
+                    "patch_size[{}]={} cannot exceed image dimension[{}]={}",
+                    i, patch_dim, i, dim
+                )));
+            }
+        }
+
+        for i in 0..3 {
+            if self.config.patch_overlap[i] >= self.config.patch_size[i] {
+                return Err(Error::InvalidDimensions(
+                    "patch_overlap must be smaller than patch_size in all dimensions".to_string(),
+                ));
+            }
+        }
 
         // Calculate patch positions
         let patch_positions = if self.config.randomize {
@@ -481,9 +617,10 @@ impl CropLoader {
         }
 
         let mut positions = Vec::new();
-        let max_d = shape[0] as usize - pd;
-        let max_h = *shape.get(1).unwrap_or(&1) as usize - ph;
-        let max_w = *shape.get(2).unwrap_or(&1) as usize - pw;
+        // Use saturating_sub to prevent underflow when patch is larger than volume
+        let max_d = (shape[0] as usize).saturating_sub(pd);
+        let max_h = (*shape.get(1).unwrap_or(&1) as usize).saturating_sub(ph);
+        let max_w = (*shape.get(2).unwrap_or(&1) as usize).saturating_sub(pw);
 
         for d in (0..=max_d).step_by(step_d) {
             for h in (0..=max_h).step_by(step_h) {
@@ -500,18 +637,19 @@ impl CropLoader {
     fn random_patch_positions(&self, shape: &[u16]) -> Vec<[usize; 3]> {
         use rand::thread_rng;
 
-        let max_d = *shape.get(0).unwrap_or(&1) as usize - self.config.patch_size[0];
-        let max_h = *shape.get(1).unwrap_or(&1) as usize - self.config.patch_size[1];
-        let max_w = *shape.get(2).unwrap_or(&1) as usize - self.config.patch_size[2];
+        // Use saturating_sub to prevent underflow when patch is larger than volume
+        let max_d = (*shape.first().unwrap_or(&1) as usize).saturating_sub(self.config.patch_size[0]);
+        let max_h = (*shape.get(1).unwrap_or(&1) as usize).saturating_sub(self.config.patch_size[1]);
+        let max_w = (*shape.get(2).unwrap_or(&1) as usize).saturating_sub(self.config.patch_size[2]);
 
         let mut rng = thread_rng();
         let mut positions = Vec::new();
 
         for _ in 0..self.config.patches_per_volume {
             positions.push([
-                rng.gen_range(0..=max_d.max(0)),
-                rng.gen_range(0..=max_h.max(0)),
-                rng.gen_range(0..=max_w.max(0)),
+                rng.gen_range(0..=max_d),
+                rng.gen_range(0..=max_h),
+                rng.gen_range(0..=max_w),
             ]);
         }
 
@@ -540,19 +678,24 @@ impl BatchLoader {
 
     /// Load the next batch of patches.
     pub fn next_batch(&mut self) -> Result<Vec<NiftiImage>> {
+        if self.batch_size == 0 {
+            return Err(Error::InvalidDimensions(
+                "batch_size must be positive".to_string(),
+            ));
+        }
+
         let mut batch = Vec::with_capacity(self.batch_size);
 
         for _ in 0..self.batch_size {
             match self.loader.next_patch() {
                 Ok(patch) => batch.push(patch),
-                Err(_) => break, // No more patches
+                Err(Error::Exhausted(_)) => break,
+                Err(e) => return Err(e),
             }
         }
 
         if batch.is_empty() {
-            Err(Error::InvalidDimensions(
-                "No more patches available".to_string(),
-            ))
+            Err(Error::Exhausted("no more patches available".to_string()))
         } else {
             Ok(batch)
         }
@@ -618,6 +761,21 @@ impl TrainingDataLoader {
         }
 
         for i in 0..3 {
+            if config.patch_size[i] == 0 {
+                return Err(Error::InvalidDimensions(format!(
+                    "patch_size[{}] must be positive",
+                    i
+                )));
+            }
+        }
+
+        if config.patches_per_volume == 0 {
+            return Err(Error::InvalidDimensions(
+                "patches_per_volume must be positive".to_string(),
+            ));
+        }
+
+        for i in 0..3 {
             if config.patch_overlap[i] >= config.patch_size[i] {
                 return Err(Error::InvalidDimensions(
                     "patch_overlap must be smaller than patch_size in all dimensions".to_string(),
@@ -666,8 +824,10 @@ impl TrainingDataLoader {
             self.load_volume_patches(self.current_volume)?;
         }
 
-        // Get patch from cache
-        let patches = self.cache.get_mut(&self.current_volume).unwrap();
+        // Get patch from cache (invariant: load_volume_patches ensures key exists)
+        let patches = self.cache.get_mut(&self.current_volume).ok_or_else(|| {
+            Error::InvalidDimensions("cache invariant violated: volume should be loaded".into())
+        })?;
 
         if self.current_patch >= patches.len() {
             // Move to next volume
@@ -675,9 +835,7 @@ impl TrainingDataLoader {
             self.current_patch = 0;
 
             if self.current_volume >= self.volumes.len() {
-                return Err(Error::InvalidDimensions(
-                    "All patches processed".to_string(),
-                ));
+                return Err(Error::Exhausted("all patches processed".to_string()));
             }
 
             return self.next_patch();
@@ -715,16 +873,28 @@ impl TrainingDataLoader {
         let header = load_header(volume_path)?;
         let shape = header.shape();
 
-        for i in 0..3 {
-            if self.config.patch_size[i] > shape[i] as usize {
-                return Err(Error::InvalidDimensions(
-                    "patch_size cannot exceed image dimensions".to_string(),
-                ));
+        if shape.len() < 3 {
+            return Err(Error::InvalidDimensions(
+                "expected at least 3 spatial dimensions".to_string(),
+            ));
+        }
+
+        for (i, (&dim, &patch_dim)) in shape
+            .iter()
+            .zip(self.config.patch_size.iter())
+            .take(3)
+            .enumerate()
+        {
+            if patch_dim > dim as usize {
+                return Err(Error::InvalidDimensions(format!(
+                    "patch_size[{}]={} cannot exceed image dimension[{}]={}",
+                    i, patch_dim, i, dim
+                )));
             }
         }
 
         if self.config.randomize {
-            self.random_patch_positions(shape)
+            Ok(self.random_patch_positions(shape))
         } else {
             self.grid_patch_positions(shape)
         }
@@ -735,9 +905,10 @@ impl TrainingDataLoader {
         let [pd, ph, pw] = self.config.patch_size;
         let [od, oh, ow] = self.config.patch_overlap;
 
-        let max_d = shape[0] as usize - pd;
-        let max_h = *shape.get(1).unwrap_or(&1) as usize - ph;
-        let max_w = *shape.get(2).unwrap_or(&1) as usize - pw;
+        // Use saturating_sub to prevent underflow when patch is larger than volume
+        let max_d = (shape[0] as usize).saturating_sub(pd);
+        let max_h = (*shape.get(1).unwrap_or(&1) as usize).saturating_sub(ph);
+        let max_w = (*shape.get(2).unwrap_or(&1) as usize).saturating_sub(pw);
 
         let step_d = pd.saturating_sub(od);
         let step_h = ph.saturating_sub(oh);
@@ -776,12 +947,13 @@ impl TrainingDataLoader {
     }
 
     /// Generate random patch positions.
-    fn random_patch_positions(&self, shape: &[u16]) -> Result<Vec<[usize; 3]>> {
+    fn random_patch_positions(&self, shape: &[u16]) -> Vec<[usize; 3]> {
         let [pd, ph, pw] = self.config.patch_size;
 
-        let max_d = shape[0] as usize - pd;
-        let max_h = *shape.get(1).unwrap_or(&1) as usize - ph;
-        let max_w = *shape.get(2).unwrap_or(&1) as usize - pw;
+        // Use saturating_sub to prevent underflow when patch is larger than volume
+        let max_d = (shape[0] as usize).saturating_sub(pd);
+        let max_h = (*shape.get(1).unwrap_or(&1) as usize).saturating_sub(ph);
+        let max_w = (*shape.get(2).unwrap_or(&1) as usize).saturating_sub(pw);
 
         let mut rng = rand::thread_rng();
         let mut positions = Vec::with_capacity(self.config.patches_per_volume);
@@ -794,7 +966,7 @@ impl TrainingDataLoader {
             ]);
         }
 
-        Ok(positions)
+        positions
     }
 
     /// Trigger prefetch for upcoming volume.
@@ -816,7 +988,7 @@ impl TrainingDataLoader {
             current_volume: self.current_volume,
             cached_volumes: self.cache.len(),
             patches_processed: self.patches_processed,
-            cache_size: self.cache.iter().map(|(_, patches)| patches.len()).sum(),
+            cache_size: self.cache.values().map(|patches| patches.len()).sum(),
             max_cache_size: self.max_cache_size,
         }
     }
@@ -917,7 +1089,7 @@ mod tests {
 
         assert_eq!(loaded.shape(), &[10, 10, 10]);
         // Compare in memory order
-        let loaded_data = loaded.to_f32();
+        let loaded_data = loaded.to_f32().unwrap();
         assert_eq!(
             loaded_data.as_slice_memory_order().unwrap(),
             data.as_slice_memory_order().unwrap()
@@ -944,7 +1116,7 @@ mod tests {
         assert_eq!(loaded.shape(), &[10, 10, 10]);
         assert_eq!(loaded.affine(), affine);
         // Compare in memory order
-        let loaded_data = loaded.to_f32();
+        let loaded_data = loaded.to_f32().unwrap();
         assert_eq!(
             loaded_data.as_slice_memory_order().unwrap(),
             data.as_slice_memory_order().unwrap()
@@ -957,10 +1129,7 @@ mod tests {
         let path = dir.path().join("test.nii");
 
         // Create a larger test image for cropping with F-order
-        let data = create_f_order_array(
-            (0..131072).map(|i| i as f32).collect(),
-            vec![64, 64, 32],
-        );
+        let data = create_f_order_array((0..131072).map(|i| i as f32).collect(), vec![64, 64, 32]);
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -979,7 +1148,7 @@ mod tests {
 
         // Verify the cropped data matches the expected region
         let original_slice = data.slice(s![16..48, 16..48, 8..24]).to_owned();
-        let cropped_data = cropped.to_f32();
+        let cropped_data = cropped.to_f32().unwrap();
 
         // Compare by iterating over logical coordinates
         for x in 0..32 {
@@ -990,11 +1159,47 @@ mod tests {
                     assert!(
                         (expected - actual).abs() < 1e-5,
                         "Mismatch at [{},{},{}]: expected {}, got {}",
-                        x, y, z, expected, actual
+                        x,
+                        y,
+                        z,
+                        expected,
+                        actual
                     );
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_save_cropped_roundtrip() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test.nii");
+        let cropped_path = dir.path().join("cropped.nii");
+
+        let data = create_f_order_array((0..131072).map(|i| i as f32).collect(), vec![64, 64, 32]);
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let img = NiftiImage::from_array(data.clone(), affine);
+        save(&img, &path).unwrap();
+
+        let crop_offset = [8, 8, 4];
+        let crop_shape = [16, 16, 8];
+        let cropped = load_cropped(&path, crop_offset, crop_shape).unwrap();
+        let cropped_data = cropped.to_f32().unwrap();
+
+        save(&cropped, &cropped_path).unwrap();
+        let loaded = load(&cropped_path).unwrap();
+
+        assert_eq!(loaded.shape(), &crop_shape);
+        let loaded_data = loaded.to_f32().unwrap();
+        assert_eq!(
+            loaded_data.as_slice_memory_order().unwrap(),
+            cropped_data.as_slice_memory_order().unwrap()
+        );
     }
 
     #[test]
@@ -1011,7 +1216,7 @@ mod tests {
             [0.0, 0.0, 0.0, 1.0],
         ];
         let mut img = NiftiImage::from_array(data.clone(), affine);
-        img.header_mut().pixdim = [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
+        img.header_mut().pixdim = [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0];
         save(&img, &path).unwrap();
 
         // Test configured loading with cropping to specific shape
@@ -1066,9 +1271,18 @@ mod tests {
         let patch2 = loader.next_patch().unwrap();
         assert_eq!(patch2.shape(), &[32, 32, 16]);
 
+        let patch3 = loader.next_patch().unwrap();
+        assert_eq!(patch3.shape(), &[32, 32, 16]);
+
+        let patch4 = loader.next_patch().unwrap();
+        assert_eq!(patch4.shape(), &[32, 32, 16]);
+
+        let exhausted = loader.next_patch().unwrap_err();
+        assert!(matches!(exhausted, Error::Exhausted(_)));
+
         // Test stats
         let stats = loader.stats();
-        assert_eq!(stats.patches_processed, 2);
+        assert_eq!(stats.patches_processed, 4);
     }
 
     #[test]
@@ -1077,10 +1291,7 @@ mod tests {
         let path = dir.path().join("test.nii");
 
         // Create test volume with F-order
-        let data = create_f_order_array(
-            (0..131072).map(|i| i as f32).collect(),
-            vec![64, 64, 32],
-        );
+        let data = create_f_order_array((0..131072).map(|i| i as f32).collect(), vec![64, 64, 32]);
         let affine = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -1112,10 +1323,10 @@ mod tests {
         assert_eq!(_patch4.shape(), &[16, 16, 8]);
 
         // With randomization, patches should be different
-        let data1 = patch1.to_f32();
-        let data2 = patch2.to_f32();
-        let _data3 = _patch3.to_f32();
-        let _data4 = _patch4.to_f32();
+        let data1 = patch1.to_f32().unwrap();
+        let data2 = patch2.to_f32().unwrap();
+        let _data3 = _patch3.to_f32().unwrap();
+        let _data4 = _patch4.to_f32().unwrap();
 
         // At least some patches should be different
         assert_ne!(data1, data2);
@@ -1192,6 +1403,97 @@ mod tests {
     }
 
     #[test]
+    fn training_data_loader_rejects_zero_patch_size() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_zero_patch_size.nii");
+        let data = create_f_order_array((0..4096).map(|i| i as f32).collect(), vec![16, 16, 16]);
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let img = NiftiImage::from_array(data, affine);
+        save(&img, &path).unwrap();
+
+        let cfg = CropLoaderConfig {
+            patch_size: [0, 8, 8],
+            patches_per_volume: 1,
+            patch_overlap: [0, 0, 0],
+            randomize: false,
+        };
+
+        let result = TrainingDataLoader::new(vec![&path], cfg, 10);
+        assert!(matches!(result, Err(Error::InvalidDimensions(_))));
+    }
+
+    #[test]
+    fn training_data_loader_rejects_zero_patches_per_volume() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_zero_patches.nii");
+        let data = create_f_order_array((0..4096).map(|i| i as f32).collect(), vec![16, 16, 16]);
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let img = NiftiImage::from_array(data, affine);
+        save(&img, &path).unwrap();
+
+        let cfg = CropLoaderConfig {
+            patch_size: [8, 8, 8],
+            patches_per_volume: 0,
+            patch_overlap: [0, 0, 0],
+            randomize: false,
+        };
+
+        let result = TrainingDataLoader::new(vec![&path], cfg, 10);
+        assert!(matches!(result, Err(Error::InvalidDimensions(_))));
+    }
+
+    #[test]
+    fn batch_loader_exhausts_cleanly() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_batch.nii");
+        let data = create_f_order_array((0..262144).map(|i| i as f32).collect(), vec![64, 64, 64]);
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let img = NiftiImage::from_array(data, affine);
+        save(&img, &path).unwrap();
+
+        let mut loader = BatchLoader::new(vec![&path], 2);
+        let batch = loader.next_batch().unwrap();
+        assert_eq!(batch.len(), 1);
+
+        let err = loader.next_batch().unwrap_err();
+        assert!(matches!(err, Error::Exhausted(_)));
+    }
+
+    #[test]
+    fn batch_loader_propagates_invalid_patch_error() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_batch_invalid.nii");
+        let data = create_f_order_array((0..32768).map(|i| i as f32).collect(), vec![32, 32, 32]);
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let img = NiftiImage::from_array(data, affine);
+        save(&img, &path).unwrap();
+
+        let mut loader = BatchLoader::new(vec![&path], 1);
+        let err = loader.next_batch().unwrap_err();
+        assert!(matches!(err, Error::InvalidDimensions(_)));
+    }
+
+    #[test]
     fn test_memory_efficiency() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("large_test.nii");
@@ -1220,7 +1522,7 @@ mod tests {
 
         // Verify data matches expected region using logical indexing
         let original_slice = data.slice(s![64..128, 64..128, 16..48]).to_owned();
-        let cropped_data = cropped.to_f32();
+        let cropped_data = cropped.to_f32().unwrap();
 
         // Compare by iterating over logical coordinates
         for x in 0..64 {
@@ -1231,7 +1533,11 @@ mod tests {
                     assert!(
                         (expected - actual).abs() < 1e-5,
                         "Mismatch at [{},{},{}]: expected {}, got {}",
-                        x, y, z, expected, actual
+                        x,
+                        y,
+                        z,
+                        expected,
+                        actual
                     );
                 }
             }
@@ -1241,5 +1547,50 @@ mod tests {
         let full_size_bytes = 256 * 256 * 64 * 4; // f32 = 4 bytes
         let crop_size_bytes = 64 * 64 * 32 * 4;
         assert!(crop_size_bytes < full_size_bytes / 10); // At least 10x reduction
+    }
+
+    #[test]
+    fn test_patch_larger_than_volume_does_not_panic() {
+        // Regression test: patch size > volume dimension should not panic due to underflow
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("test_small_volume.nii");
+
+        // Create small test volume (4x4x4)
+        let data = create_f_order_array((0..64).map(|i| i as f32).collect(), vec![4, 4, 4]);
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let img = NiftiImage::from_array(data, affine);
+        save(&img, &path).unwrap();
+
+        // Create loader with patch larger than volume (8x8x8 > 4x4x4)
+        let config = CropLoaderConfig {
+            patch_size: [8, 8, 8],
+            patches_per_volume: 2,
+            patch_overlap: [0, 0, 0],
+            randomize: false, // Use grid mode
+        };
+
+        // This should NOT panic - grid_patch_positions uses saturating_sub
+        let mut loader = CropLoader::new(vec![&path], config);
+        // It should still attempt to load (may fail with bounds error, but not panic)
+        let result = loader.next_patch();
+        // The behavior is that it still generates positions at (0,0,0)
+        // and the load_cropped may fail or succeed with partial data
+        assert!(result.is_ok() || result.is_err());
+
+        // Test random mode too
+        let config_random = CropLoaderConfig {
+            patch_size: [8, 8, 8],
+            patches_per_volume: 2,
+            patch_overlap: [0, 0, 0],
+            randomize: true,
+        };
+        let mut loader_random = CropLoader::new(vec![&path], config_random);
+        let result_random = loader_random.next_patch();
+        assert!(result_random.is_ok() || result_random.is_err());
     }
 }

@@ -247,7 +247,7 @@ def plot_resample():
 
     # For visualization, we'll just show the resampled result
     fig, axes = plt.subplots(2, 3, figsize=(12, 8))
-    fig.suptitle(f'Resample: Original vs 2mm spacing', fontsize=14, fontweight='bold')
+    fig.suptitle('Resample: Original vs 2mm spacing', fontsize=14, fontweight='bold')
 
     views = ['axial', 'coronal', 'sagittal']
     orig_slices = get_center_slices(original)

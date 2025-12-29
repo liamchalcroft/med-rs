@@ -21,7 +21,7 @@ class TestMONAICompatibility:
 
     def test_monai_transform_inheritance(self):
         """Test that medrs transforms can inherit from MONAI Transform."""
-        from examples.monai_compose_integration import MedrsLoadImage
+        from medrs.monai_compat import MedrsLoadImage
 
         # Test that MedrsLoadImage is a proper MONAI transform
         loader = MedrsLoadImage()
@@ -30,10 +30,10 @@ class TestMONAICompatibility:
 
     def test_monai_compose_integration(self):
         """Test that medrs transforms work in MONAI Compose pipelines."""
-        from examples.monai_compose_integration import MedrsLoadImage
+        from medrs.monai_compat import MedrsLoadImage
 
         # Create a medrs transform
-        medrs_loader = MedrsLoadImage(dtype=np.float32)
+        medrs_loader = MedrsLoadImage()
 
         # Create MONAI compose pipeline with medrs transform
         transforms = [
@@ -50,88 +50,63 @@ class TestMONAICompatibility:
         # Test that the first transform is our medrs loader
         assert isinstance(pipeline.transforms[0], MedrsLoadImage)
 
-    def test_medrs_load_cropped_transform(self):
-        """Test MedrsLoadCropped transform interface."""
-        from examples.monai_compose_integration import MedrsLoadCropped
+    def test_medrs_rand_spatial_crop_transform(self):
+        """Test MedrsRandSpatialCropd transform interface."""
+        from medrs.monai_compat import MedrsRandSpatialCropd
 
         # Test transform creation
-        loader = MedrsLoadCropped(
-            crop_offset=[16, 16, 8],
-            crop_size=[32, 32, 16],
-            target_spacing=[1.0, 1.0, 1.0]
+        cropper = MedrsRandSpatialCropd(
+            keys=["image"],
+            roi_size=[32, 32, 16],
         )
-        assert isinstance(loader, Transform)
+        assert callable(cropper)
+
+        # Test that parameters are stored correctly
+        assert list(cropper.roi_size) == [32, 32, 16]
+        assert cropper.keys == ("image",)
+
+    def test_medrs_loadimaged_transform(self):
+        """Test MedrsLoadImaged transform interface."""
+        from medrs.monai_compat import MedrsLoadImaged
+
+        # Test transform creation
+        loader = MedrsLoadImaged(
+            keys=["image", "label"],
+            ensure_channel_first=True,
+        )
         assert callable(loader)
 
         # Test that parameters are stored correctly
-        assert loader.crop_offset == [16, 16, 8]
-        assert loader.crop_size == [32, 32, 16]
-        assert loader.target_spacing == [1.0, 1.0, 1.0]
-
-    def test_medrs_load_to_tensor_transform(self):
-        """Test MedrsLoadToTensor transform interface."""
-        from examples.integrations.monai_integration import MedrsLoadToTensor
-
-        # Test transform creation
-        loader = MedrsLoadToTensor(
-            crop_size=[32, 32, 16],
-            dtype="float16",
-            device="cpu"
-        )
-        assert isinstance(loader, Transform)
-        assert callable(loader)
-
-        # Test that parameters are stored correctly
-        assert loader.crop_size == [32, 32, 16]
-        assert loader.dtype == "float16"
-        assert loader.device == "cpu"
+        assert loader.keys == ("image", "label")
+        assert loader.ensure_channel_first is True
 
 
 class TestPipelineCreation:
     """Test pipeline creation with different configurations."""
 
     def test_create_medrs_monai_pipeline(self):
-        """Test pipeline creation with different configurations."""
-        from examples.monai_compose_integration import create_medrs_monai_pipeline
+        """Test pipeline creation with medrs and MONAI transforms."""
+        from medrs.monai_compat import MedrsLoadImaged, MedrsRandSpatialCropd
+        from monai.transforms import Compose, RandFlipd, EnsureTyped
 
-        # Test different configurations
-        configs = [
-            ("segmentation", "memory"),
-            ("segmentation", "speed"),
-            ("classification", "balanced"),
-            ("detection", "memory"),
-        ]
+        # Create a mixed pipeline
+        pipeline = Compose([
+            MedrsLoadImaged(keys=["image"], ensure_channel_first=True),
+            MedrsRandSpatialCropd(keys=["image"], roi_size=[32, 32, 32]),
+            RandFlipd(keys=["image"], prob=0.5),
+            EnsureTyped(keys=["image"]),
+        ])
 
-        for task_type, performance_mode in configs:
-            try:
-                pipeline = create_medrs_monai_pipeline(task_type, performance_mode)
-                assert pipeline is not None
-                assert callable(pipeline)
-
-                # Test that pipeline has transforms
-                assert len(pipeline.transforms) > 0
-            except Exception as e:
-                # Some configs might fail if MONAI transforms aren't available
-                print(f"Note: Config {task_type}/{performance_mode} failed: {e}")
+        assert pipeline is not None
+        assert callable(pipeline)
+        assert len(pipeline.transforms) == 4
 
     def test_medrs_training_dataloader_interface(self):
-        """Test medrs training data loader interface."""
-        from examples.monai_compose_integration import create_medrs_training_dataloader
-
-        # Test with mock file list
-        mock_files = ["test1.nii", "test2.nii"]
-
-        # Should handle gracefully with missing files
-        try:
-            loader = create_medrs_training_dataloader(
-                image_files=mock_files,
-                patch_size=[64, 64, 64],
-                patches_per_volume=4,
-                cache_size=100
-            )
-        except Exception as e:
-            # Expected to fail with mock files, but interface should be valid
-            assert "No such file" in str(e) or "os error" in str(e)
+        """Test medrs TrainingDataLoader interface."""
+        # Test that TrainingDataLoader class is available
+        assert hasattr(medrs, 'TrainingDataLoader')
+        loader_class = getattr(medrs, 'TrainingDataLoader')
+        assert callable(loader_class)
 
 
 class TestPerformanceFeatures:
@@ -153,9 +128,9 @@ class TestPerformanceFeatures:
             assert callable(func)
 
     def test_training_data_loader_availability(self):
-        """Test that PyTrainingDataLoader is available."""
-        assert hasattr(medrs, 'PyTrainingDataLoader')
-        loader_class = getattr(medrs, 'PyTrainingDataLoader')
+        """Test that TrainingDataLoader is available."""
+        assert hasattr(medrs, 'TrainingDataLoader')
+        loader_class = getattr(medrs, 'TrainingDataLoader')
         assert callable(loader_class)
 
     def test_framework_integration_signatures(self):
@@ -279,9 +254,8 @@ class TestJAXIntegration:
             for dtype in dtypes:
                 with pytest.raises(Exception):  # Expected with mock file
                     jax_array = medrs.load_cropped_to_jax(
-                        volume_path=path,
+                        path,
                         output_shape=[16, 16, 16],
-                        dtype=dtype
                     )
         finally:
             if os.path.exists(path):
@@ -291,47 +265,38 @@ class TestJAXIntegration:
 class TestIntegrationExample:
     """Test the integration example functionality."""
 
-    def test_integration_example_runs(self):
-        """Test that the integration example can run without errors."""
-        import subprocess
-        import sys
-
-        # Run the integration example as a subprocess
-        result = subprocess.run(
-            [sys.executable, "examples/monai_compose_integration.py"],
-            capture_output=True,
-            text=True,
-            timeout=30
+    def test_monai_compat_module_imports(self):
+        """Test that the monai_compat module can be imported and used."""
+        from medrs.monai_compat import (
+            MedrsLoadImage,
+            MedrsLoadImaged,
+            MedrsSaveImage,
+            MedrsSaveImaged,
+            MedrsRandCropByPosNegLabeld,
+            MedrsRandSpatialCropd,
+            MedrsCenterSpatialCropd,
+            MedrsOrientation,
+            MedrsOrientationd,
         )
 
-        # Should complete successfully (even with mock files)
-        assert result.returncode == 0, f"Example failed: {result.stderr}"
-
-        # Check for expected output
-        expected_phrases = [
-            "medrs + MONAI Integration Example",
-            "Available Integrations",
-            "Performance Benchmark"
-        ]
-
-        for phrase in expected_phrases:
-            assert phrase in result.stdout, f"Missing expected output: {phrase}"
+        # Verify all classes are callable
+        assert callable(MedrsLoadImage)
+        assert callable(MedrsLoadImaged)
+        assert callable(MedrsSaveImage)
+        assert callable(MedrsSaveImaged)
+        assert callable(MedrsRandCropByPosNegLabeld)
+        assert callable(MedrsRandSpatialCropd)
+        assert callable(MedrsCenterSpatialCropd)
+        assert callable(MedrsOrientation)
+        assert callable(MedrsOrientationd)
 
 
 class TestErrorHandling:
     """Test error handling in integration scenarios."""
 
-    def test_invalid_transform_parameters(self):
-        """Test handling of invalid transform parameters."""
-        from examples.monai_compose_integration import MedrsLoadImage
-
-        # Test invalid reader
-        with pytest.raises(ValueError):
-            MedrsLoadImage(reader="invalid_reader")
-
     def test_missing_file_handling(self):
         """Test handling of missing files in pipelines."""
-        from examples.monai_compose_integration import MedrsLoadImage
+        from medrs.monai_compat import MedrsLoadImage
 
         loader = MedrsLoadImage()
 
@@ -339,26 +304,73 @@ class TestErrorHandling:
         with pytest.raises(Exception):  # Should raise some kind of error
             loader("nonexistent_file.nii")
 
-    def test_invalid_crop_parameters(self):
-        """Test handling of invalid crop parameters."""
-        from examples.monai_compose_integration import MedrsLoadCropped
+    def test_crop_transform_creation(self):
+        """Test crop transform creation with various parameters."""
+        from medrs.monai_compat import MedrsRandSpatialCropd, MedrsCenterSpatialCropd
 
-        # Test invalid crop sizes (negative or zero)
-        invalid_configs = [
-            ([0, 0, 0], [16, 16, 16]),  # Zero offset
-            ([16, 16, 16], [0, 0, 0]),   # Zero size
-            ([-1, 16, 16], [32, 32, 32]), # Negative offset
-            ([16, 16, 16], [-1, 32, 32]), # Negative size
-        ]
+        # Valid crop creation
+        cropper = MedrsRandSpatialCropd(keys=["image"], roi_size=[32, 32, 32])
+        assert callable(cropper)
 
-        for offset, size in invalid_configs:
-            # Transform should create successfully but fail during execution
-            try:
-                loader = MedrsLoadCropped(crop_offset=offset, crop_size=size)
-                assert isinstance(loader, Transform)
-            except Exception as e:
-                # Some validation might happen at creation time
-                assert "crop" in str(e).lower() or "offset" in str(e).lower() or "size" in str(e).lower()
+        center_cropper = MedrsCenterSpatialCropd(keys=["image"], roi_size=[32, 32, 32])
+        assert callable(center_cropper)
+
+
+class TestMetaTensorOrientationConversion:
+    """Test orientation to direction matrix conversion."""
+
+    def test_ras_orientation(self):
+        """Test RAS (Right-Anterior-Superior) orientation."""
+        from medrs.metatensor_support import MedrsMetaTensorConverter
+
+        direction = MedrsMetaTensorConverter._orientation_to_direction("RAS")
+
+        # RAS: X=Right(+), Y=Anterior(+), Z=Superior(+)
+        expected = np.array([
+            [1, 0, 0],  # R -> +X
+            [0, 1, 0],  # A -> +Y
+            [0, 0, 1],  # S -> +Z
+        ], dtype=np.float64)
+        np.testing.assert_array_equal(direction, expected)
+
+    def test_lpi_orientation(self):
+        """Test LPI (Left-Posterior-Inferior) orientation."""
+        from medrs.metatensor_support import MedrsMetaTensorConverter
+
+        direction = MedrsMetaTensorConverter._orientation_to_direction("LPI")
+
+        # LPI: X=Left(-), Y=Posterior(-), Z=Inferior(-)
+        expected = np.array([
+            [-1, 0, 0],   # L -> -X
+            [0, -1, 0],   # P -> -Y
+            [0, 0, -1],   # I -> -Z
+        ], dtype=np.float64)
+        np.testing.assert_array_equal(direction, expected)
+
+    def test_las_orientation(self):
+        """Test LAS (Left-Anterior-Superior) orientation."""
+        from medrs.metatensor_support import MedrsMetaTensorConverter
+
+        direction = MedrsMetaTensorConverter._orientation_to_direction("LAS")
+
+        # LAS: X=Left(-), Y=Anterior(+), Z=Superior(+)
+        expected = np.array([
+            [-1, 0, 0],  # L -> -X
+            [0, 1, 0],   # A -> +Y
+            [0, 0, 1],   # S -> +Z
+        ], dtype=np.float64)
+        np.testing.assert_array_equal(direction, expected)
+
+    def test_case_insensitivity(self):
+        """Test that orientation codes are case insensitive."""
+        from medrs.metatensor_support import MedrsMetaTensorConverter
+
+        upper = MedrsMetaTensorConverter._orientation_to_direction("RAS")
+        lower = MedrsMetaTensorConverter._orientation_to_direction("ras")
+        mixed = MedrsMetaTensorConverter._orientation_to_direction("RaS")
+
+        np.testing.assert_array_equal(upper, lower)
+        np.testing.assert_array_equal(upper, mixed)
 
 
 if __name__ == "__main__":

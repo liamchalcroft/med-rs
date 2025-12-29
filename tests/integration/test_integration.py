@@ -1,78 +1,58 @@
 #!/usr/bin/env python3
 """
-Simple MONAI + medrs Integration Test
+MONAI + medrs Integration Tests
 
 Test that medrs functions are available and can be integrated with MONAI transforms.
 """
 
-import sys
-
-# Imports will fail fast if dependencies are missing
+import pytest
 import medrs
-import torch
-import monai
 
-def main():
-    """Test basic integration."""
-    print("MONAI + medrs integration")
-    print("=" * 40)
+# Check for required dependencies
+torch = pytest.importorskip("torch")
+monai = pytest.importorskip("monai")
 
-    print("medrs imported successfully")
-    print(f"PyTorch {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    print(f"MONAI {monai.__version__}")
 
-    # Check that key functions exist
-    required_functions = [
-        'load',
-        'load_cropped',
-        'load_resampled'
-    ]
+class TestMONAIIntegration:
+    """Test MONAI integration capabilities."""
 
-    missing_functions = []
-    for func in required_functions:
-        if hasattr(medrs, func):
-            print(f"ok: {func}")
-        else:
-            missing_functions.append(func)
-            print(f"missing: {func}")
+    def test_core_functions_exist(self):
+        """Verify core medrs functions are available."""
+        required_functions = ["load", "load_cropped", "load_resampled"]
+        for func in required_functions:
+            assert hasattr(medrs, func), f"Missing core function: {func}"
 
-    # Check for advanced functions
-    advanced_functions = [
-        'load_cropped_to_torch',
-        'load_label_aware_cropped',
-        'compute_crop_regions'
-    ]
+    def test_advanced_functions_exist(self):
+        """Verify advanced medrs functions are available."""
+        advanced_functions = [
+            "load_cropped_to_torch",
+            "load_label_aware_cropped",
+            "compute_crop_regions",
+        ]
+        for func in advanced_functions:
+            assert hasattr(medrs, func), f"Missing advanced function: {func}"
 
-    for func in advanced_functions:
-        if hasattr(medrs, func):
-            print(f"ok: {func}")
-        else:
-            print(f"{func} - Missing from current build")
+    def test_torch_tensor_creation(self):
+        """Verify PyTorch tensor creation works."""
+        image_tensor = torch.randn(1, 96, 96, 96)
+        label_tensor = torch.randint(0, 2, (1, 96, 96, 96))
 
-    if missing_functions:
-        print(f"\n Missing core functions: {missing_functions}")
-        sys.exit(1)
+        assert image_tensor.shape == (1, 96, 96, 96)
+        assert image_tensor.dtype == torch.float32
+        assert label_tensor.shape == (1, 96, 96, 96)
 
-    # Create test tensors to verify compatibility
-    image_tensor = torch.randn(1, 96, 96, 96)  # Typical medical image shape
-    label_tensor = torch.randint(0, 2, (1, 96, 96, 96))  # Binary label
+    def test_monai_version_compatibility(self):
+        """Verify MONAI version is compatible."""
+        from packaging import version
 
-    print("Created test tensors")
-    print(f"  Image shape: {image_tensor.shape}, dtype: {image_tensor.dtype}")
-    print(f"  Label shape: {label_tensor.shape}, dtype: {label_tensor.dtype}")
+        monai_version = version.parse(monai.__version__)
+        # medrs requires MONAI >= 1.5
+        assert monai_version >= version.parse("1.5.0"), (
+            f"MONAI version {monai.__version__} is below minimum required 1.5.0"
+        )
 
-    print("\nIntegration example:")
-    print("  image, label = medrs.load_label_aware_cropped(")
-    print("      'image.nii', 'label.nii',")
-    print("      patch_size=(96, 96, 96),")
-    print("      pos_neg_ratio=2.0")
-    print("  )")
-
-    print("\nAll basic tests passed.")
-    print("medrs integration ready.")
-    return True
-
-if __name__ == "__main__":
-    success = main()
-    sys.exit(0 if success else 1)
+    def test_torch_cuda_detection(self):
+        """Verify CUDA detection works (doesn't require CUDA)."""
+        # Just verify the detection doesn't crash
+        cuda_available = torch.cuda.is_available()
+        assert isinstance(cuda_available, bool)

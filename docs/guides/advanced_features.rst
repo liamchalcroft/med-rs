@@ -3,15 +3,15 @@ Advanced Features
 
 This guide highlights utilities that build on top of the core loading and transform API.
 
-Patch Sampling with ``PyTrainingDataLoader``
---------------------------------------------
+Patch Sampling with ``TrainingDataLoader``
+------------------------------------------
 The Rust-backed loader extracts patches with caching and optional randomization.
 
 .. code-block:: python
 
    import medrs
 
-   loader = medrs.PyTrainingDataLoader(
+   loader = medrs.TrainingDataLoader(
        volumes=["vol1.nii.gz", "vol2.nii.gz"],
        patch_size=[64, 64, 64],
        patches_per_volume=4,
@@ -58,7 +58,8 @@ Track hotspots during training or preprocessing with ``PerformanceProfiler``.
 
    profiler = PerformanceProfiler()
    op_id = profiler.start_operation("load_patch")
-   patch = medrs.load_cropped("brain.nii.gz", [0, 0, 0], [64, 64, 64])
+   # Note: load_cropped requires uncompressed .nii files
+   patch = medrs.load_cropped("brain.nii", [0, 0, 0], [64, 64, 64])
    profiler.end_operation(op_id, "load_patch")
    print(profiler.get_summary()["load_patch"])
 

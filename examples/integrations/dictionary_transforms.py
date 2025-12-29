@@ -72,7 +72,7 @@ def main():
     ])
 
     print("   Pipeline: medrs loading + MONAI transforms")
-    print("   Benefits: 40x memory reduction + 350x speedup")
+    print("   Benefits: Reduced memory + faster I/O")
 
     # Example 4: Training Dataset
     print("\n4. Training Dataset")
@@ -106,7 +106,7 @@ def main():
     print(" Handles different slice thickness automatically")
     print(" Coordinated cropping across all modalities")
     print(" Full MONAI compatibility")
-    print(" 40x memory reduction, 350x speedup")
+    print(" Reduced memory, faster I/O")
 
 
 if __name__ == "__main__":

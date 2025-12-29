@@ -10,6 +10,7 @@ Provides comprehensive test infrastructure including:
 
 from __future__ import annotations
 
+import sys
 import pytest
 import tempfile
 import shutil
@@ -17,6 +18,13 @@ from pathlib import Path
 from typing import Generator, List, Tuple, Any
 import numpy as np
 import psutil
+
+ROOT_DIR = Path(__file__).resolve().parents[1]
+
+if sys.version_info < (3, 10):
+    raise pytest.UsageError(
+        "medrs requires Python >= 3.10; upgrade your interpreter to run the test suite."
+    )
 
 try:
     import torch
@@ -40,6 +48,12 @@ except ImportError:
 try:
     import medrs
     HAS_MEDRS = True
+    medrs_path = Path(medrs.__file__).resolve()
+    if not medrs_path.is_relative_to(ROOT_DIR):
+        raise pytest.UsageError(
+            "medrs import does not resolve to this repo. "
+            "Run `maturin develop --features python` from the repo root."
+        )
 except ImportError:
     HAS_MEDRS = False
 
@@ -161,11 +175,17 @@ def torch_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-@pytest.fixture(params=[torch.float32, torch.float16])
-@pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+@pytest.fixture(params=[
+    pytest.param("float32", marks=pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")),
+    pytest.param("float16", marks=pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")),
+])
 def torch_dtype(request):
     """Parameterized fixture for different torch dtypes."""
-    return request.param
+    if not HAS_TORCH:
+        pytest.skip("PyTorch not available")
+    import torch
+    dtype_map = {"float32": torch.float32, "float16": torch.float16}
+    return dtype_map[request.param]
 
 
 @pytest.fixture

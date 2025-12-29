@@ -69,4 +69,16 @@ pub enum Error {
     /// Configuration error.
     #[error("configuration error: {0}")]
     Configuration(String),
+
+    /// Iterator exhausted (no more items available).
+    #[error("iteration exhausted: {0}")]
+    Exhausted(String),
+
+    /// Invalid orientation code.
+    #[error("invalid orientation: {0}")]
+    InvalidOrientation(String),
+
+    /// Non-contiguous array data.
+    #[error("array not contiguous: {0}")]
+    NonContiguousArray(String),
 }

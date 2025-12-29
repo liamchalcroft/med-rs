@@ -123,7 +123,7 @@ impl NiftiImage {
         T: NiftiElement + Clone,
     {
         let shape: Vec<u16> = array.shape().iter().map(|&d| d as u16).collect();
-        let shape_cache: Vec<usize> = array.shape().iter().map(|&d| d as usize).collect();
+        let shape_cache: Vec<usize> = array.shape().to_vec();
         let mut dim = [1u16; 7];
         dim[..shape.len()].copy_from_slice(&shape);
 
@@ -154,16 +154,16 @@ impl NiftiImage {
 
     /// Get owned array data (materializes shared storage if needed).
     /// Note: This clones even if data is already owned; prefer `data_cow()` to avoid copies.
-    pub(crate) fn owned_data(&self) -> ArrayData {
+    pub(crate) fn owned_data(&self) -> Result<ArrayData> {
         self.materialize_owned()
     }
 
     /// Get a reference to owned data, or materialize and return owned.
     /// This avoids cloning when data is already owned.
-    pub(crate) fn data_cow(&self) -> std::borrow::Cow<'_, ArrayData> {
+    pub(crate) fn data_cow(&self) -> Result<std::borrow::Cow<'_, ArrayData>> {
         match &self.storage {
-            DataStorage::Owned(d) => std::borrow::Cow::Borrowed(d),
-            _ => std::borrow::Cow::Owned(self.materialize_owned()),
+            DataStorage::Owned(d) => Ok(std::borrow::Cow::Borrowed(d)),
+            _ => Ok(std::borrow::Cow::Owned(self.materialize_owned()?)),
         }
     }
 
@@ -178,15 +178,15 @@ impl NiftiImage {
     /// re-materializing the data on each transform call.
     ///
     /// Returns a new NiftiImage with owned data storage.
-    pub fn materialize(&self) -> Self {
+    pub fn materialize(&self) -> Result<Self> {
         if self.is_materialized() {
-            return self.clone();
+            return Ok(self.clone());
         }
-        Self {
+        Ok(Self {
             header: self.header.clone(),
-            storage: DataStorage::Owned(self.materialize_owned()),
+            storage: DataStorage::Owned(self.materialize_owned()?),
             shape_cache: self.shape_cache.clone(),
-        }
+        })
     }
 
     /// Borrow a view of the data as f32 if storage is contiguous.
@@ -204,6 +204,10 @@ impl NiftiImage {
                     return None;
                 }
                 let ptr = slice.as_ptr() as *const f32;
+                // SAFETY: Creating ArrayView from raw pointer is safe because:
+                // 1. Alignment is verified above (checked % align_of::<f32>() == 0)
+                // 2. Element count matches shape (verified above)
+                // 3. Returned view lifetime is tied to &self, preventing dangling refs
                 // NIfTI data is stored in F-order (column-major)
                 let view = unsafe {
                     ndarray::ArrayView::from_shape_ptr(IxDyn(&self.shape_cache).f(), ptr)
@@ -220,13 +224,17 @@ impl NiftiImage {
                     return None;
                 }
                 let ptr = slice.as_ptr() as *const f32;
+                // SAFETY: Creating ArrayView from raw pointer is safe because:
+                // 1. Alignment is verified above (checked % align_of::<f32>() == 0)
+                // 2. Element count matches shape (verified above)
+                // 3. Returned view lifetime is tied to &self, preventing dangling refs
                 // NIfTI data is stored in F-order (column-major)
                 let view = unsafe {
                     ndarray::ArrayView::from_shape_ptr(IxDyn(&self.shape_cache).f(), ptr)
                 };
                 Some(view)
             }
-            _ => None,
+            DataStorage::Owned(_) => None,
         }
     }
 
@@ -277,9 +285,18 @@ impl NiftiImage {
         }
 
         let elem_size = std::mem::size_of::<T>();
-        if slice.len() / elem_size != self.shape_cache.iter().product::<usize>() {
+
+        // Ensure slice length is exactly divisible by element size
+        if elem_size == 0 || slice.len() % elem_size != 0 {
             return None;
         }
+
+        let num_elements = slice.len() / elem_size;
+        let expected_elements: usize = self.shape_cache.iter().product();
+        if num_elements != expected_elements {
+            return None;
+        }
+
         if (slice.as_ptr() as usize) % std::mem::align_of::<T>() != 0 {
             return None;
         }
@@ -291,9 +308,13 @@ impl NiftiImage {
         }
 
         let ptr = slice.as_ptr() as *const T;
+        // SAFETY: Creating ArrayView from raw pointer is safe because:
+        // 1. Alignment is verified above (checked % align_of::<T>() == 0)
+        // 2. Element count matches shape (verified above)
+        // 3. Endianness matches native (verified above)
+        // 4. Returned view lifetime is tied to &self, preventing dangling refs
         // NIfTI data is stored in F-order (column-major)
-        let view =
-            unsafe { ndarray::ArrayView::from_shape_ptr(IxDyn(&self.shape_cache).f(), ptr) };
+        let view = unsafe { ndarray::ArrayView::from_shape_ptr(IxDyn(&self.shape_cache).f(), ptr) };
         Some(view)
     }
 
@@ -330,7 +351,7 @@ impl NiftiImage {
     /// Get data as f32 array with scaling applied.
     ///
     /// This is the primary way to access image data, similar to nibabel's `get_fdata()`.
-    pub fn to_f32(&self) -> ArrayD<f32> {
+    pub fn to_f32(&self) -> Result<ArrayD<f32>> {
         let slope = if self.header.scl_slope == 0.0 {
             1.0
         } else {
@@ -340,7 +361,7 @@ impl NiftiImage {
 
         macro_rules! convert_owned {
             ($arr:expr) => {
-                $arr.mapv(|v| v as f32 * slope + inter)
+                Ok($arr.mapv(|v| v as f32 * slope + inter))
             };
         }
 
@@ -354,32 +375,32 @@ impl NiftiImage {
                 ArrayData::U32(a) => convert_owned!(a),
                 ArrayData::I64(a) => convert_owned!(a),
                 ArrayData::U64(a) => convert_owned!(a),
-                ArrayData::F16(a) => a.mapv(|v| v.to_f32() * slope + inter),
-                ArrayData::BF16(a) => a.mapv(|v| v.to_f32() * slope + inter),
+                ArrayData::F16(a) => convert_owned!(a.mapv(|v| v.to_f32() * slope + inter)),
+                ArrayData::BF16(a) => convert_owned!(a.mapv(|v| v.to_f32() * slope + inter)),
                 ArrayData::F32(a) => {
                     if slope == 1.0 && inter == 0.0 {
-                        a.clone()
+                        Ok(a.clone())
                     } else {
-                        a.mapv(|v| v * slope + inter)
+                        convert_owned!(a.mapv(|v| v * slope + inter))
                     }
                 }
-                ArrayData::F64(a) => a.mapv(|v| (v * slope as f64 + inter as f64) as f32),
+                ArrayData::F64(a) => {
+                    convert_owned!(a.mapv(|v| (v * slope as f64 + inter as f64) as f32))
+                }
             },
             DataStorage::SharedBytes { bytes, offset, len } => {
                 let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
                 self.shared_to_f32_slice(slice, slope, inter)
-                    .expect("failed to read shared bytes")
             }
             DataStorage::SharedMmap { mmap, offset, len } => {
                 let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
                 self.shared_to_f32_slice(slice, slope, inter)
-                    .expect("failed to read shared mmap")
             }
         }
     }
 
     /// Get data as f64 array with scaling applied.
-    pub fn to_f64(&self) -> ArrayD<f64> {
+    pub fn to_f64(&self) -> Result<ArrayD<f64>> {
         let slope = if self.header.scl_slope == 0.0 {
             1.0
         } else {
@@ -389,11 +410,11 @@ impl NiftiImage {
 
         macro_rules! convert {
             ($arr:expr) => {
-                $arr.mapv(|v| v as f64 * slope + inter)
+                Ok($arr.mapv(|v| v as f64 * slope + inter))
             };
         }
 
-        match self.materialize_owned() {
+        match self.materialize_owned()? {
             ArrayData::U8(a) => convert!(a),
             ArrayData::I8(a) => convert!(a),
             ArrayData::I16(a) => convert!(a),
@@ -402,17 +423,151 @@ impl NiftiImage {
             ArrayData::U32(a) => convert!(a),
             ArrayData::I64(a) => convert!(a),
             ArrayData::U64(a) => convert!(a),
-            ArrayData::F16(a) => a.mapv(|v| v.to_f64() * slope + inter),
-            ArrayData::BF16(a) => a.mapv(|v| v.to_f64() * slope + inter),
+            ArrayData::F16(a) => Ok(a.mapv(|v| v.to_f64() * slope + inter)),
+            ArrayData::BF16(a) => Ok(a.mapv(|v| v.to_f64() * slope + inter)),
             ArrayData::F32(a) => convert!(a),
             ArrayData::F64(a) => {
                 if slope == 1.0 && inter == 0.0 {
-                    a.clone()
+                    Ok(a)
                 } else {
-                    a.mapv(|v| v * slope + inter)
+                    Ok(a.mapv(|v| v * slope + inter))
                 }
             }
         }
+    }
+
+    /// Get data as bf16 (bfloat16) array with scaling applied.
+    ///
+    /// Useful for ML pipelines that use bfloat16 for reduced memory/storage.
+    pub fn to_bf16(&self) -> Result<ArrayD<bf16>> {
+        let slope = if self.header.scl_slope == 0.0 {
+            1.0
+        } else {
+            self.header.scl_slope
+        };
+        let inter = self.header.scl_inter;
+
+        macro_rules! convert {
+            ($arr:expr) => {
+                Ok($arr.mapv(|v| bf16::from_f32(v as f32 * slope + inter)))
+            };
+        }
+
+        match self.materialize_owned()? {
+            ArrayData::U8(a) => convert!(a),
+            ArrayData::I8(a) => convert!(a),
+            ArrayData::I16(a) => convert!(a),
+            ArrayData::U16(a) => convert!(a),
+            ArrayData::I32(a) => convert!(a),
+            ArrayData::U32(a) => convert!(a),
+            ArrayData::I64(a) => convert!(a),
+            ArrayData::U64(a) => convert!(a),
+            ArrayData::F16(a) => Ok(a.mapv(|v| bf16::from_f32(v.to_f32() * slope + inter))),
+            ArrayData::BF16(a) => {
+                if slope == 1.0 && inter == 0.0 {
+                    Ok(a)
+                } else {
+                    Ok(a.mapv(|v| bf16::from_f32(v.to_f32() * slope + inter)))
+                }
+            }
+            ArrayData::F32(a) => Ok(a.mapv(|v| bf16::from_f32(v * slope + inter))),
+            ArrayData::F64(a) => {
+                Ok(a.mapv(|v| bf16::from_f32((v * slope as f64 + inter as f64) as f32)))
+            }
+        }
+    }
+
+    /// Get data as f16 (IEEE half-precision) array with scaling applied.
+    ///
+    /// Useful for ML pipelines that use float16 for reduced memory/storage.
+    pub fn to_f16(&self) -> Result<ArrayD<f16>> {
+        let slope = if self.header.scl_slope == 0.0 {
+            1.0
+        } else {
+            self.header.scl_slope
+        };
+        let inter = self.header.scl_inter;
+
+        macro_rules! convert {
+            ($arr:expr) => {
+                Ok($arr.mapv(|v| f16::from_f32(v as f32 * slope + inter)))
+            };
+        }
+
+        match self.materialize_owned()? {
+            ArrayData::U8(a) => convert!(a),
+            ArrayData::I8(a) => convert!(a),
+            ArrayData::I16(a) => convert!(a),
+            ArrayData::U16(a) => convert!(a),
+            ArrayData::I32(a) => convert!(a),
+            ArrayData::U32(a) => convert!(a),
+            ArrayData::I64(a) => convert!(a),
+            ArrayData::U64(a) => convert!(a),
+            ArrayData::F16(a) => {
+                if slope == 1.0 && inter == 0.0 {
+                    Ok(a)
+                } else {
+                    Ok(a.mapv(|v| f16::from_f32(v.to_f32() * slope + inter)))
+                }
+            }
+            ArrayData::BF16(a) => Ok(a.mapv(|v| f16::from_f32(v.to_f32() * slope + inter))),
+            ArrayData::F32(a) => Ok(a.mapv(|v| f16::from_f32(v * slope + inter))),
+            ArrayData::F64(a) => {
+                Ok(a.mapv(|v| f16::from_f32((v * slope as f64 + inter as f64) as f32)))
+            }
+        }
+    }
+
+    /// Create a new image with data converted to a different dtype.
+    ///
+    /// This is useful for reducing file size when saving (e.g., f32 → bf16 saves 50% space).
+    /// Scaling factors are applied and then reset to identity (slope=1, inter=0).
+    pub fn with_dtype(&self, dtype: DataType) -> Result<Self> {
+        let mut header = self.header.clone();
+        header.datatype = dtype;
+        header.scl_slope = 1.0;
+        header.scl_inter = 0.0;
+
+        let new_data = match dtype {
+            DataType::Float32 => ArrayData::F32(self.to_f32()?),
+            DataType::Float64 => ArrayData::F64(self.to_f64()?),
+            DataType::Float16 => ArrayData::F16(self.to_f16()?),
+            DataType::BFloat16 => ArrayData::BF16(self.to_bf16()?),
+            DataType::Int16 => {
+                let f32_data = self.to_f32()?;
+                ArrayData::I16(f32_data.mapv(|v| v.round() as i16))
+            }
+            DataType::UInt16 => {
+                let f32_data = self.to_f32()?;
+                ArrayData::U16(f32_data.mapv(|v| v.round().max(0.0) as u16))
+            }
+            DataType::Int32 => {
+                let f32_data = self.to_f32()?;
+                ArrayData::I32(f32_data.mapv(|v| v.round() as i32))
+            }
+            DataType::UInt32 => {
+                let f32_data = self.to_f32()?;
+                ArrayData::U32(f32_data.mapv(|v| v.round().max(0.0) as u32))
+            }
+            DataType::UInt8 => {
+                let f32_data = self.to_f32()?;
+                ArrayData::U8(f32_data.mapv(|v| v.round().clamp(0.0, 255.0) as u8))
+            }
+            DataType::Int8 => {
+                let f32_data = self.to_f32()?;
+                ArrayData::I8(f32_data.mapv(|v| v.round().clamp(-128.0, 127.0) as i8))
+            }
+            DataType::Int64 => {
+                let f64_data = self.to_f64()?;
+                ArrayData::I64(f64_data.mapv(|v| v.round() as i64))
+            }
+            DataType::UInt64 => {
+                let f64_data = self.to_f64()?;
+                ArrayData::U64(f64_data.mapv(|v| v.round().max(0.0) as u64))
+            }
+        };
+
+        Ok(Self::from_parts(header, new_data))
     }
 
     /// Get typed array reference if data matches type T.
@@ -424,7 +579,7 @@ impl NiftiImage {
     }
 
     /// Convert data to type T (with potential loss of precision).
-    pub fn into_array<T: NiftiElement + NumCast>(self) -> ArrayD<T> {
+    pub fn into_array<T: NiftiElement + NumCast>(self) -> Result<ArrayD<T>> {
         let slope = if self.header.scl_slope == 0.0 {
             1.0
         } else {
@@ -434,7 +589,7 @@ impl NiftiImage {
 
         macro_rules! convert {
             ($arr:expr) => {
-                $arr.mapv(|v| {
+                Ok($arr.mapv(|v| {
                     let scaled = v as f64 * slope + inter;
                     T::from(scaled).unwrap_or_else(|| {
                         if scaled > 0.0 {
@@ -443,11 +598,11 @@ impl NiftiImage {
                             T::min_value()
                         }
                     })
-                })
+                }))
             };
         }
 
-        let owned = self.materialize_owned();
+        let owned = self.materialize_owned()?;
 
         match owned {
             ArrayData::U8(a) => convert!(a),
@@ -458,7 +613,7 @@ impl NiftiImage {
             ArrayData::U32(a) => convert!(a),
             ArrayData::I64(a) => convert!(a),
             ArrayData::U64(a) => convert!(a),
-            ArrayData::F16(a) => a.mapv(|v| {
+            ArrayData::F16(a) => Ok(a.mapv(|v| {
                 let scaled = v.to_f64() * slope + inter;
                 T::from(scaled).unwrap_or_else(|| {
                     if scaled > 0.0 {
@@ -467,8 +622,8 @@ impl NiftiImage {
                         T::min_value()
                     }
                 })
-            }),
-            ArrayData::BF16(a) => a.mapv(|v| {
+            })),
+            ArrayData::BF16(a) => Ok(a.mapv(|v| {
                 let scaled = v.to_f64() * slope + inter;
                 T::from(scaled).unwrap_or_else(|| {
                     if scaled > 0.0 {
@@ -477,7 +632,7 @@ impl NiftiImage {
                         T::min_value()
                     }
                 })
-            }),
+            })),
             ArrayData::F32(a) => convert!(a),
             ArrayData::F64(a) => convert!(a),
         }
@@ -485,69 +640,128 @@ impl NiftiImage {
 
     /// Serialize image data to bytes (for writing).
     /// Uses memory order (F-order for NIfTI convention) to write data.
-    pub(crate) fn data_to_bytes(&self) -> Vec<u8> {
-        use byteorder::{ByteOrder, LittleEndian};
-
-        // Helper macro to serialize using memory order
-        macro_rules! serialize_memory_order {
-            ($arr:expr, $elem_size:expr, $write_fn:expr) => {{
-                let slice = $arr.as_slice_memory_order()
-                    .expect("Array should be contiguous in memory");
-                let mut buf = vec![0u8; slice.len() * $elem_size];
-                for (i, &v) in slice.iter().enumerate() {
-                    $write_fn(&mut buf[i * $elem_size..(i + 1) * $elem_size], v);
-                }
-                buf
-            }};
+    ///
+    /// Optimized for little-endian systems using direct byte casting via bytemuck.
+    pub(crate) fn data_to_bytes(&self) -> Result<Vec<u8>> {
+        // Helper function to get contiguous slice or error
+        fn get_slice<T>(arr: &ArrayD<T>) -> Result<&[T]> {
+            arr.as_slice_memory_order().ok_or_else(|| {
+                Error::NonContiguousArray("Array must be contiguous for serialization".to_string())
+            })
         }
 
-        match self.materialize_owned() {
-            ArrayData::U8(a) => a.as_slice_memory_order()
-                .expect("Array should be contiguous").to_vec(),
-            ArrayData::I8(a) => a.as_slice_memory_order()
-                .expect("Array should be contiguous")
-                .iter().map(|&v| v as u8).collect(),
-            ArrayData::I16(a) => serialize_memory_order!(a, 2, LittleEndian::write_i16),
-            ArrayData::U16(a) => serialize_memory_order!(a, 2, LittleEndian::write_u16),
-            ArrayData::I32(a) => serialize_memory_order!(a, 4, LittleEndian::write_i32),
-            ArrayData::U32(a) => serialize_memory_order!(a, 4, LittleEndian::write_u32),
-            ArrayData::I64(a) => serialize_memory_order!(a, 8, LittleEndian::write_i64),
-            ArrayData::U64(a) => serialize_memory_order!(a, 8, LittleEndian::write_u64),
-            ArrayData::F16(a) => {
-                let slice = a.as_slice_memory_order()
-                    .expect("Array should be contiguous");
-                let mut buf = vec![0u8; slice.len() * 2];
-                for (i, &v) in slice.iter().enumerate() {
-                    LittleEndian::write_u16(&mut buf[i * 2..(i + 1) * 2], v.to_bits());
+        // Fast path: directly cast primitive types to bytes using bytemuck
+        // This is safe on little-endian systems (which includes x86_64, ARM64, WASM)
+        #[cfg(target_endian = "little")]
+        {
+            match self.materialize_owned()? {
+                ArrayData::U8(a) => Ok(get_slice(&a)?.to_vec()),
+                ArrayData::I8(a) => {
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<i8, u8>(slice).to_vec())
                 }
-                buf
-            }
-            ArrayData::BF16(a) => {
-                let slice = a.as_slice_memory_order()
-                    .expect("Array should be contiguous");
-                let mut buf = vec![0u8; slice.len() * 2];
-                for (i, &v) in slice.iter().enumerate() {
-                    LittleEndian::write_u16(&mut buf[i * 2..(i + 1) * 2], v.to_bits());
+                ArrayData::I16(a) => {
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<i16, u8>(slice).to_vec())
                 }
-                buf
+                ArrayData::U16(a) => {
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<u16, u8>(slice).to_vec())
+                }
+                ArrayData::I32(a) => {
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<i32, u8>(slice).to_vec())
+                }
+                ArrayData::U32(a) => {
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<u32, u8>(slice).to_vec())
+                }
+                ArrayData::I64(a) => {
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<i64, u8>(slice).to_vec())
+                }
+                ArrayData::U64(a) => {
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<u64, u8>(slice).to_vec())
+                }
+                ArrayData::F16(a) => {
+                    // half::f16 is bytemuck-compatible when feature is enabled
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<half::f16, u8>(slice).to_vec())
+                }
+                ArrayData::BF16(a) => {
+                    // half::bf16 is bytemuck-compatible when feature is enabled
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<half::bf16, u8>(slice).to_vec())
+                }
+                ArrayData::F32(a) => {
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<f32, u8>(slice).to_vec())
+                }
+                ArrayData::F64(a) => {
+                    let slice = get_slice(&a)?;
+                    Ok(bytemuck::cast_slice::<f64, u8>(slice).to_vec())
+                }
             }
-            ArrayData::F32(a) => serialize_memory_order!(a, 4, LittleEndian::write_f32),
-            ArrayData::F64(a) => serialize_memory_order!(a, 8, LittleEndian::write_f64),
+        }
+
+        // Fallback for big-endian systems (rare): use byte-order conversion
+        #[cfg(target_endian = "big")]
+        {
+            use byteorder::{ByteOrder, LittleEndian};
+
+            macro_rules! serialize_memory_order {
+                ($arr:expr, $elem_size:expr, $write_fn:expr) => {{
+                    let slice = get_slice($arr)?;
+                    let mut buf = vec![0u8; slice.len() * $elem_size];
+                    for (i, &v) in slice.iter().enumerate() {
+                        $write_fn(&mut buf[i * $elem_size..(i + 1) * $elem_size], v);
+                    }
+                    Ok(buf)
+                }};
+            }
+
+            match self.materialize_owned()? {
+                ArrayData::U8(a) => Ok(get_slice(&a)?.to_vec()),
+                ArrayData::I8(a) => Ok(get_slice(&a)?.iter().map(|&v| v as u8).collect()),
+                ArrayData::I16(a) => serialize_memory_order!(&a, 2, LittleEndian::write_i16),
+                ArrayData::U16(a) => serialize_memory_order!(&a, 2, LittleEndian::write_u16),
+                ArrayData::I32(a) => serialize_memory_order!(&a, 4, LittleEndian::write_i32),
+                ArrayData::U32(a) => serialize_memory_order!(&a, 4, LittleEndian::write_u32),
+                ArrayData::I64(a) => serialize_memory_order!(&a, 8, LittleEndian::write_i64),
+                ArrayData::U64(a) => serialize_memory_order!(&a, 8, LittleEndian::write_u64),
+                ArrayData::F16(a) => {
+                    let slice = get_slice(&a)?;
+                    let mut buf = vec![0u8; slice.len() * 2];
+                    for (i, &v) in slice.iter().enumerate() {
+                        LittleEndian::write_u16(&mut buf[i * 2..(i + 1) * 2], v.to_bits());
+                    }
+                    Ok(buf)
+                }
+                ArrayData::BF16(a) => {
+                    let slice = get_slice(&a)?;
+                    let mut buf = vec![0u8; slice.len() * 2];
+                    for (i, &v) in slice.iter().enumerate() {
+                        LittleEndian::write_u16(&mut buf[i * 2..(i + 1) * 2], v.to_bits());
+                    }
+                    Ok(buf)
+                }
+                ArrayData::F32(a) => serialize_memory_order!(&a, 4, LittleEndian::write_f32),
+                ArrayData::F64(a) => serialize_memory_order!(&a, 8, LittleEndian::write_f64),
+            }
         }
     }
 
-    fn materialize_owned(&self) -> ArrayData {
+    fn materialize_owned(&self) -> Result<ArrayData> {
         match &self.storage {
-            DataStorage::Owned(d) => d.clone(),
+            DataStorage::Owned(d) => Ok(d.clone()),
             DataStorage::SharedBytes { bytes, offset, len } => {
                 let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
                 self.materialize_native_from_slice(slice)
-                    .expect("failed to materialize shared bytes")
             }
             DataStorage::SharedMmap { mmap, offset, len } => {
                 let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
                 self.materialize_native_from_slice(slice)
-                    .expect("failed to materialize shared mmap")
             }
         }
     }
@@ -605,7 +819,11 @@ impl NiftiImage {
                         .map_err(|e| Error::InvalidDimensions(e.to_string()))
                 } else {
                     // Aligned: direct reinterpretation (fastest path)
-                    // Safety: data is aligned and native-endian
+                    // SAFETY: Creating slice from raw pointer is safe because:
+                    // 1. bytes.as_ptr() is valid for num_elems * size_of::<$ty>() bytes
+                    // 2. Alignment was verified in the if-condition above
+                    // 3. Data is native-endian (conversion applied above if needed)
+                    // 4. The slice is immediately copied to a Vec (data doesn't escape)
                     let ptr = bytes.as_ptr() as *const $ty;
                     let slice = unsafe { std::slice::from_raw_parts(ptr, num_elems) };
                     let vec: Vec<$ty> = slice.to_vec();
@@ -829,6 +1047,11 @@ impl NiftiImage {
             let align = std::mem::align_of::<f32>();
             if (bytes.as_ptr() as usize) % align == 0 {
                 // Aligned: direct reinterpretation
+                // SAFETY: Creating slice from raw pointer is safe because:
+                // 1. bytes.as_ptr() is valid for num_elems * 4 bytes
+                // 2. Alignment was verified in the if-condition above
+                // 3. Data is native-endian (checked via is_native above)
+                // 4. The slice is immediately copied to a Vec (data doesn't escape)
                 let ptr = bytes.as_ptr() as *const f32;
                 let slice = unsafe { std::slice::from_raw_parts(ptr, num_elems) };
                 return ArrayD::from_shape_vec(IxDyn(shape).f(), slice.to_vec())
@@ -1061,7 +1284,7 @@ mod tests {
         assert_eq!(view.len(), 8);
         // F-order view - check via memory order slice
         let view_slice = view.as_slice_memory_order().unwrap();
-        let orig = img.materialize_owned();
+        let orig = img.materialize_owned().expect("should materialize");
         if let ArrayData::U16(arr) = orig {
             let orig_slice = arr.as_slice_memory_order().unwrap();
             assert_eq!(view_slice, orig_slice);

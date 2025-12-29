@@ -19,6 +19,7 @@ Contents
 
    guides/advanced_features
    guides/performance_optimization
+   guides/benchmarks
    guides/error_handling
 
 .. toctree::

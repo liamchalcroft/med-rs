@@ -51,6 +51,7 @@
 //! [`NiftiImage`]: crate::nifti::NiftiImage
 
 mod augment;
+pub mod common;
 pub mod crop;
 mod intensity;
 mod orientation;

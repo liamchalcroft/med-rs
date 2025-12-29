@@ -21,11 +21,6 @@ try:
 except ImportError:
     TORCH_AVAILABLE = False
 
-try:
-    import numpy as np
-    NUMPY_AVAILABLE = True
-except ImportError:
-    NUMPY_AVAILABLE = False
 
 
 @dataclass
@@ -210,6 +205,8 @@ def benchmark_operation(
     metadata: Optional[Dict[str, Any]] = None
 ) -> Dict[str, float]:
     """Benchmark an operation with multiple runs."""
+    if num_runs < 1:
+        raise ValueError(f"num_runs must be at least 1, got {num_runs}")
     # Warmup runs
     for _ in range(warmup_runs):
         operation()

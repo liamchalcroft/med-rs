@@ -213,24 +213,25 @@ pub fn trilinear_interp_batch_f32(
 
     for (i, &(z, y, x)) in coords.iter().enumerate() {
         // Handle out-of-bounds with zero padding
+        // Valid range is [0, size-1] for each dimension
         if z < 0.0
             || y < 0.0
             || x < 0.0
-            || z >= (sz - 1) as f32
-            || y >= (sy - 1) as f32
-            || x >= (sx - 1) as f32
+            || z > (sz - 1) as f32
+            || y > (sy - 1) as f32
+            || x > (sx - 1) as f32
         {
             output[i] = 0.0;
             continue;
         }
 
-        // Integer indices
+        // Integer indices - clamp upper indices to handle boundary exactly at size-1
         let z0 = z as usize;
         let y0 = y as usize;
         let x0 = x as usize;
-        let z1 = z0 + 1;
-        let y1 = y0 + 1;
-        let x1 = x0 + 1;
+        let z1 = (z0 + 1).min(sz - 1);
+        let y1 = (y0 + 1).min(sy - 1);
+        let x1 = (x0 + 1).min(sx - 1);
 
         // Fractional parts
         let fz = z - z0 as f32;
@@ -275,7 +276,11 @@ pub fn trilinear_interp_batch_f32(
 /// * `x_params` - Precomputed X interpolation parameters (idx0, idx1, frac)
 /// * `out_row` - Output row buffer
 #[inline]
-#[allow(clippy::too_many_arguments, clippy::similar_names)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::similar_names,
+    clippy::needless_range_loop
+)]
 pub fn trilinear_row_simd(
     src: &[f32],
     stride_z: usize,
@@ -435,7 +440,9 @@ pub fn lerp_1d_simd(src0: &[f32], src1: &[f32], frac: f32, output: &mut [f32]) {
 pub fn parallel_linear_transform_f32(input: &[f32], output: &mut [f32], scale: f32, offset: f32) {
     use rayon::prelude::*;
 
-    const CHUNK_SIZE: usize = 8192; // Process 32KB chunks per thread
+    // 8192 f32 values = 32KB per chunk, sized to fit in L1 cache (typically 32-48KB)
+    // This balances parallelism overhead against cache efficiency
+    const CHUNK_SIZE: usize = 8192;
 
     output
         .par_chunks_mut(CHUNK_SIZE)
@@ -456,6 +463,7 @@ pub fn parallel_linear_transform_clamp_f32(
 ) {
     use rayon::prelude::*;
 
+    // 8192 f32 values = 32KB per chunk (L1 cache optimal)
     const CHUNK_SIZE: usize = 8192;
 
     output
@@ -470,6 +478,8 @@ pub fn parallel_linear_transform_clamp_f32(
 pub fn parallel_sum_and_sum_sq_f32(input: &[f32]) -> (f64, f64, usize) {
     use rayon::prelude::*;
 
+    // 16384 f32 values = 64KB per chunk (L2 cache optimal for reduction operations)
+    // Larger than linear transform because reduction has lower memory bandwidth needs
     const CHUNK_SIZE: usize = 16384;
 
     let (sum, sum_sq): (f64, f64) = input
@@ -493,6 +503,577 @@ pub fn parallel_minmax_f32(input: &[f32]) -> (f32, f32) {
         || (f32::INFINITY, f32::NEG_INFINITY),
         |(min1, max1), (min2, max2)| (min1.min(min2), max1.max(max2)),
     )
+}
+
+// =============================================================================
+// OPTIMIZED F-ORDER TRILINEAR RESAMPLING
+// =============================================================================
+//
+// These functions work directly with F-order (column-major) data to avoid
+// expensive memory layout conversions. F-order means the first index varies
+// fastest in memory, i.e., for shape [X, Y, Z], elements at (x, y, z) and
+// (x+1, y, z) are adjacent in memory.
+
+/// Precomputed interpolation weights for a single axis.
+/// Stores both indices and weights for efficient SIMD processing.
+#[derive(Clone)]
+pub struct AxisInterpWeights {
+    /// Lower indices for each output position
+    pub idx0: Vec<usize>,
+    /// Upper indices for each output position
+    pub idx1: Vec<usize>,
+    /// Interpolation weights (fraction towards idx1)
+    pub frac: Vec<f32>,
+    /// Inverse weights (1 - frac), precomputed for SIMD
+    pub frac_inv: Vec<f32>,
+}
+
+impl AxisInterpWeights {
+    /// Create interpolation weights for resampling from old_size to new_size.
+    ///
+    /// # Panics
+    /// Panics if `old_size` is 0. This is an invariant violation.
+    pub fn new(new_size: usize, old_size: usize) -> Self {
+        assert!(old_size > 0, "old_size must be > 0, got {}", old_size);
+
+        // Handle edge case: if new_size is 0, return empty weights
+        if new_size == 0 {
+            return Self {
+                idx0: Vec::new(),
+                idx1: Vec::new(),
+                frac: Vec::new(),
+                frac_inv: Vec::new(),
+            };
+        }
+
+        // Scale factor: map [0, new_size-1] to [0, old_size-1]
+        // When new_size == 1, all output maps to center of input (scale = 0)
+        let scale = if new_size > 1 && old_size > 1 {
+            (old_size - 1) as f32 / (new_size - 1) as f32
+        } else {
+            0.0
+        };
+
+        let mut idx0 = Vec::with_capacity(new_size);
+        let mut idx1 = Vec::with_capacity(new_size);
+        let mut frac = Vec::with_capacity(new_size);
+        let mut frac_inv = Vec::with_capacity(new_size);
+
+        for i in 0..new_size {
+            let pos = i as f32 * scale;
+            let i0 = (pos.floor() as usize).min(old_size - 1);
+            let i1 = (i0 + 1).min(old_size - 1);
+            let f = pos - i0 as f32;
+
+            idx0.push(i0);
+            idx1.push(i1);
+            frac.push(f);
+            frac_inv.push(1.0 - f);
+        }
+
+        Self {
+            idx0,
+            idx1,
+            frac,
+            frac_inv,
+        }
+    }
+}
+
+/// F-order optimized trilinear resampling with SIMD.
+///
+/// Works directly with F-order data (X varies fastest), avoiding layout conversions.
+/// Uses tiled processing for better cache utilization on large volumes.
+///
+/// # Arguments
+/// * `src` - Source data in F-order [X, Y, Z]
+/// * `src_shape` - Source shape [sx, sy, sz]
+/// * `dst_shape` - Destination shape [dx, dy, dz]
+///
+/// # Returns
+/// Resampled data in F-order
+#[allow(clippy::similar_names)]
+pub fn trilinear_resample_forder(
+    src: &[f32],
+    src_shape: [usize; 3],
+    dst_shape: [usize; 3],
+) -> Vec<f32> {
+    use crate::pipeline::acquire_buffer;
+    use rayon::prelude::*;
+
+    let [sx, sy, sz] = src_shape;
+    let [dx, dy, dz] = dst_shape;
+
+    // Precompute interpolation weights for each axis
+    let x_weights = AxisInterpWeights::new(dx, sx);
+    let y_weights = AxisInterpWeights::new(dy, sy);
+    let z_weights = AxisInterpWeights::new(dz, sz);
+
+    // F-order strides: X varies fastest
+    let src_stride_y = sx;
+    let src_stride_z = sx * sy;
+
+    let dst_stride_y = dx;
+    let dst_stride_z = dx * dy;
+
+    let total_voxels = dx * dy * dz;
+    let mut dst: Vec<f32> = acquire_buffer(total_voxels);
+
+    // Process in Z-slices for parallelization
+    // Each thread processes one or more Z-slices
+    dst.par_chunks_mut(dst_stride_z)
+        .enumerate()
+        .for_each(|(z_dst, z_slice)| {
+            let z0 = z_weights.idx0[z_dst];
+            let z1 = z_weights.idx1[z_dst];
+            let wz = z_weights.frac[z_dst];
+            let wz_inv = z_weights.frac_inv[z_dst];
+
+            // Base offsets for the two Z planes
+            let z0_base = z0 * src_stride_z;
+            let z1_base = z1 * src_stride_z;
+
+            for y_dst in 0..dy {
+                let y0 = y_weights.idx0[y_dst];
+                let y1 = y_weights.idx1[y_dst];
+                let wy = y_weights.frac[y_dst];
+                let wy_inv = y_weights.frac_inv[y_dst];
+
+                // Precompute combined weights for the 4 Y-Z corner combinations
+                let w00 = wz_inv * wy_inv; // z0, y0
+                let w01 = wz_inv * wy; // z0, y1
+                let w10 = wz * wy_inv; // z1, y0
+                let w11 = wz * wy; // z1, y1
+
+                // Base offsets for the 4 source rows
+                let off_z0_y0 = z0_base + y0 * src_stride_y;
+                let off_z0_y1 = z0_base + y1 * src_stride_y;
+                let off_z1_y0 = z1_base + y0 * src_stride_y;
+                let off_z1_y1 = z1_base + y1 * src_stride_y;
+
+                let dst_row = &mut z_slice[y_dst * dst_stride_y..(y_dst + 1) * dst_stride_y];
+
+                // SIMD processing along X axis
+                trilinear_x_simd_forder(
+                    src, &x_weights, off_z0_y0, off_z0_y1, off_z1_y0, off_z1_y1, w00, w01, w10,
+                    w11, dst_row,
+                );
+            }
+        });
+
+    dst
+}
+
+/// SIMD-optimized X-axis interpolation for F-order data.
+///
+/// Processes 8 output X values at a time using AVX (f32x8).
+#[inline]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn trilinear_x_simd_forder(
+    src: &[f32],
+    x_weights: &AxisInterpWeights,
+    off_z0_y0: usize,
+    off_z0_y1: usize,
+    off_z1_y0: usize,
+    off_z1_y1: usize,
+    w00: f32,
+    w01: f32,
+    w10: f32,
+    w11: f32,
+    dst_row: &mut [f32],
+) {
+    let dx = dst_row.len();
+    let chunks = dx / SIMD_WIDTH;
+
+    // SIMD weight vectors
+    let w00_v = f32x8::splat(w00);
+    let w01_v = f32x8::splat(w01);
+    let w10_v = f32x8::splat(w10);
+    let w11_v = f32x8::splat(w11);
+
+    for chunk_i in 0..chunks {
+        let base = chunk_i * SIMD_WIDTH;
+
+        let mut v_z0_y0_0 = [0.0f32; 8];
+        let mut v_z0_y0_1 = [0.0f32; 8];
+        let mut v_z0_y1_0 = [0.0f32; 8];
+        let mut v_z0_y1_1 = [0.0f32; 8];
+        let mut v_z1_y0_0 = [0.0f32; 8];
+        let mut v_z1_y0_1 = [0.0f32; 8];
+        let mut v_z1_y1_0 = [0.0f32; 8];
+        let mut v_z1_y1_1 = [0.0f32; 8];
+        let mut xf = [0.0f32; 8];
+        let mut xf_inv = [0.0f32; 8];
+
+        for i in 0..SIMD_WIDTH {
+            let xi = base + i;
+            let x0 = x_weights.idx0[xi];
+            let x1 = x_weights.idx1[xi];
+            xf[i] = x_weights.frac[xi];
+            xf_inv[i] = x_weights.frac_inv[xi];
+
+            v_z0_y0_0[i] = src[off_z0_y0 + x0];
+            v_z0_y0_1[i] = src[off_z0_y0 + x1];
+            v_z0_y1_0[i] = src[off_z0_y1 + x0];
+            v_z0_y1_1[i] = src[off_z0_y1 + x1];
+            v_z1_y0_0[i] = src[off_z1_y0 + x0];
+            v_z1_y0_1[i] = src[off_z1_y0 + x1];
+            v_z1_y1_0[i] = src[off_z1_y1 + x0];
+            v_z1_y1_1[i] = src[off_z1_y1 + x1];
+        }
+
+        let xf_v = f32x8::from(xf);
+        let xf_inv_v = f32x8::from(xf_inv);
+
+        let c_z0_y0 = f32x8::from(v_z0_y0_0) * xf_inv_v + f32x8::from(v_z0_y0_1) * xf_v;
+        let c_z0_y1 = f32x8::from(v_z0_y1_0) * xf_inv_v + f32x8::from(v_z0_y1_1) * xf_v;
+        let c_z1_y0 = f32x8::from(v_z1_y0_0) * xf_inv_v + f32x8::from(v_z1_y0_1) * xf_v;
+        let c_z1_y1 = f32x8::from(v_z1_y1_0) * xf_inv_v + f32x8::from(v_z1_y1_1) * xf_v;
+
+        let result = c_z0_y0 * w00_v + c_z0_y1 * w01_v + c_z1_y0 * w10_v + c_z1_y1 * w11_v;
+
+        let result_arr: [f32; 8] = result.into();
+        dst_row[base..base + SIMD_WIDTH].copy_from_slice(&result_arr);
+    }
+
+    // Scalar remainder
+    let base = chunks * SIMD_WIDTH;
+    for xi in base..dx {
+        let x0 = x_weights.idx0[xi];
+        let x1 = x_weights.idx1[xi];
+        let xf = x_weights.frac[xi];
+        let xf_inv = x_weights.frac_inv[xi];
+
+        let c_z0_y0 = src[off_z0_y0 + x0] * xf_inv + src[off_z0_y0 + x1] * xf;
+        let c_z0_y1 = src[off_z0_y1 + x0] * xf_inv + src[off_z0_y1 + x1] * xf;
+        let c_z1_y0 = src[off_z1_y0 + x0] * xf_inv + src[off_z1_y0 + x1] * xf;
+        let c_z1_y1 = src[off_z1_y1 + x0] * xf_inv + src[off_z1_y1 + x1] * xf;
+
+        dst_row[xi] = c_z0_y0 * w00 + c_z0_y1 * w01 + c_z1_y0 * w10 + c_z1_y1 * w11;
+    }
+}
+
+/// Separable trilinear resampling optimized for F-order data.
+///
+/// Uses 3-pass approach (X, Y, Z) for better cache locality on large volumes.
+/// Each pass processes data along one axis, keeping memory accesses sequential.
+#[allow(clippy::similar_names)]
+pub fn trilinear_resample_forder_separable(
+    src: &[f32],
+    src_shape: [usize; 3],
+    dst_shape: [usize; 3],
+) -> Vec<f32> {
+    use crate::pipeline::acquire_buffer;
+    use rayon::prelude::*;
+
+    let [sx, sy, sz] = src_shape;
+    let [dx, dy, dz] = dst_shape;
+
+    // Pass 1: Resample along X (sx, sy, sz) -> (dx, sy, sz)
+    let x_weights = AxisInterpWeights::new(dx, sx);
+    let temp1_size = dx * sy * sz;
+    let mut temp1: Vec<f32> = acquire_buffer(temp1_size);
+
+    // F-order: X varies fastest, so we process YZ slices in parallel
+    temp1
+        .par_chunks_mut(dx)
+        .enumerate()
+        .for_each(|(yz_idx, dst_row)| {
+            let y = yz_idx % sy;
+            let z = yz_idx / sy;
+            let src_row_offset = y * sx + z * sx * sy;
+
+            resample_1d_simd(
+                &src[src_row_offset..src_row_offset + sx],
+                &x_weights,
+                dst_row,
+            );
+        });
+
+    // Pass 2: Resample along Y (dx, sy, sz) -> (dx, dy, sz)
+    let y_weights = AxisInterpWeights::new(dy, sy);
+    let temp2_size = dx * dy * sz;
+    let mut temp2: Vec<f32> = acquire_buffer(temp2_size);
+
+    // For Y resampling in F-order, we need to handle non-contiguous access
+    // Process each (X, Z) fiber in parallel
+    let temp1_ref = &temp1;
+    temp2
+        .par_chunks_mut(dx * dy)
+        .enumerate()
+        .for_each(|(z, z_slice)| {
+            let src_z_base = z * dx * sy;
+            for x in 0..dx {
+                for y_dst in 0..dy {
+                    let y0 = y_weights.idx0[y_dst];
+                    let y1 = y_weights.idx1[y_dst];
+                    let f = y_weights.frac[y_dst];
+                    let f_inv = y_weights.frac_inv[y_dst];
+
+                    let v0 = temp1_ref[src_z_base + y0 * dx + x];
+                    let v1 = temp1_ref[src_z_base + y1 * dx + x];
+                    z_slice[y_dst * dx + x] = v0 * f_inv + v1 * f;
+                }
+            }
+        });
+
+    drop(temp1);
+
+    // Pass 3: Resample along Z (dx, dy, sz) -> (dx, dy, dz)
+    let z_weights = AxisInterpWeights::new(dz, sz);
+    let dst_size = dx * dy * dz;
+    let mut dst: Vec<f32> = acquire_buffer(dst_size);
+
+    let xy_size = dx * dy;
+    let temp2_ref = &temp2;
+
+    dst.par_chunks_mut(xy_size)
+        .enumerate()
+        .for_each(|(z_dst, xy_slice)| {
+            let z0 = z_weights.idx0[z_dst];
+            let z1 = z_weights.idx1[z_dst];
+            let f = z_weights.frac[z_dst];
+
+            let src0 = &temp2_ref[z0 * xy_size..(z0 + 1) * xy_size];
+            let src1 = &temp2_ref[z1 * xy_size..(z1 + 1) * xy_size];
+
+            lerp_1d_simd(src0, src1, f, xy_slice);
+        });
+
+    dst
+}
+
+/// 1D SIMD resampling using precomputed weights.
+#[inline]
+fn resample_1d_simd(src: &[f32], weights: &AxisInterpWeights, dst: &mut [f32]) {
+    let n = dst.len();
+    let chunks = n / SIMD_WIDTH;
+
+    for chunk_i in 0..chunks {
+        let base = chunk_i * SIMD_WIDTH;
+
+        let mut v0 = [0.0f32; 8];
+        let mut v1 = [0.0f32; 8];
+        let mut f = [0.0f32; 8];
+        let mut f_inv = [0.0f32; 8];
+
+        for i in 0..SIMD_WIDTH {
+            let idx = base + i;
+            v0[i] = src[weights.idx0[idx]];
+            v1[i] = src[weights.idx1[idx]];
+            f[i] = weights.frac[idx];
+            f_inv[i] = weights.frac_inv[idx];
+        }
+
+        let v0_v = f32x8::from(v0);
+        let v1_v = f32x8::from(v1);
+        let f_v = f32x8::from(f);
+        let f_inv_v = f32x8::from(f_inv);
+
+        let result = v0_v * f_inv_v + v1_v * f_v;
+        let result_arr: [f32; 8] = result.into();
+        dst[base..base + SIMD_WIDTH].copy_from_slice(&result_arr);
+    }
+
+    // Scalar remainder
+    for i in (chunks * SIMD_WIDTH)..n {
+        let v0 = src[weights.idx0[i]];
+        let v1 = src[weights.idx1[i]];
+        dst[i] = v0 * weights.frac_inv[i] + v1 * weights.frac[i];
+    }
+}
+
+/// Choose optimal resampling strategy based on volume size.
+///
+/// Automatically selects specialized kernels for common cases:
+/// - 2x upsampling: Uses optimized kernel with contiguous memory access
+/// - General case: Uses direct trilinear with scattered gathers
+pub fn trilinear_resample_forder_adaptive(
+    src: &[f32],
+    src_shape: [usize; 3],
+    dst_shape: [usize; 3],
+) -> Vec<f32> {
+    // Check for exact 2x upsampling (very common case)
+    let is_2x_upsample = dst_shape[0] == 2 * src_shape[0] - 1
+        && dst_shape[1] == 2 * src_shape[1] - 1
+        && dst_shape[2] == 2 * src_shape[2] - 1;
+
+    // Also check for approximate 2x (allowing for rounding)
+    let is_approx_2x = (dst_shape[0] as f32 / src_shape[0] as f32 - 2.0).abs() < 0.1
+        && (dst_shape[1] as f32 / src_shape[1] as f32 - 2.0).abs() < 0.1
+        && (dst_shape[2] as f32 / src_shape[2] as f32 - 2.0).abs() < 0.1;
+
+    if is_2x_upsample || is_approx_2x {
+        trilinear_upsample_2x_forder(src, src_shape, dst_shape)
+    } else {
+        trilinear_resample_forder(src, src_shape, dst_shape)
+    }
+}
+
+/// Optimized 2x upsampling using contiguous memory access.
+///
+/// This kernel exploits the regular pattern of 2x upsampling:
+/// - Even output indices map exactly to input indices
+/// - Odd output indices interpolate between adjacent input values
+///
+/// By processing along X axis (contiguous in F-order), we achieve
+/// much better cache utilization than the general scattered-gather approach.
+#[allow(clippy::similar_names, clippy::needless_range_loop)]
+pub fn trilinear_upsample_2x_forder(
+    src: &[f32],
+    src_shape: [usize; 3],
+    dst_shape: [usize; 3],
+) -> Vec<f32> {
+    use crate::pipeline::acquire_buffer;
+    use rayon::prelude::*;
+
+    let [sx, sy, sz] = src_shape;
+    let [dx, dy, dz] = dst_shape;
+
+    // Source strides (F-order: X varies fastest)
+    let src_stride_y = sx;
+    let src_stride_z = sx * sy;
+
+    // Destination strides
+    let dst_stride_y = dx;
+    let dst_stride_z = dx * dy;
+
+    let total_voxels = dx * dy * dz;
+    let mut dst: Vec<f32> = acquire_buffer(total_voxels);
+
+    // Precompute Y and Z interpolation weights
+    // For 2x upsampling: even indices → frac=0, odd indices → frac=0.5
+    let y_scale = (sy - 1) as f32 / (dy - 1).max(1) as f32;
+    let z_scale = (sz - 1) as f32 / (dz - 1).max(1) as f32;
+
+    // Process Z slices in parallel
+    dst.par_chunks_mut(dst_stride_z)
+        .enumerate()
+        .for_each(|(z_dst, z_slice)| {
+            // Z interpolation
+            let z_pos = z_dst as f32 * z_scale;
+            let z0 = (z_pos.floor() as usize).min(sz - 1);
+            let z1 = (z0 + 1).min(sz - 1);
+            let wz = z_pos - z0 as f32;
+            let wz_inv = 1.0 - wz;
+
+            let z0_base = z0 * src_stride_z;
+            let z1_base = z1 * src_stride_z;
+
+            for y_dst in 0..dy {
+                // Y interpolation
+                let y_pos = y_dst as f32 * y_scale;
+                let y0 = (y_pos.floor() as usize).min(sy - 1);
+                let y1 = (y0 + 1).min(sy - 1);
+                let wy = y_pos - y0 as f32;
+                let wy_inv = 1.0 - wy;
+
+                // Combined Y-Z weights
+                let w00 = wz_inv * wy_inv;
+                let w01 = wz_inv * wy;
+                let w10 = wz * wy_inv;
+                let w11 = wz * wy;
+
+                // Source row offsets for the 4 corners
+                let off_z0_y0 = z0_base + y0 * src_stride_y;
+                let off_z0_y1 = z0_base + y1 * src_stride_y;
+                let off_z1_y0 = z1_base + y0 * src_stride_y;
+                let off_z1_y1 = z1_base + y1 * src_stride_y;
+
+                let dst_row = &mut z_slice[y_dst * dst_stride_y..(y_dst + 1) * dst_stride_y];
+
+                // Use optimized X interpolation with contiguous access
+                upsample_x_row_simd(
+                    src, sx, dx, off_z0_y0, off_z0_y1, off_z1_y0, off_z1_y1, w00, w01, w10, w11,
+                    dst_row,
+                );
+            }
+        });
+
+    dst
+}
+
+/// SIMD-optimized X-axis upsampling using contiguous reads.
+///
+/// Instead of gathering scattered values, this reads consecutive source
+/// values and computes interpolated outputs efficiently.
+#[inline]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+fn upsample_x_row_simd(
+    src: &[f32],
+    sx: usize,
+    dx: usize,
+    off_z0_y0: usize,
+    off_z0_y1: usize,
+    off_z1_y0: usize,
+    off_z1_y1: usize,
+    w00: f32,
+    w01: f32,
+    w10: f32,
+    w11: f32,
+    dst_row: &mut [f32],
+) {
+    let x_scale = (sx - 1) as f32 / (dx - 1).max(1) as f32;
+
+    // SIMD constants for Y-Z weights
+    let w00_v = f32x8::splat(w00);
+    let w01_v = f32x8::splat(w01);
+    let w10_v = f32x8::splat(w10);
+    let w11_v = f32x8::splat(w11);
+
+    // Process 8 output values at a time
+    let chunks = dx / SIMD_WIDTH;
+
+    for chunk_i in 0..chunks {
+        let base = chunk_i * SIMD_WIDTH;
+
+        // Gather X-interpolated values for each of the 4 Y-Z corners
+        let mut v_z0_y0 = [0.0f32; 8];
+        let mut v_z0_y1 = [0.0f32; 8];
+        let mut v_z1_y0 = [0.0f32; 8];
+        let mut v_z1_y1 = [0.0f32; 8];
+
+        for i in 0..SIMD_WIDTH {
+            let x_dst = base + i;
+            let x_pos = x_dst as f32 * x_scale;
+            let x0 = (x_pos.floor() as usize).min(sx - 1);
+            let x1 = (x0 + 1).min(sx - 1);
+            let wx = x_pos - x0 as f32;
+            let wx_inv = 1.0 - wx;
+
+            // X-interpolate for each Y-Z corner
+            v_z0_y0[i] = src[off_z0_y0 + x0] * wx_inv + src[off_z0_y0 + x1] * wx;
+            v_z0_y1[i] = src[off_z0_y1 + x0] * wx_inv + src[off_z0_y1 + x1] * wx;
+            v_z1_y0[i] = src[off_z1_y0 + x0] * wx_inv + src[off_z1_y0 + x1] * wx;
+            v_z1_y1[i] = src[off_z1_y1 + x0] * wx_inv + src[off_z1_y1 + x1] * wx;
+        }
+
+        // SIMD weighted sum for Y-Z interpolation
+        let v_z0_y0_v = f32x8::from(v_z0_y0);
+        let v_z0_y1_v = f32x8::from(v_z0_y1);
+        let v_z1_y0_v = f32x8::from(v_z1_y0);
+        let v_z1_y1_v = f32x8::from(v_z1_y1);
+
+        let result = v_z0_y0_v * w00_v + v_z0_y1_v * w01_v + v_z1_y0_v * w10_v + v_z1_y1_v * w11_v;
+        let result_arr: [f32; 8] = result.into();
+        dst_row[base..base + SIMD_WIDTH].copy_from_slice(&result_arr);
+    }
+
+    // Scalar remainder
+    for x_dst in (chunks * SIMD_WIDTH)..dx {
+        let x_pos = x_dst as f32 * x_scale;
+        let x0 = (x_pos.floor() as usize).min(sx - 1);
+        let x1 = (x0 + 1).min(sx - 1);
+        let wx = x_pos - x0 as f32;
+        let wx_inv = 1.0 - wx;
+
+        let v_z0_y0 = src[off_z0_y0 + x0] * wx_inv + src[off_z0_y0 + x1] * wx;
+        let v_z0_y1 = src[off_z0_y1 + x0] * wx_inv + src[off_z0_y1 + x1] * wx;
+        let v_z1_y0 = src[off_z1_y0 + x0] * wx_inv + src[off_z1_y0 + x1] * wx;
+        let v_z1_y1 = src[off_z1_y1 + x0] * wx_inv + src[off_z1_y1 + x1] * wx;
+
+        dst_row[x_dst] = v_z0_y0 * w00 + v_z0_y1 * w01 + v_z1_y0 * w10 + v_z1_y1 * w11;
+    }
 }
 
 #[cfg(test)]

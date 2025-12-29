@@ -18,7 +18,8 @@ def demonstrate_crop_loading():
     print("=" * 40)
 
     # Replace with your NIfTI file
-    volume_path = "sample_volume.nii.gz"
+    # Note: load_cropped requires uncompressed .nii files (not .nii.gz)
+    volume_path = "sample_volume.nii"
 
     try:
         # Method 1: Load with specific offset and shape

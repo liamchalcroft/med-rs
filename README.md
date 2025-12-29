@@ -12,8 +12,98 @@ medrs is designed for throughput-critical medical imaging workflows, particularl
 
 - **Fast NIfTI I/O**: Memory-mapped reading, crop-first loading (read sub-volumes without loading entire files)
 - **Transform Pipeline**: Lazy evaluation with automatic operation fusion and SIMD acceleration
+- **Mixed Precision**: Native f16/bf16 support for 50% storage savings
 - **Random Augmentation**: Reproducible, GPU-friendly augmentations for ML training
 - **Python Bindings**: Zero-copy numpy views, direct PyTorch/JAX tensor creation
+- **MONAI Integration**: Drop-in replacements for MONAI transforms
+
+## Why medrs?
+
+### Performance vs MONAI & TorchIO (128³ volume)
+
+| Operation | medrs | MONAI | TorchIO | vs MONAI |
+|-----------|-------|-------|---------|----------|
+| Load | 0.13ms | 4.55ms | 4.71ms | **35x** |
+| Load Cropped (64³) | 0.41ms | 4.68ms | 9.86ms | **11x** |
+| Load Resampled | 0.40ms | 6.88ms | 27.65ms | **17x** |
+| To PyTorch | 0.49ms | 5.14ms | 10.22ms | **10x** |
+| Load + Normalize | 0.60ms | 5.36ms | 12.26ms | **9x** |
+
+*At larger volumes (512³), speedups increase dramatically: up to **38,000x** vs MONAI and **6,600x** vs TorchIO.*
+
+### Storage Efficiency (128³ volume, compressed)
+
+| Format | Size | vs f32 |
+|--------|------|--------|
+| float32 | 8.3 MB | 100% |
+| **bfloat16** | **3.4 MB** | **41%** |
+| **float16** | **4.1 MB** | **50%** |
+| int16 | 1.2 MB | 15% |
+
+### Key Advantages
+
+1. **Crop-First Loading**: Load 64³ patch from 512³ volume without reading entire file - **6,600x faster** than MONAI
+2. **Mixed Precision**: Save in bf16/f16 for 40-50% smaller files with minimal precision loss
+3. **MONAI Drop-in**: Replace MONAI I/O transforms with one import change
+4. **Zero-Copy**: Direct tensor creation without intermediate numpy allocations
+
+<details>
+<summary>📊 Detailed Benchmarks (click to expand)</summary>
+
+### Comprehensive Benchmark Results
+
+Benchmark results comparing medrs, MONAI, and TorchIO across multiple volume sizes and operations.
+
+![Benchmark Summary](benchmarks/results/plots/summary.png)
+
+#### Load Performance (Basic I/O)
+
+| Size | medrs | MONAI | TorchIO | vs MONAI | vs TorchIO |
+|------|-------|-------|---------|----------|------------|
+| 64³ | 0.13ms | 1.34ms | 2.35ms | **10x** | **18x** |
+| 128³ | 0.13ms | 4.55ms | 4.71ms | **35x** | **36x** |
+| 256³ | 0.14ms | 159.11ms | 95.18ms | **1,136x** | **680x** |
+| 512³ | 0.13ms | 5,006.76ms | 866.54ms | **38,513x** | **6,665x** |
+
+#### Crop-First Loading (64³ patch)
+
+| Source | medrs | MONAI | TorchIO | vs MONAI | vs TorchIO |
+|--------|-------|-------|---------|----------|------------|
+| 64³ | 0.27ms | 1.75ms | 6.00ms | **6x** | **22x** |
+| 128³ | 0.41ms | 4.68ms | 9.86ms | **11x** | **24x** |
+| 256³ | 0.55ms | 154.86ms | 104.48ms | **282x** | **190x** |
+| 512³ | 0.76ms | 5,041.42ms | 1,076.89ms | **6,633x** | **1,417x** |
+
+#### Load Resampled (Half resolution)
+
+| Source | medrs | MONAI | TorchIO | vs MONAI | vs TorchIO |
+|--------|-------|-------|---------|----------|------------|
+| 64³ → 32³ | 0.18ms | 1.93ms | 5.45ms | **11x** | **30x** |
+| 128³ → 64³ | 0.40ms | 6.88ms | 27.65ms | **17x** | **69x** |
+| 256³ → 128³ | 2.02ms | 178.87ms | 363.85ms | **89x** | **180x** |
+| 512³ → 256³ | 6.67ms | 5,960.93ms | 4,039.05ms | **894x** | **605x** |
+
+#### Direct PyTorch Loading
+
+| Source | medrs | MONAI | TorchIO | vs MONAI | vs TorchIO |
+|--------|-------|-------|---------|----------|------------|
+| 64³ | 0.34ms | 1.58ms | 5.37ms | **5x** | **16x** |
+| 128³ | 0.49ms | 5.14ms | 10.22ms | **10x** | **21x** |
+| 256³ | 0.60ms | 162.78ms | 53.70ms | **271x** | **90x** |
+| 512³ | 0.84ms | 5,864.85ms | 1,223.24ms | **6,982x** | **1,456x** |
+
+#### Load with Z-Normalization
+
+| Source | medrs | MONAI | TorchIO | vs MONAI | vs TorchIO |
+|--------|-------|-------|---------|----------|------------|
+| 64³ | 0.49ms | 2.15ms | 7.04ms | **4x** | **14x** |
+| 128³ | 0.60ms | 5.36ms | 12.26ms | **9x** | **20x** |
+| 256³ | 0.73ms | 163.38ms | 53.59ms | **224x** | **73x** |
+| 512³ | 1.01ms | 3,735.31ms | 1,092.25ms | **3,698x** | **1,081x** |
+
+*Benchmarks run on Apple M1 Pro, 20 iterations, 3 warmup. Run your own: `python benchmarks/bench_medrs.py`*
+
+</details>
 
 ## Installation
 
@@ -41,7 +131,7 @@ maturin develop --features python
 
 ## Quick Start
 
-### Python
+**Python:**
 
 ```python
 import medrs
@@ -59,7 +149,7 @@ processed.save("output.nii.gz")
 tensor = medrs.load_to_torch("brain.nii.gz", dtype=torch.float16, device="cuda")
 ```
 
-### Rust
+**Rust:**
 
 ```rust
 use medrs::nifti;
@@ -69,7 +159,7 @@ fn main() -> medrs::Result<()> {
     let img = nifti::load("brain.nii.gz")?;
     println!("Shape: {:?}, Spacing: {:?}", img.shape(), img.spacing());
 
-    let resampled = resample_to_spacing(&img, [1.0, 1.0, 1.0], Interpolation::Trilinear);
+    let resampled = resample_to_spacing(&img, [1.0, 1.0, 1.0], Interpolation::Trilinear)?;
     nifti::save(&resampled, "output.nii.gz")?;
     Ok(())
 }
@@ -79,7 +169,7 @@ fn main() -> medrs::Result<()> {
 
 Build composable transform pipelines with lazy evaluation and automatic optimization:
 
-### Python
+**Python:**
 
 ```python
 import medrs
@@ -96,7 +186,7 @@ for path in image_paths:
     processed = pipeline.apply(img)
 ```
 
-### Rust
+**Rust:**
 
 ```rust
 use medrs::pipeline::compose::TransformPipeline;
@@ -113,7 +203,7 @@ let processed = pipeline.apply(&img);
 
 Reproducible augmentations for ML training with optional seeding:
 
-### Python
+**Python:**
 
 ```python
 import medrs
@@ -132,14 +222,14 @@ gamma = medrs.random_gamma(img, gamma_range=(0.7, 1.5), seed=42)
 augmented = medrs.random_augment(img, seed=42)
 ```
 
-### Rust
+**Rust:**
 
 ```rust
 use medrs::transforms::{random_flip, random_gaussian_noise, random_augment};
 
 // Individual augmentations
 let flipped = random_flip(&img, &[0, 1, 2], Some(0.5), Some(42))?;
-let noisy = random_gaussian_noise(&img, Some(0.1), Some(42));
+let noisy = random_gaussian_noise(&img, Some(0.1), Some(42))?;
 
 // Combined augmentation
 let augmented = random_augment(&img, Some(42))?;
@@ -148,8 +238,6 @@ let augmented = random_augment(&img, Some(42))?;
 ## Crop-First Loading
 
 Load only the data you need - essential for training pipelines:
-
-### Python
 
 ```python
 import medrs
@@ -246,8 +334,13 @@ cargo test
 # Python tests
 pytest tests/
 
-# Benchmarks
-cargo bench
+# Benchmarks (requires torch, monai, torchio)
+python benchmarks/bench_medrs.py --quick
+python benchmarks/bench_monai.py --quick
+python benchmarks/bench_torchio.py --quick
+
+# Generate benchmark plots
+python benchmarks/plot_results.py
 ```
 
 ## License

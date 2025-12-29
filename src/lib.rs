@@ -31,6 +31,11 @@
 #![allow(clippy::needless_borrow)] // Borrow is intentional for clarity
 #![allow(clippy::manual_memcpy)] // Manual copy is clearer in some contexts
 
+// Deny panic-prone patterns to prevent regressions
+#![deny(clippy::panic)] // No panic!() in library code
+#![deny(clippy::unwrap_used)] // No .unwrap() in library code
+#![deny(clippy::expect_used)] // No .expect() in library code
+
 //! # medrs
 //!
 //! High-performance medical image I/O and processing library for Rust and Python.

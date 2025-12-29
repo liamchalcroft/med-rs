@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.abspath('../src'))
 project = 'medrs'
 copyright = f'{datetime.now().year}, Liam Chalcroft'
 author = 'Liam Chalcroft'
-version = '0.1.0'
-release = '0.1.0'
+version = '0.1.2'
+release = '0.1.2'
 
 # -- General configuration ---------------------------------------------------
 

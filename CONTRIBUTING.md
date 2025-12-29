@@ -26,7 +26,7 @@ Thank you for your interest in contributing to medrs! This guide will help you g
 
 3. **Run the test suite**
    ```bash
-   # Rust tests (73 tests)
+   # Rust tests
    cargo test
 
    # Python tests
@@ -241,8 +241,8 @@ python examples/integrations/performance_comparison.py
 ///
 /// # Performance
 ///
-/// This function reads only the required bytes, achieving 40x
-/// memory reduction compared to loading the entire volume.
+/// This function reads only the required bytes from disk,
+/// reducing memory usage compared to loading the entire volume.
 ///
 /// # Examples
 ///

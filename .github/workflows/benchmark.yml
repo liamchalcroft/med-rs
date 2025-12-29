@@ -1,0 +1,253 @@
+name: Benchmarks
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Run weekly on Sunday at 00:00 UTC
+    - cron: "0 0 * * 0"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: "Number of benchmark iterations"
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  benchmark:
+    name: Benchmark (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x64
+          - os: ubuntu-latest
+            python: "3.10"
+          - os: ubuntu-latest
+            python: "3.12"
+          # macOS arm64 (Apple Silicon)
+          - os: macos-latest
+            python: "3.10"
+          - os: macos-latest
+            python: "3.12"
+          # Windows x64
+          - os: windows-latest
+            python: "3.10"
+          - os: windows-latest
+            python: "3.12"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          toolchain: stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build medrs
+        run: maturin develop --release --features python
+
+      - name: Install dependencies
+        run: |
+          pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
+          pip install monai
+
+      - name: Run benchmarks
+        id: benchmark
+        run: |
+          ITERATIONS=${{ github.event.inputs.iterations || '30' }}
+          python benchmarks/benchmark_vs_monai.py --iterations $ITERATIONS --output benchmarks/results_${{ matrix.os }}_py${{ matrix.python }}.json
+
+      - name: Run storage benchmarks
+        run: |
+          python benchmarks/benchmark_storage.py --iterations 5 --output benchmarks/storage_${{ matrix.os }}_py${{ matrix.python }}.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ matrix.os }}-py${{ matrix.python }}
+          path: |
+            benchmarks/results_*.json
+            benchmarks/storage_*.json
+          retention-days: 90
+
+  report:
+    name: Generate Report
+    needs: benchmark
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: benchmark-results
+          pattern: benchmark-results-*
+          merge-multiple: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install numpy
+
+      - name: Generate comparison report
+        id: report
+        run: |
+          python << 'EOF'
+          import json
+          import os
+          from pathlib import Path
+
+          results_dir = Path("benchmark-results")
+          report_lines = []
+
+          report_lines.append("## Benchmark Results\n")
+          report_lines.append("| Platform | Python | Load | Save | Crop-Load | Resample | Z-Norm | To Torch |")
+          report_lines.append("|----------|--------|------|------|-----------|----------|--------|----------|")
+
+          # Find all result files
+          for f in sorted(results_dir.glob("results_*.json")):
+              try:
+                  with open(f) as fp:
+                      data = json.load(fp)
+
+                  # Extract platform info from filename
+                  name = f.stem.replace("results_", "")
+                  parts = name.rsplit("_py", 1)
+                  platform = parts[0].replace("ubuntu-latest", "Linux").replace("macos-latest", "macOS").replace("windows-latest", "Windows")
+                  python = parts[1] if len(parts) > 1 else "?"
+
+                  # Extract speedups
+                  def get_speedup(op_name):
+                      for result in data.get("results", []):
+                          if result.get("operation") == op_name and result.get("size") == 128:
+                              speedup = result.get("speedup")
+                              if speedup:
+                                  return f"{speedup:.1f}x"
+                      return "N/A"
+
+                  load_speedup = get_speedup("load")
+                  save_speedup = get_speedup("save")
+                  crop_speedup = get_speedup("load_cropped")
+                  resample_speedup = get_speedup("resample")
+                  znorm_speedup = get_speedup("z_normalize")
+                  torch_speedup = get_speedup("to_torch")
+
+                  report_lines.append(
+                      f"| {platform} | {python} | {load_speedup} | {save_speedup} | {crop_speedup} | {resample_speedup} | {znorm_speedup} | {torch_speedup} |"
+                  )
+              except Exception as e:
+                  print(f"Error processing {f}: {e}")
+
+          report_lines.append("\n### Storage Efficiency\n")
+          report_lines.append("| Platform | dtype | Size (128³) | vs f32 | Read MB/s |")
+          report_lines.append("|----------|-------|-------------|--------|-----------|")
+
+          for f in sorted(results_dir.glob("storage_*.json")):
+              try:
+                  with open(f) as fp:
+                      data = json.load(fp)
+
+                  name = f.stem.replace("storage_", "")
+                  parts = name.rsplit("_py", 1)
+                  platform = parts[0].replace("ubuntu-latest", "Linux").replace("macos-latest", "macOS").replace("windows-latest", "Windows")
+
+                  # Find 128x128x128 results
+                  size_data = data.get("by_size", {}).get("128x128x128", {})
+                  for result in size_data.get("results", [])[:4]:  # First 4 dtypes
+                      if result.get("compressed"):
+                          dtype = result["dtype"]
+                          size_mb = result["file_bytes"] / 1024 / 1024
+                          ratio = result["compression_ratio"]
+                          read_mbps = result["read_throughput_mbps"]
+                          report_lines.append(
+                              f"| {platform} | {dtype} | {size_mb:.1f}MB | {ratio:.0%} | {read_mbps:.0f} |"
+                          )
+              except Exception as e:
+                  print(f"Error processing {f}: {e}")
+
+          report_lines.append("\n*Speedup = medrs time / MONAI time (higher is better)*")
+          report_lines.append("\n*Storage ratio = file size / raw f32 size (lower is better)*")
+
+          report = "\n".join(report_lines)
+          print(report)
+
+          # Save report
+          with open("benchmark-report.md", "w") as f:
+              f.write(report)
+
+          # Set output for PR comment
+          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
+              # Escape newlines for GitHub Actions
+              escaped = report.replace("\n", "%0A").replace("\r", "%0D")
+              f.write(f"report<<EOF\n{report}\nEOF\n")
+          EOF
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('benchmark-report.md', 'utf8');
+
+            // Find existing comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const botComment = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('## Benchmark Results')
+            );
+
+            const body = `## Benchmark Results\n\n${report}\n\n*Updated: ${new Date().toISOString()}*`;
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: botComment.id,
+                body: body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: body,
+              });
+            }
+
+      - name: Upload report
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: benchmark-report.md
+          retention-days: 90

@@ -11,6 +11,8 @@ use ndarray::{ArrayD, Axis, Slice};
 /// # Errors
 ///
 /// Returns an error if `target_shape` dimensions don't match the image dimensions.
+#[must_use = "this function returns a new image and does not modify the original"]
+#[allow(clippy::comparison_chain)]
 pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiImage> {
     let current_shape = image.shape();
     let ndim = current_shape.len();
@@ -21,6 +23,16 @@ pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiIm
             target_shape.len(),
             ndim
         )));
+    }
+
+    // Validate no zero dimensions
+    for (i, &dim) in target_shape.iter().enumerate() {
+        if dim == 0 {
+            return Err(Error::InvalidDimensions(format!(
+                "Target shape dimension {} cannot be 0",
+                i
+            )));
+        }
     }
 
     // Calculate crop/pad slices
@@ -89,7 +101,7 @@ pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiIm
     }
 
     // Use data_cow() to avoid cloning if data is already owned
-    let data = image.data_cow();
+    let data = image.data_cow()?;
     let new_data = match data.as_ref() {
         ArrayData::U8(a) => ArrayData::U8(process_array_ref!(a, u8)),
         ArrayData::I8(a) => ArrayData::I8(process_array_ref!(a, i8)),
@@ -110,6 +122,12 @@ pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiIm
     header.ndim = target_shape.len() as u8;
     header.dim = [1u16; 7];
     for (i, &s) in target_shape.iter().enumerate() {
+        if s > u16::MAX as usize {
+            return Err(Error::InvalidDimensions(format!(
+                "Target shape dimension {} ({}) exceeds maximum value {}",
+                i, s, u16::MAX
+            )));
+        }
         header.dim[i] = s as u16;
     }
 
@@ -151,6 +169,7 @@ pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiIm
 /// # Errors
 ///
 /// Returns an error if any axis index is out of bounds.
+#[must_use = "this function returns a new image and does not modify the original"]
 pub fn flip(image: &NiftiImage, axes: &[usize]) -> Result<NiftiImage> {
     let ndim = image.ndim();
     for &axis in axes {
@@ -178,7 +197,7 @@ pub fn flip(image: &NiftiImage, axes: &[usize]) -> Result<NiftiImage> {
     }
 
     // Use data_cow() to avoid cloning if data is already owned
-    let data = image.data_cow();
+    let data = image.data_cow()?;
     let new_data = match data.as_ref() {
         ArrayData::U8(a) => flip_array_ref!(a, U8),
         ArrayData::I8(a) => flip_array_ref!(a, I8),
@@ -227,7 +246,7 @@ mod tests {
         assert_eq!(cropped.shape(), &[2, 2, 2]);
 
         // Verify we got the center region
-        let result = cropped.to_f32();
+        let result = cropped.to_f32().unwrap();
         assert_eq!(result.len(), 8);
     }
 
@@ -242,7 +261,7 @@ mod tests {
         assert_eq!(padded.shape(), &[4, 4, 4]);
 
         // The outer voxels should be 0 (padding)
-        let result = padded.to_f32();
+        let result = padded.to_f32().unwrap();
         let slice = result.as_slice_memory_order().unwrap();
 
         // With F-order, first element in memory is still [0,0,0]
@@ -258,11 +277,11 @@ mod tests {
         let result = crop_or_pad(&img, &[2, 2, 2]).unwrap();
         assert_eq!(result.shape(), &[2, 2, 2]);
 
-        let result_data = result.to_f32();
+        let result_data = result.to_f32().unwrap();
         let result_slice = result_data.as_slice_memory_order().unwrap();
 
         // Compare against original in same memory order
-        let orig = img.to_f32();
+        let orig = img.to_f32().unwrap();
         let orig_slice = orig.as_slice_memory_order().unwrap();
 
         for i in 0..result_slice.len() {
@@ -305,7 +324,7 @@ mod tests {
 
         // Flip along axis 0 (depth)
         let flipped = flip(&img, &[0]).unwrap();
-        let result = flipped.to_f32();
+        let result = flipped.to_f32().unwrap();
 
         // After flipping axis 0:
         // Original: [[[1,2],[3,4]], [[5,6],[7,8]]]
@@ -332,7 +351,7 @@ mod tests {
 
         // Flip along all axes
         let flipped = flip(&img, &[0, 1, 2]).unwrap();
-        let result = flipped.to_f32();
+        let result = flipped.to_f32().unwrap();
 
         // Flipping all axes reverses the data
         // [0,0,0] should have what was at [1,1,1]
@@ -348,7 +367,7 @@ mod tests {
 
         // No flip - should be identity
         let flipped = flip(&img, &[]).unwrap();
-        let result = flipped.to_f32();
+        let result = flipped.to_f32().unwrap();
 
         // Check all positions match original
         assert!((result[[0, 0, 0]] - 1.0).abs() < 1e-5);
@@ -364,6 +383,19 @@ mod tests {
         // Axis 3 is out of bounds for 3D image
         let result = flip(&img, &[3]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_crop_or_pad_rejects_zero_dimension() {
+        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        let img = create_test_image(data, [2, 2, 2]);
+
+        // Zero dimension should be rejected
+        let result = crop_or_pad(&img, &[0, 2, 2]);
+        assert!(result.is_err());
+        if let Err(e) = result {
+            assert!(e.to_string().contains("cannot be 0"));
+        }
     }
 
     #[test]
@@ -384,7 +416,7 @@ mod tests {
         let flipped1 = flip(&img, &[0]).unwrap();
         let flipped2 = flip(&flipped1, &[0]).unwrap();
 
-        let result = flipped2.to_f32();
+        let result = flipped2.to_f32().unwrap();
 
         // Double flip should be identity - check key positions
         assert!(

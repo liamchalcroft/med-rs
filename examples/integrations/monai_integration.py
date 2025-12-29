@@ -34,7 +34,7 @@ class MedrsLoadToTensor:
         keys: list,
         output_shape: tuple = (96, 96, 96),
         device: str = None,
-        dtype: str = "float32"
+        dtype: torch.dtype = torch.float32
     ):
         self.keys = keys
         self.output_shape = output_shape
@@ -69,7 +69,7 @@ def create_monai_pipeline():
 
     # Complete MONAI pipeline
     transforms = Compose([
-        medrs_load,                           # Crop-first loading (40x memory reduction)
+        medrs_load,                           # Fast crop-first loading
         EnsureChannelFirstd(keys=["image", "label"]),  # Add channel dimension
         ScaleIntensityd(keys=["image"]),      # Normalize intensities
         RandFlipd(keys=["image", "label"], prob=0.5),  # Data augmentation
@@ -104,7 +104,7 @@ def example_training_workflow():
     print(f"- Dataset: {len(dataset)} samples")
     print("- Batch size: 2")
     print(f"- Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
-    print("- Expected performance: 40x memory reduction, 200x speedup")
+    print("- Expected performance: up to 40x faster I/O vs MONAI")
 
     return dataloader
 
@@ -116,14 +116,14 @@ def performance_comparison():
     print("=" * 25)
     print("Traditional MONAI approach:")
     print("  LoadImaged  Load full volume (1600MB)")
-    print("  RandCropd  Crop to patch (waste 40x memory)")
+    print("  RandCropd  Crop to patch (loads full volume)")
     print("  Transfer to GPU  Additional overhead")
     print()
     print("medrs + MONAI approach:")
     print("  MedrsLoadToTensor  Load exact bytes (40MB)")
     print("  Direct GPU placement  Zero transfer overhead")
     print()
-    print("Result: 40x memory reduction + 200x speedup")
+    print("Result: Faster I/O with reduced memory usage")
 
 
 if __name__ == "__main__":

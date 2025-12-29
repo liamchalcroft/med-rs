@@ -9,6 +9,7 @@
 //! - Center cropping for inference/validation
 //! - Foreground detection for automatic region selection
 
+use crate::error::Result;
 use crate::nifti::NiftiImage;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -67,13 +68,16 @@ impl Default for SpatialCropConfig {
 /// This function implements MONAI's `RandCropByPosNegLabeld` functionality
 /// optimized for medrs's byte-exact loading. It returns crop regions
 /// that can be used directly with `load_cropped()` to load only required bytes.
+///
+/// # Errors
+/// Returns an error if the label image data cannot be materialized.
 pub fn compute_label_aware_crop_regions(
     config: &RandCropByPosNegLabelConfig,
     _image: &NiftiImage,
     label: &NiftiImage,
     num_samples: usize,
-) -> Vec<CropRegion> {
-    let label_data = label.to_f32();
+) -> Result<Vec<CropRegion>> {
+    let label_data = label.to_f32()?;
     let volume_shape_slice = label_data.shape();
     let volume_shape = if volume_shape_slice.len() == 3 {
         [
@@ -83,7 +87,7 @@ pub fn compute_label_aware_crop_regions(
         ]
     } else {
         // Skip processing if not 3D
-        return Vec::new();
+        return Ok(Vec::new());
     };
 
     // Initialize random number generator
@@ -95,7 +99,7 @@ pub fn compute_label_aware_crop_regions(
 
     if positive_voxels.is_empty() {
         // Fallback to random cropping if no positive voxels
-        return compute_random_regions(config, &volume_shape, num_samples);
+        return Ok(compute_random_regions(config, &volume_shape, num_samples));
     }
 
     let mut regions = Vec::with_capacity(num_samples);
@@ -150,7 +154,7 @@ pub fn compute_label_aware_crop_regions(
     }
 
     regions.truncate(num_samples);
-    regions
+    Ok(regions)
 }
 
 /// Compute random spatial crop regions.
@@ -319,26 +323,42 @@ fn compute_random_regions_for_size(
     num_samples: usize,
     patch_size: [usize; 3],
 ) -> Vec<CropRegion> {
+    // Early return if volume is too small for requested patch (when not allowing smaller crops)
+    if !config.allow_smaller {
+        for i in 0..3 {
+            if volume_shape[i] < patch_size[i] {
+                // Volume dimension smaller than patch - cannot extract any valid regions
+                return Vec::new();
+            }
+        }
+    }
+
+    // Check for zero-sized volumes
+    if volume_shape[0] == 0 || volume_shape[1] == 0 || volume_shape[2] == 0 {
+        return Vec::new();
+    }
+
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed.unwrap_or(42));
     let mut regions = Vec::with_capacity(num_samples);
 
     for _ in 0..num_samples {
+        // Compute max_start, ensuring at least 1 to avoid empty range panic
         let max_start_x = if config.allow_smaller {
-            volume_shape[0]
+            volume_shape[0].max(1)
         } else {
-            volume_shape[0].saturating_sub(patch_size[0])
+            volume_shape[0].saturating_sub(patch_size[0]).max(1)
         };
 
         let max_start_y = if config.allow_smaller {
-            volume_shape[1]
+            volume_shape[1].max(1)
         } else {
-            volume_shape[1].saturating_sub(patch_size[1])
+            volume_shape[1].saturating_sub(patch_size[1]).max(1)
         };
 
         let max_start_z = if config.allow_smaller {
-            volume_shape[2]
+            volume_shape[2].max(1)
         } else {
-            volume_shape[2].saturating_sub(patch_size[2])
+            volume_shape[2].saturating_sub(patch_size[2]).max(1)
         };
 
         let start = [
@@ -453,8 +473,11 @@ impl ForegroundDetector {
     }
 
     /// Find the bounding box of foreground voxels.
-    pub fn find_foreground_bbox(&self, image: &NiftiImage) -> Option<CropRegion> {
-        let data = image.to_f32();
+    ///
+    /// # Errors
+    /// Returns an error if the image data cannot be materialized.
+    pub fn find_foreground_bbox(&self, image: &NiftiImage) -> Result<Option<CropRegion>> {
+        let data = image.to_f32()?;
         let volume_shape = data.shape();
         let mut min_coords = [volume_shape[0], volume_shape[1], volume_shape[2]];
         let mut max_coords = [0, 0, 0];
@@ -483,7 +506,7 @@ impl ForegroundDetector {
         let foreground_ratio = foreground_count as f32 / total_voxels as f32;
 
         if foreground_ratio < self.min_foreground_ratio {
-            return None;
+            return Ok(None);
         }
 
         // Expand bounding box slightly
@@ -502,7 +525,7 @@ impl ForegroundDetector {
 
         let size = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
 
-        Some(CropRegion { start, end, size })
+        Ok(Some(CropRegion { start, end, size }))
     }
 }
 
@@ -550,11 +573,65 @@ mod tests {
         ];
         let image = NiftiImage::from_array(data.clone(), affine);
 
-        let bbox = detector.find_foreground_bbox(&image);
+        let bbox = detector.find_foreground_bbox(&image).unwrap();
         assert!(bbox.is_some());
 
         let region = bbox.unwrap();
         assert_eq!(region.start, [2, 2, 2]); // Expanded by morph_radius=2
         assert_eq!(region.end, [9, 9, 9]); // max_coords (6) + morph_radius (2) + 1 = 9
+    }
+
+    #[test]
+    fn test_random_crop_volume_smaller_than_patch() {
+        // Volume smaller than patch - should return empty vec, not panic
+        let config = SpatialCropConfig {
+            patch_size: [128, 128, 128],
+            seed: Some(42),
+            allow_smaller: false,
+        };
+
+        // Create 2x2x2 volume (smaller than 128x128x128 patch)
+        let volume_shape = [2, 2, 2];
+        let regions = compute_random_regions_for_size(&config, &volume_shape, 4, config.patch_size);
+
+        // Should return empty, not panic
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn test_random_crop_zero_volume() {
+        let config = SpatialCropConfig {
+            patch_size: [8, 8, 8],
+            seed: Some(42),
+            allow_smaller: true,
+        };
+
+        // Zero-sized volume
+        let volume_shape = [0, 10, 10];
+        let regions = compute_random_regions_for_size(&config, &volume_shape, 4, config.patch_size);
+        assert!(regions.is_empty());
+    }
+
+    #[test]
+    fn test_random_crop_allow_smaller() {
+        // When allow_smaller is true, should work even with small volumes
+        let config = SpatialCropConfig {
+            patch_size: [64, 64, 64],
+            seed: Some(42),
+            allow_smaller: true,
+        };
+
+        let volume_shape = [8, 8, 8];
+        let regions = compute_random_regions_for_size(&config, &volume_shape, 2, config.patch_size);
+
+        // Should succeed with allow_smaller = true
+        assert_eq!(regions.len(), 2);
+
+        // Resulting crops will be clamped to volume bounds
+        for region in &regions {
+            assert!(region.end[0] <= volume_shape[0]);
+            assert!(region.end[1] <= volume_shape[1]);
+            assert!(region.end[2] <= volume_shape[2]);
+        }
     }
 }

@@ -1,3 +1,4 @@
+use crate::error::{Error, Result};
 use crate::nifti::image::ArrayData;
 use crate::nifti::{DataType, NiftiImage};
 use crate::pipeline::acquire_buffer;
@@ -8,15 +9,23 @@ use rayon::prelude::*;
 /// Normalize image intensity to zero mean and unit variance.
 ///
 /// Formula: output = (input - mean) / std
-pub fn z_normalization(image: &NiftiImage) -> NiftiImage {
+///
+/// # Errors
+///
+/// Returns an error if the underlying array is not contiguous in memory or
+/// if the image data cannot be materialized.
+#[must_use = "this function returns a Result and does not modify the original"]
+pub fn z_normalization(image: &NiftiImage) -> Result<NiftiImage> {
     let mut header = image.header().clone();
 
     // Use data_cow() to avoid cloning if already owned
-    let data = image.data_cow();
+    let data = image.data_cow()?;
 
     // Fast path for f32 (most common case) - SIMD + parallel
     if let ArrayData::F32(a) = data.as_ref() {
-        let slice = a.as_slice_memory_order().unwrap();
+        let slice = a.as_slice_memory_order().ok_or_else(|| {
+            Error::NonContiguousArray("Array must be contiguous for z-normalization".to_string())
+        })?;
         let len = slice.len();
 
         // SIMD-accelerated statistics computation
@@ -37,17 +46,24 @@ pub fn z_normalization(image: &NiftiImage) -> NiftiImage {
         parallel_linear_transform_f32(slice, &mut output, inv_std, offset);
 
         // Return result in F-order to match NIfTI convention
-        let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output).unwrap();
+        let shape = a.shape();
+        let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
+            Error::MemoryAllocation(format!("Failed to create output array: {}", e))
+        })?;
         header.datatype = DataType::Float32;
         header.scl_slope = 1.0;
         header.scl_inter = 0.0;
-        return NiftiImage::from_parts(header, ArrayData::F32(out_array));
+        return Ok(NiftiImage::from_parts(header, ArrayData::F32(out_array)));
     }
 
     // Generic path for other types
     macro_rules! normalize {
         ($array:expr, $to_f64:expr, $from_f32:expr) => {{
-            let slice = $array.as_slice_memory_order().unwrap();
+            let slice = $array.as_slice_memory_order().ok_or_else(|| {
+                Error::NonContiguousArray(
+                    "Array must be contiguous for z-normalization".to_string(),
+                )
+            })?;
             let len = slice.len();
 
             let (sum, sum_sq) = slice
@@ -77,7 +93,10 @@ pub fn z_normalization(image: &NiftiImage) -> NiftiImage {
                 });
 
             // F-order to match NIfTI convention
-            let out_array = ArrayD::from_shape_vec(IxDyn($array.shape()).f(), output).unwrap();
+            let shape = $array.shape();
+            let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
+                Error::MemoryAllocation(format!("Failed to create output array: {}", e))
+            })?;
             header.datatype = DataType::Float32;
             ArrayData::F32(out_array)
         }};
@@ -96,7 +115,11 @@ pub fn z_normalization(image: &NiftiImage) -> NiftiImage {
         ArrayData::BF16(a) => normalize!(a, |v: half::bf16| v.to_f64(), |v: f64| v as f32),
         ArrayData::F32(_) => unreachable!(), // Handled above
         ArrayData::F64(a) => {
-            let slice = a.as_slice_memory_order().unwrap();
+            let slice = a.as_slice_memory_order().ok_or_else(|| {
+                Error::NonContiguousArray(
+                    "Array must be contiguous for z-normalization".to_string(),
+                )
+            })?;
             let len = slice.len();
 
             let (sum, sum_sq) = slice
@@ -121,7 +144,10 @@ pub fn z_normalization(image: &NiftiImage) -> NiftiImage {
                 });
 
             // F-order to match NIfTI convention
-            let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output).unwrap();
+            let shape = a.shape();
+            let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
+                Error::MemoryAllocation(format!("Failed to create output array: {}", e))
+            })?;
             header.datatype = DataType::Float64;
             ArrayData::F64(out_array)
         }
@@ -130,23 +156,31 @@ pub fn z_normalization(image: &NiftiImage) -> NiftiImage {
     header.scl_slope = 1.0;
     header.scl_inter = 0.0;
 
-    NiftiImage::from_parts(header, new_data)
+    Ok(NiftiImage::from_parts(header, new_data))
 }
 
 /// Rescale image intensity to a specific range.
 ///
 /// Formula: output = (input - min) / (max - min) * (out_max - out_min) + out_min
-pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> NiftiImage {
+///
+/// # Errors
+///
+/// Returns an error if the underlying array is not contiguous in memory or
+/// if the image data cannot be materialized.
+#[must_use = "this function returns a Result and does not modify the original"]
+pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Result<NiftiImage> {
     use crate::pipeline::simd_kernels::parallel_minmax_f32;
 
     let mut header = image.header().clone();
 
     // Use data_cow() to avoid cloning if already owned
-    let data = image.data_cow();
+    let data = image.data_cow()?;
 
     // Fast path for f32 - SIMD + parallel
     if let ArrayData::F32(a) = data.as_ref() {
-        let slice = a.as_slice_memory_order().unwrap();
+        let slice = a.as_slice_memory_order().ok_or_else(|| {
+            Error::NonContiguousArray("Array must be contiguous for rescale".to_string())
+        })?;
 
         // SIMD-accelerated min/max
         let (min, max) = parallel_minmax_f32(slice);
@@ -161,17 +195,22 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Nift
         parallel_linear_transform_f32(slice, &mut output, scale, offset);
 
         // F-order to match NIfTI convention
-        let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output).unwrap();
+        let shape = a.shape();
+        let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
+            Error::MemoryAllocation(format!("Failed to create output array: {}", e))
+        })?;
         header.datatype = DataType::Float32;
         header.scl_slope = 1.0;
         header.scl_inter = 0.0;
-        return NiftiImage::from_parts(header, ArrayData::F32(out_array));
+        return Ok(NiftiImage::from_parts(header, ArrayData::F32(out_array)));
     }
 
     // Generic path for other types
     macro_rules! rescale {
         ($array:expr, $to_f64:expr) => {{
-            let slice = $array.as_slice_memory_order().unwrap();
+            let slice = $array.as_slice_memory_order().ok_or_else(|| {
+                Error::NonContiguousArray("Array must be contiguous for rescale".to_string())
+            })?;
             let len = slice.len();
 
             let (min, max) = slice
@@ -201,7 +240,10 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Nift
                 });
 
             // F-order to match NIfTI convention
-            let out_array = ArrayD::from_shape_vec(IxDyn($array.shape()).f(), output).unwrap();
+            let shape = $array.shape();
+            let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
+                Error::MemoryAllocation(format!("Failed to create output array: {}", e))
+            })?;
             header.datatype = DataType::Float32;
             ArrayData::F32(out_array)
         }};
@@ -220,7 +262,9 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Nift
         ArrayData::BF16(a) => rescale!(a, |v: half::bf16| v.to_f64()),
         ArrayData::F32(_) => unreachable!(), // Handled above
         ArrayData::F64(a) => {
-            let slice = a.as_slice_memory_order().unwrap();
+            let slice = a.as_slice_memory_order().ok_or_else(|| {
+                Error::NonContiguousArray("Array must be contiguous for rescale".to_string())
+            })?;
             let len = slice.len();
 
             let (min, max) = slice.par_iter().map(|&v| (v, v)).reduce(
@@ -241,7 +285,10 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Nift
                 });
 
             // F-order to match NIfTI convention
-            let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output).unwrap();
+            let shape = a.shape();
+            let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
+                Error::MemoryAllocation(format!("Failed to create output array: {}", e))
+            })?;
             header.datatype = DataType::Float64;
             ArrayData::F64(out_array)
         }
@@ -250,21 +297,29 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Nift
     header.scl_slope = 1.0;
     header.scl_inter = 0.0;
 
-    NiftiImage::from_parts(header, new_data)
+    Ok(NiftiImage::from_parts(header, new_data))
 }
 
 /// Clamp image intensity to a specific range.
-pub fn clamp(image: &NiftiImage, min: f64, max: f64) -> NiftiImage {
+///
+/// # Errors
+///
+/// Returns an error if the underlying array is not contiguous in memory or
+/// if the image data cannot be materialized.
+#[must_use = "this function returns a Result and does not modify the original"]
+pub fn clamp(image: &NiftiImage, min: f64, max: f64) -> Result<NiftiImage> {
     use crate::pipeline::simd_kernels::parallel_linear_transform_clamp_f32;
 
     let header = image.header().clone();
 
     // Use data_cow() to avoid cloning if already owned
-    let data = image.data_cow();
+    let data = image.data_cow()?;
 
     // Fast path for f32 - SIMD + parallel
     if let ArrayData::F32(a) = data.as_ref() {
-        let slice = a.as_slice_memory_order().unwrap();
+        let slice = a.as_slice_memory_order().ok_or_else(|| {
+            Error::NonContiguousArray("Array must be contiguous for clamp".to_string())
+        })?;
         let (min_f, max_f) = (min as f32, max as f32);
 
         // SIMD-accelerated clamping (identity transform with clamp, use memory pool)
@@ -272,8 +327,11 @@ pub fn clamp(image: &NiftiImage, min: f64, max: f64) -> NiftiImage {
         parallel_linear_transform_clamp_f32(slice, &mut output, 1.0, 0.0, min_f, max_f);
 
         // F-order to match NIfTI convention
-        let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output).unwrap();
-        return NiftiImage::from_parts(header, ArrayData::F32(out_array));
+        let shape = a.shape();
+        let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
+            Error::MemoryAllocation(format!("Failed to create output array: {}", e))
+        })?;
+        return Ok(NiftiImage::from_parts(header, ArrayData::F32(out_array)));
     }
 
     // Generic path - use mapv for simplicity (less common types)
@@ -322,7 +380,7 @@ pub fn clamp(image: &NiftiImage, min: f64, max: f64) -> NiftiImage {
         ArrayData::F64(a) => ArrayData::F64(a.mapv(|v| v.clamp(min, max))),
     };
 
-    NiftiImage::from_parts(header, new_data)
+    Ok(NiftiImage::from_parts(header, new_data))
 }
 
 #[cfg(test)]
@@ -350,8 +408,8 @@ mod tests {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let img = create_test_image(data, [2, 2, 2]);
 
-        let normalized = z_normalization(&img);
-        let result = normalized.to_f32();
+        let normalized = z_normalization(&img).unwrap();
+        let result = normalized.to_f32().unwrap();
         let result_slice = result.as_slice_memory_order().unwrap();
 
         // After z-normalization, mean should be ~0 and std should be ~1
@@ -370,8 +428,8 @@ mod tests {
         let data = vec![5.0; 8];
         let img = create_test_image(data, [2, 2, 2]);
 
-        let normalized = z_normalization(&img);
-        let result = normalized.to_f32();
+        let normalized = z_normalization(&img).unwrap();
+        let result = normalized.to_f32().unwrap();
         let result_slice = result.as_slice_memory_order().unwrap();
 
         // With zero variance, should handle gracefully (no NaN)
@@ -385,8 +443,8 @@ mod tests {
         let data = vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0];
         let img = create_test_image(data, [2, 2, 2]);
 
-        let rescaled = rescale_intensity(&img, 0.0, 1.0);
-        let result = rescaled.to_f32();
+        let rescaled = rescale_intensity(&img, 0.0, 1.0).unwrap();
+        let result = rescaled.to_f32().unwrap();
         let result_slice = result.as_slice_memory_order().unwrap();
 
         // After rescaling to [0, 1], min should be 0 and max should be 1
@@ -405,8 +463,8 @@ mod tests {
         let data = vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0];
         let img = create_test_image(data, [2, 2, 2]);
 
-        let rescaled = rescale_intensity(&img, -1.0, 1.0);
-        let result = rescaled.to_f32();
+        let rescaled = rescale_intensity(&img, -1.0, 1.0).unwrap();
+        let result = rescaled.to_f32().unwrap();
         let result_slice = result.as_slice_memory_order().unwrap();
 
         let min = result_slice.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -425,8 +483,8 @@ mod tests {
         let data = vec![5.0; 8];
         let img = create_test_image(data, [2, 2, 2]);
 
-        let rescaled = rescale_intensity(&img, 0.0, 1.0);
-        let result = rescaled.to_f32();
+        let rescaled = rescale_intensity(&img, 0.0, 1.0).unwrap();
+        let result = rescaled.to_f32().unwrap();
         let result_slice = result.as_slice_memory_order().unwrap();
 
         // With zero range, should not produce NaN
@@ -440,8 +498,8 @@ mod tests {
         let data = vec![-10.0, 0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0];
         let img = create_test_image(data, [2, 2, 2]);
 
-        let clamped = clamp(&img, 0.0, 20.0);
-        let result = clamped.to_f32();
+        let clamped = clamp(&img, 0.0, 20.0).unwrap();
+        let result = clamped.to_f32().unwrap();
         let result_slice = result.as_slice_memory_order().unwrap();
 
         for &v in result_slice {
@@ -451,7 +509,7 @@ mod tests {
 
         // Check that values are properly clamped (don't rely on specific indices
         // since F-order changes the memory layout)
-        let orig = img.to_f32();
+        let orig = img.to_f32().unwrap();
         let orig_slice = orig.as_slice_memory_order().unwrap();
         for i in 0..result_slice.len() {
             let expected = orig_slice[i].max(0.0).min(20.0);
@@ -470,8 +528,8 @@ mod tests {
         let data = vec![-10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0, 25.0];
         let img = create_test_image(data, [2, 2, 2]);
 
-        let clamped = clamp(&img, -3.0, 3.0);
-        let result = clamped.to_f32();
+        let clamped = clamp(&img, -3.0, 3.0).unwrap();
+        let result = clamped.to_f32().unwrap();
         let result_slice = result.as_slice_memory_order().unwrap();
 
         for &v in result_slice {
@@ -485,13 +543,13 @@ mod tests {
         let data = vec![1.0; 24]; // 2x3x4 = 24
         let img = create_test_image(data, [2, 3, 4]);
 
-        let z_norm = z_normalization(&img);
+        let z_norm = z_normalization(&img).unwrap();
         assert_eq!(z_norm.shape(), &[2, 3, 4]);
 
-        let rescaled = rescale_intensity(&img, 0.0, 1.0);
+        let rescaled = rescale_intensity(&img, 0.0, 1.0).unwrap();
         assert_eq!(rescaled.shape(), &[2, 3, 4]);
 
-        let clamped = clamp(&img, 0.0, 2.0);
+        let clamped = clamp(&img, 0.0, 2.0).unwrap();
         assert_eq!(clamped.shape(), &[2, 3, 4]);
     }
 }

@@ -32,8 +32,11 @@ class MedicalDataset(Dataset):
             crop_shape=self.patch_size
         )
 
-        # Direct GPU placement with zero-copy
-        tensor = patch.to_torch(device=self.device, dtype=torch.float32)
+        # Direct GPU placement with specified dtype
+        tensor = patch.to_torch_with_dtype_and_device(
+            dtype=torch.float32,
+            device=self.device
+        )
 
         # Simple preprocessing
         tensor = (tensor - tensor.mean()) / (tensor.std() + 1e-8)
@@ -162,7 +165,7 @@ def demonstrate_memory_efficiency():
     print("\n2. medrs crop-first approach:")
     print(f"    Memory used: {patch_memory}MB")
     print(f"    Memory reduction: {traditional_memory/patch_memory}x")
-    print("    Speed improvement: 200-3500x")
+    print("    Speed improvement: up to 40x faster I/O")
 
     print("\n3. Training batch memory calculation:")
     batch_size = 16

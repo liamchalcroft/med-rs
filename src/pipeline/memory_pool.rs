@@ -87,7 +87,7 @@ impl MemoryPool {
         }
 
         let bin = Self::round_up_pow2(capacity);
-        let buffers = self.buffers.entry(bin).or_insert_with(Vec::new);
+        let buffers = self.buffers.entry(bin).or_default();
 
         // Check max per class
         if buffers.len() >= self.max_per_class {
@@ -127,18 +127,40 @@ thread_local! {
 }
 
 /// Acquire a buffer from the thread-local pool.
+///
+/// Safe to call reentrantly (nested calls allocate fresh buffers).
+/// Returns a zeroed Vec<f32> of at least `len` capacity.
+#[allow(clippy::option_if_let_else)]
 pub fn acquire_buffer(len: usize) -> Vec<f32> {
-    POOL.with(|pool| pool.borrow_mut().acquire(len))
+    POOL.with(|pool| {
+        match pool.try_borrow_mut() {
+            Ok(mut p) => p.acquire(len),
+            // Reentrant call - allocate fresh to avoid panic
+            Err(_) => vec![0.0f32; len],
+        }
+    })
 }
 
 /// Return a buffer to the thread-local pool.
+///
+/// Safe to call reentrantly (buffer is dropped if pool is busy).
 pub fn release_buffer(buf: Vec<f32>) {
-    POOL.with(|pool| pool.borrow_mut().release(buf));
+    POOL.with(|pool| {
+        // Silently drop if pool is borrowed (reentrant call)
+        if let Ok(mut p) = pool.try_borrow_mut() {
+            p.release(buf);
+        }
+        // Otherwise buffer is dropped, which is fine
+    });
 }
 
 /// Clear the thread-local pool.
 pub fn clear_pool() {
-    POOL.with(|pool| pool.borrow_mut().clear());
+    POOL.with(|pool| {
+        if let Ok(mut p) = pool.try_borrow_mut() {
+            p.clear();
+        }
+    });
 }
 
 /// Get the current thread-local pool usage in bytes.
@@ -160,18 +182,30 @@ impl PooledBuffer {
     }
 
     /// Get a reference to the underlying buffer.
+    ///
+    /// # Panics
+    /// Panics if `take()` was previously called.
+    #[allow(clippy::expect_used)]
     pub fn as_slice(&self) -> &[f32] {
-        self.buffer.as_ref().unwrap()
+        self.buffer.as_ref().expect("buffer already taken")
     }
 
     /// Get a mutable reference to the underlying buffer.
+    ///
+    /// # Panics
+    /// Panics if `take()` was previously called.
+    #[allow(clippy::expect_used)]
     pub fn as_mut_slice(&mut self) -> &mut [f32] {
-        self.buffer.as_mut().unwrap()
+        self.buffer.as_mut().expect("buffer already taken")
     }
 
     /// Take ownership of the buffer (it won't be returned to the pool).
+    ///
+    /// # Panics
+    /// Panics if `take()` was previously called.
+    #[allow(clippy::expect_used)]
     pub fn take(mut self) -> Vec<f32> {
-        self.buffer.take().unwrap()
+        self.buffer.take().expect("buffer already taken")
     }
 }
 

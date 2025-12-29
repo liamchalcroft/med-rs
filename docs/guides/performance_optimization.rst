@@ -3,13 +3,172 @@ Performance Optimization
 
 This guide covers advanced performance optimization techniques for medrs applications to achieve maximum throughput and minimal memory usage.
 
+Quick Reference: Performance vs MONAI
+-------------------------------------
+
+medrs delivers substantial speedups over MONAI for I/O-bound operations:
+
+.. list-table::
+   :header-rows: 1
+   :widths: 30 20 20 20
+
+   * - Operation
+     - medrs
+     - MONAI
+     - Speedup
+   * - Load (128³)
+     - 0.2ms
+     - 7.5ms
+     - **41x**
+   * - Load Cropped (64³ from 128³)
+     - 0.8ms
+     - 30ms
+     - **39x**
+   * - To PyTorch
+     - 1.0ms
+     - 16ms
+     - **16x**
+   * - Save (128³)
+     - 110ms
+     - 37ms
+     - 3x slower
+   * - Z-Normalize
+     - 30ms
+     - 20ms
+     - 1.5x slower
+
+*Note: medrs excels at I/O operations. MONAI is faster for compute-heavy transforms like resampling and normalization due to PyTorch's optimized kernels.*
+
+Mixed-Precision Storage
+-----------------------
+
+medrs supports bf16 and f16 storage for 50% file size reduction with minimal precision loss.
+
+Storage Efficiency
+~~~~~~~~~~~~~~~~~~
+
+.. list-table::
+   :header-rows: 1
+   :widths: 25 25 25
+
+   * - Format
+     - Size (128³, compressed)
+     - vs float32
+   * - float32
+     - 8.3 MB
+     - 100%
+   * - **bfloat16**
+     - **3.4 MB**
+     - **41%**
+   * - **float16**
+     - **4.1 MB**
+     - **50%**
+   * - int16
+     - 1.2 MB
+     - 15%
+
+Using Mixed Precision
+~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   import medrs
+
+   # Load an image
+   img = medrs.load("brain.nii.gz")
+
+   # Convert to bf16 for training (better numerical range than f16)
+   bf16_img = img.with_dtype("bfloat16")
+   bf16_img.save("brain_bf16.nii.gz")  # 50% smaller file
+
+   # Convert to f16 for inference
+   f16_img = img.with_dtype("float16")
+   f16_img.save("brain_f16.nii.gz")
+
+   # Load directly to PyTorch with target precision
+   import torch
+   tensor = medrs.load_to_torch("brain.nii.gz", dtype=torch.bfloat16, device="cuda")
+
+When to Use Mixed Precision
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- **bfloat16**: Recommended for training. Same dynamic range as float32, just reduced mantissa precision.
+- **float16**: Best for inference or when hardware doesn't support bf16. Watch for overflow with large values.
+- **int16**: Maximum compression for normalized data in [-1, 1] or [0, 1] range.
+
+MONAI Integration for Maximum Performance
+-----------------------------------------
+
+medrs provides drop-in replacements for MONAI transforms that can dramatically improve I/O performance in existing pipelines.
+
+Drop-in Replacement Usage
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   # Before (MONAI - slower)
+   from monai.transforms import LoadImaged, RandCropByPosNegLabeld
+
+   # After (medrs - up to 40x faster)
+   from medrs.monai_compat import MedrsLoadImaged, MedrsRandCropByPosNegLabeld
+
+   # Same API, just change the imports
+   pipeline = Compose([
+       MedrsLoadImaged(keys=["image", "label"], ensure_channel_first=True),
+       MedrsRandCropByPosNegLabeld(
+           keys=["image", "label"],
+           label_key="label",
+           spatial_size=(64, 64, 64),
+           pos=1,
+           neg=1,
+           num_samples=4,
+       ),
+   ])
+
+Mixing medrs and MONAI Transforms
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. code-block:: python
+
+   from medrs.monai_compat import MedrsLoadImaged, MedrsRandCropByPosNegLabeld
+   from monai.transforms import Compose, RandFlipd, RandGaussianNoised, EnsureTyped
+
+   # Use medrs for I/O-heavy operations, MONAI for augmentations
+   train_transforms = Compose([
+       # medrs: Fast loading (up to 40x faster)
+       MedrsLoadImaged(keys=["image", "label"], ensure_channel_first=True),
+
+       # medrs: Fast cropping (up to 40x faster)
+       MedrsRandCropByPosNegLabeld(
+           keys=["image", "label"],
+           label_key="label",
+           spatial_size=(64, 64, 64),
+           pos=1, neg=1, num_samples=4,
+       ),
+
+       # MONAI: Standard augmentations (work seamlessly with medrs outputs)
+       RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+       RandGaussianNoised(keys=["image"], prob=0.2, std=0.1),
+       EnsureTyped(keys=["image", "label"]),
+   ])
+
+Available Drop-in Transforms
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+- ``MedrsLoadImage`` / ``MedrsLoadImaged`` - Fast NIfTI loading
+- ``MedrsSaveImage`` / ``MedrsSaveImaged`` - Fast NIfTI saving
+- ``MedrsRandCropByPosNegLabeld`` - Label-aware cropping (up to 40x faster)
+- ``MedrsRandSpatialCropd`` / ``MedrsCenterSpatialCropd`` - Spatial cropping
+- ``MedrsOrientation`` / ``MedrsOrientationd`` - Reorientation
+- ``MedrsResample`` / ``MedrsResampled`` - Resampling
+
 Memory Optimization
 ------------------
 
 Crop-First Loading Strategy
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The most significant performance gain comes from crop-first loading, which reduces memory usage by 40x and improves speed by 200-3500x.
+The most significant performance gain comes from crop-first loading, which reduces memory usage (only patch data is loaded) and improves speed (only reads required bytes from disk).
 
 .. code-block:: python
 
@@ -42,9 +201,9 @@ The most significant performance gain comes from crop-first loading, which reduc
    optimized_patch = crop_first_approach("large_volume.nii.gz", (64, 64, 64))
    optimized_time = time.time() - start_time
 
-   print(f"Traditional: {traditional_time:.3f}s, ~1600MB RAM")
-   print(f"Optimized: {optimized_time:.3f}s, ~40MB RAM")
-   print(f"Speedup: {traditional_time/optimized_time:.1f}x, Memory reduction: 40x")
+   print(f"Traditional: {traditional_time:.3f}s")
+   print(f"Optimized: {optimized_time:.3f}s")
+   print(f"Speedup: {traditional_time/optimized_time:.1f}x")
 
 Memory Pool Management
 ~~~~~~~~~~~~~~~~~~~~~~

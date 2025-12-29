@@ -1,8 +1,8 @@
 """
 Custom exceptions for medrs Python API.
 
-Provides enterprise-grade error handling with specific error types,
-detailed error information, and recovery suggestions.
+Provides specific error types for different failure modes, preserving
+error context from the Rust core for debugging.
 """
 
 from __future__ import annotations
@@ -50,16 +50,22 @@ class LoadError(MedrsError):
         self.path = str(path)
         self.reason = reason
 
+        # Surface the actual error reason prominently
         message = f"Failed to load '{self.path}': {reason}"
-        suggestions = [
-            f"Check if '{self.path}' exists and is readable",
-            "Verify the file is a valid NIfTI format (.nii or .nii.gz)",
-            "Ensure you have sufficient permissions to read the file",
-            "Try running: file command to verify file format"
-        ]
 
-        if "corrupted" in reason.lower():
+        # Only add generic suggestions for generic errors
+        suggestions = []
+        reason_lower = reason.lower()
+
+        if "not exist" in reason_lower or "no such file" in reason_lower:
+            suggestions.append(f"Verify the file path: {self.path}")
+        elif "permission" in reason_lower:
+            suggestions.append("Check file permissions and ownership")
+        elif "invalid" in reason_lower or "magic" in reason_lower:
+            suggestions.append("Verify the file is a valid NIfTI format (.nii or .nii.gz)")
+        elif "corrupted" in reason_lower or "truncated" in reason_lower:
             suggestions.append("The file may be corrupted - try re-downloading or re-creating")
+        # Don't add generic suggestions that obscure the actual error
 
         super().__init__(message, details, suggestions)
 
@@ -206,8 +212,22 @@ class ConfigurationError(MedrsError):
 
 
 # Utility functions for error handling
-def validate_path(path: Union[str, Path], must_exist: bool = True) -> Path:
-    """Validate file path and raise appropriate errors."""
+def validate_path(
+    path: Union[str, Path],
+    must_exist: bool = True,
+    check_extension: bool = True
+) -> Path:
+    """Validate file path and raise appropriate errors.
+
+    Args:
+        path: File path to validate.
+        must_exist: If True, raise LoadError if file doesn't exist.
+                   Set to False for output paths.
+        check_extension: If True, validate NIfTI extension.
+
+    Returns:
+        Validated Path object.
+    """
     path_obj = Path(path)
 
     if must_exist and not path_obj.exists():
@@ -217,12 +237,20 @@ def validate_path(path: Union[str, Path], must_exist: bool = True) -> Path:
             {"absolute_path": str(path_obj.absolute())}
         )
 
-    if path_obj.suffix not in {'.nii', '.nii.gz'}:
-        raise ValidationError(
-            "path",
-            str(path_obj),
-            "NIfTI file (.nii or .nii.gz)"
+    if check_extension:
+        # Handle both .nii and .nii.gz extensions
+        # pathlib.suffix returns only the last extension (.gz for .nii.gz)
+        suffixes = path_obj.suffixes
+        is_valid_nifti = (
+            suffixes == ['.nii'] or  # Plain .nii
+            (len(suffixes) >= 2 and suffixes[-2:] == ['.nii', '.gz'])  # .nii.gz
         )
+        if not is_valid_nifti:
+            raise ValidationError(
+                "path",
+                str(path_obj),
+                "NIfTI file (.nii or .nii.gz)"
+            )
 
     return path_obj
 
