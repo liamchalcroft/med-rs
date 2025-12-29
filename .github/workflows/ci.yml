@@ -72,7 +72,7 @@ jobs:
           pip install pytest numpy nibabel psutil
 
       - name: Run Python tests
-        run: pytest tests/ -v --ignore=tests/test_monai_integration.py
+        run: pytest tests/ -v --ignore=tests/test_monai_integration.py --ignore=tests/test_python_integration.py
 
   # MONAI integration tests (subset of platforms)
   monai-test:
@@ -106,9 +106,9 @@ jobs:
         shell: bash
         run: |
           pip install target/wheels/*.whl
-          pip install numpy nibabel pytest
+          pip install numpy nibabel pytest psutil
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install monai
+          pip install monai jax jaxlib
 
-      - name: Run MONAI integration tests
-        run: pytest tests/test_monai_integration.py -v
+      - name: Run MONAI and Python integration tests
+        run: pytest tests/test_monai_integration.py tests/test_python_integration.py -v
