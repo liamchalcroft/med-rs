@@ -67,6 +67,7 @@ jobs:
         run: maturin build --release --features python
 
       - name: Install medrs
+        shell: bash
         run: pip install target/wheels/*.whl
 
       - name: Install dependencies

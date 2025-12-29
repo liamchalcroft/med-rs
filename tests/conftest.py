@@ -48,12 +48,6 @@ except ImportError:
 try:
     import medrs
     HAS_MEDRS = True
-    medrs_path = Path(medrs.__file__).resolve()
-    if not medrs_path.is_relative_to(ROOT_DIR):
-        raise pytest.UsageError(
-            "medrs import does not resolve to this repo. "
-            "Run `maturin develop --features python` from the repo root."
-        )
 except ImportError:
     HAS_MEDRS = False
 

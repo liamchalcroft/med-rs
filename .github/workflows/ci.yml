@@ -66,6 +66,7 @@ jobs:
         run: maturin build --release --features python
 
       - name: Install medrs and test dependencies
+        shell: bash
         run: |
           pip install target/wheels/*.whl
           pip install pytest numpy nibabel psutil
@@ -102,6 +103,7 @@ jobs:
         run: maturin build --release --features python
 
       - name: Install medrs and MONAI dependencies
+        shell: bash
         run: |
           pip install target/wheels/*.whl
           pip install numpy nibabel pytest
