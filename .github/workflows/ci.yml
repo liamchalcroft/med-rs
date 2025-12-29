@@ -30,11 +30,11 @@ jobs:
       - name: Run cargo fmt
         run: cargo fmt --check
 
-      - name: Run cargo clippy
-        run: cargo clippy --all-features -- -D warnings
+      - name: Run cargo clippy (no Python)
+        run: cargo clippy -- -D warnings
 
-      - name: Run cargo test
-        run: cargo test --all-features
+      - name: Run cargo test (no Python)
+        run: cargo test
 
   # Python tests across versions and platforms
   python-test:
@@ -68,7 +68,7 @@ jobs:
       - name: Install medrs and test dependencies
         run: |
           pip install target/wheels/*.whl
-          pip install pytest numpy nibabel
+          pip install pytest numpy nibabel psutil
 
       - name: Run Python tests
         run: pytest tests/ -v --ignore=tests/test_monai_integration.py
