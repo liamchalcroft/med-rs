@@ -55,9 +55,7 @@ jobs:
           python-version: ${{ matrix.python }}
 
       - name: Install Rust
-        uses: dtolnay/rust-action@stable
-        with:
-          toolchain: stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -73,23 +71,20 @@ jobs:
           pip install numpy torch --index-url https://download.pytorch.org/whl/cpu
           pip install monai
 
-      - name: Run benchmarks
-        id: benchmark
-        run: |
-          ITERATIONS=${{ github.event.inputs.iterations || '30' }}
-          python benchmarks/benchmark_vs_monai.py --iterations $ITERATIONS --output benchmarks/results_${{ matrix.os }}_py${{ matrix.python }}.json
+      - name: Run medrs benchmarks
+        run: python benchmarks/bench_medrs.py --quick
 
-      - name: Run storage benchmarks
-        run: |
-          python benchmarks/benchmark_storage.py --iterations 5 --output benchmarks/storage_${{ matrix.os }}_py${{ matrix.python }}.json
+      - name: Run MONAI benchmarks
+        run: python benchmarks/bench_monai.py --quick
+
+      - name: Generate comparison
+        run: python benchmarks/compare_all.py
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results-${{ matrix.os }}-py${{ matrix.python }}
-          path: |
-            benchmarks/results_*.json
-            benchmarks/storage_*.json
+          path: benchmarks/results/
           retention-days: 90
 
   report:
@@ -127,72 +122,40 @@ jobs:
           report_lines = []
 
           report_lines.append("## Benchmark Results\n")
-          report_lines.append("| Platform | Python | Load | Save | Crop-Load | Resample | Z-Norm | To Torch |")
-          report_lines.append("|----------|--------|------|------|-----------|----------|--------|----------|")
 
-          # Find all result files
-          for f in sorted(results_dir.glob("results_*.json")):
-              try:
-                  with open(f) as fp:
-                      data = json.load(fp)
+          # Load medrs and monai results
+          medrs_path = results_dir / "medrs_results.json"
+          monai_path = results_dir / "monai_results.json"
 
-                  # Extract platform info from filename
-                  name = f.stem.replace("results_", "")
-                  parts = name.rsplit("_py", 1)
-                  platform = parts[0].replace("ubuntu-latest", "Linux").replace("macos-latest", "macOS").replace("windows-latest", "Windows")
-                  python = parts[1] if len(parts) > 1 else "?"
+          if not medrs_path.exists() and not monai_path.exists():
+              report_lines.append("No benchmark results found.")
+          else:
+              medrs_data = json.load(open(medrs_path)) if medrs_path.exists() else None
+              monai_data = json.load(open(monai_path)) if monai_path.exists() else None
 
-                  # Extract speedups
-                  def get_speedup(op_name):
-                      for result in data.get("results", []):
-                          if result.get("operation") == op_name and result.get("size") == 128:
-                              speedup = result.get("speedup")
-                              if speedup:
-                                  return f"{speedup:.1f}x"
-                      return "N/A"
+              report_lines.append("| Operation | Size | medrs (ms) | MONAI (ms) | Speedup |")
+              report_lines.append("|-----------|------|------------|------------|---------|")
 
-                  load_speedup = get_speedup("load")
-                  save_speedup = get_speedup("save")
-                  crop_speedup = get_speedup("load_cropped")
-                  resample_speedup = get_speedup("resample")
-                  znorm_speedup = get_speedup("z_normalize")
-                  torch_speedup = get_speedup("to_torch")
+              if medrs_data and monai_data:
+                  # Index monai results by (op, size)
+                  monai_by_key = {}
+                  for r in monai_data.get("results", []):
+                      key = (r["operation"], tuple(r["size"]))
+                      monai_by_key[key] = r
 
-                  report_lines.append(
-                      f"| {platform} | {python} | {load_speedup} | {save_speedup} | {crop_speedup} | {resample_speedup} | {znorm_speedup} | {torch_speedup} |"
-                  )
-              except Exception as e:
-                  print(f"Error processing {f}: {e}")
+                  for result in medrs_data.get("results", []):
+                      op = result["operation"]
+                      size = tuple(result["size"])
+                      medrs_ms = result["median_ms"]
 
-          report_lines.append("\n### Storage Efficiency\n")
-          report_lines.append("| Platform | dtype | Size (128³) | vs f32 | Read MB/s |")
-          report_lines.append("|----------|-------|-------------|--------|-----------|")
-
-          for f in sorted(results_dir.glob("storage_*.json")):
-              try:
-                  with open(f) as fp:
-                      data = json.load(fp)
-
-                  name = f.stem.replace("storage_", "")
-                  parts = name.rsplit("_py", 1)
-                  platform = parts[0].replace("ubuntu-latest", "Linux").replace("macos-latest", "macOS").replace("windows-latest", "Windows")
-
-                  # Find 128x128x128 results
-                  size_data = data.get("by_size", {}).get("128x128x128", {})
-                  for result in size_data.get("results", [])[:4]:  # First 4 dtypes
-                      if result.get("compressed"):
-                          dtype = result["dtype"]
-                          size_mb = result["file_bytes"] / 1024 / 1024
-                          ratio = result["compression_ratio"]
-                          read_mbps = result["read_throughput_mbps"]
+                      key = (op, size)
+                      if key in monai_by_key:
+                          monai_ms = monai_by_key[key]["median_ms"]
+                          speedup = monai_ms / medrs_ms if medrs_ms > 0 else 0
+                          size_str = f"{size[0]}³"
                           report_lines.append(
-                              f"| {platform} | {dtype} | {size_mb:.1f}MB | {ratio:.0%} | {read_mbps:.0f} |"
+                              f"| {op} | {size_str} | {medrs_ms:.2f} | {monai_ms:.2f} | **{speedup:.0f}x** |"
                           )
-              except Exception as e:
-                  print(f"Error processing {f}: {e}")
-
-          report_lines.append("\n*Speedup = medrs time / MONAI time (higher is better)*")
-          report_lines.append("\n*Storage ratio = file size / raw f32 size (lower is better)*")
 
           report = "\n".join(report_lines)
           print(report)
@@ -200,12 +163,6 @@ jobs:
           # Save report
           with open("benchmark-report.md", "w") as f:
               f.write(report)
-
-          # Set output for PR comment
-          with open(os.environ.get("GITHUB_OUTPUT", "/dev/null"), "a") as f:
-              # Escape newlines for GitHub Actions
-              escaped = report.replace("\n", "%0A").replace("\r", "%0D")
-              f.write(f"report<<EOF\n{report}\nEOF\n")
           EOF
 
       - name: Comment on PR

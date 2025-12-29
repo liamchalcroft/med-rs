@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Rust tests
+  rust-test:
+    name: Rust Tests
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo fmt
+        run: cargo fmt --check
+
+      - name: Run cargo clippy
+        run: cargo clippy --all-features -- -D warnings
+
+      - name: Run cargo test
+        run: cargo test --all-features
+
+  # Python tests across versions and platforms
+  python-test:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build medrs
+        run: maturin develop --release --features python
+
+      - name: Install test dependencies
+        run: pip install pytest numpy nibabel
+
+      - name: Run Python tests
+        run: pytest tests/ -v --ignore=tests/test_monai_integration.py
+
+  # MONAI integration tests (subset of platforms)
+  monai-test:
+    name: MONAI Integration (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build medrs
+        run: maturin develop --release --features python
+
+      - name: Install MONAI dependencies
+        run: |
+          pip install numpy nibabel
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install monai pytest
+
+      - name: Run MONAI integration tests
+        run: pytest tests/test_monai_integration.py -v

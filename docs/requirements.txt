@@ -1,41 +1,15 @@
 # Documentation requirements for ReadTheDocs build
 
-# Core Sphinx and extensions
-sphinx>=5.0.0
-sphinx-book-theme>=1.0.0
+# Core Sphinx
+sphinx>=7.0.0
+sphinx-rtd-theme>=1.3.0
+
+# Extensions
 myst-parser>=2.0.0
 sphinx-copybutton>=0.5.0
 sphinx-tabs>=3.4.0
-sphinx-design>=0.4.0
+sphinx-design>=0.5.0
 sphinx-autodoc-typehints>=1.24.0
 
-# Code highlighting and formatting
-pygments>=2.15.0
-sphinxext-opengraph>=0.8.0
-sphinxext-rediraffe>=2.0.0
-
-# API documentation
-sphinx-autodoc>=6.0.0
-sphinx-napoleon>=5.0.0
-sphinx-intersphinx>=2.0.0
-
-# Testing and coverage
-sphinx-doctest>=1.0.0
-coverage>=7.0.0
-
-# Additional utilities
-sphinxext-autosectionlabel>=0.4.0
-sphinxext-extlinks>=0.3.0
-sphinx-togglebutton>=0.3.0
-linkify-it-py>=2.10.0
-docutils>=0.19.0
-
-# Theme and styling
-beautifulsoup4>=4.11.0
-csscompress>=0.2.0
-html5lib>=1.1
-
-# Build utilities
-jinja2>=3.1.0
-markupsafe>=2.1.0
-pyyaml>=6.0
+# Required for building
+numpy>=1.25.0
