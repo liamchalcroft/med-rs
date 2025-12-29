@@ -11,8 +11,8 @@ build:
   jobs:
     post_install:
       - pip install maturin
-      - maturin build --release --features python
-      - pip install target/wheels/*.whl
+      - maturin build --release --features python -o dist
+      - pip install dist/*.whl
 
 sphinx:
   configuration: docs/conf.py

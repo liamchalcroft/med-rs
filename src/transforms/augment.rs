@@ -302,7 +302,9 @@ fn rotate_90(image: &NiftiImage, axes: (usize, usize), k: usize) -> Result<Nifti
         if s > u16::MAX as usize {
             return Err(Error::InvalidDimensions(format!(
                 "Rotated dimension {} ({}) exceeds maximum value {}",
-                i, s, u16::MAX
+                i,
+                s,
+                u16::MAX
             )));
         }
         header.dim[i] = s as u16;

@@ -638,9 +638,12 @@ impl CropLoader {
         use rand::thread_rng;
 
         // Use saturating_sub to prevent underflow when patch is larger than volume
-        let max_d = (*shape.first().unwrap_or(&1) as usize).saturating_sub(self.config.patch_size[0]);
-        let max_h = (*shape.get(1).unwrap_or(&1) as usize).saturating_sub(self.config.patch_size[1]);
-        let max_w = (*shape.get(2).unwrap_or(&1) as usize).saturating_sub(self.config.patch_size[2]);
+        let max_d =
+            (*shape.first().unwrap_or(&1) as usize).saturating_sub(self.config.patch_size[0]);
+        let max_h =
+            (*shape.get(1).unwrap_or(&1) as usize).saturating_sub(self.config.patch_size[1]);
+        let max_w =
+            (*shape.get(2).unwrap_or(&1) as usize).saturating_sub(self.config.patch_size[2]);
 
         let mut rng = thread_rng();
         let mut positions = Vec::new();

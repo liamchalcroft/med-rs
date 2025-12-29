@@ -125,7 +125,9 @@ pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiIm
         if s > u16::MAX as usize {
             return Err(Error::InvalidDimensions(format!(
                 "Target shape dimension {} ({}) exceeds maximum value {}",
-                i, s, u16::MAX
+                i,
+                s,
+                u16::MAX
             )));
         }
         header.dim[i] = s as u16;

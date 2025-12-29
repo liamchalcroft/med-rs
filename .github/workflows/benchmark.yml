@@ -63,8 +63,11 @@ jobs:
       - name: Install maturin
         run: pip install maturin
 
-      - name: Build medrs
-        run: maturin develop --release --features python
+      - name: Build medrs wheel
+        run: maturin build --release --features python
+
+      - name: Install medrs
+        run: pip install target/wheels/*.whl
 
       - name: Install dependencies
         run: |

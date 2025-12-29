@@ -62,11 +62,13 @@ jobs:
       - name: Install maturin
         run: pip install maturin
 
-      - name: Build medrs
-        run: maturin develop --release --features python
+      - name: Build medrs wheel
+        run: maturin build --release --features python
 
-      - name: Install test dependencies
-        run: pip install pytest numpy nibabel
+      - name: Install medrs and test dependencies
+        run: |
+          pip install target/wheels/*.whl
+          pip install pytest numpy nibabel
 
       - name: Run Python tests
         run: pytest tests/ -v --ignore=tests/test_monai_integration.py
@@ -96,14 +98,15 @@ jobs:
       - name: Install maturin
         run: pip install maturin
 
-      - name: Build medrs
-        run: maturin develop --release --features python
+      - name: Build medrs wheel
+        run: maturin build --release --features python
 
-      - name: Install MONAI dependencies
+      - name: Install medrs and MONAI dependencies
         run: |
-          pip install numpy nibabel
+          pip install target/wheels/*.whl
+          pip install numpy nibabel pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install monai pytest
+          pip install monai
 
       - name: Run MONAI integration tests
         run: pytest tests/test_monai_integration.py -v
