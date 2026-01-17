@@ -29,7 +29,7 @@ def main():
     loader = medrs.create_metatensor_loader(
         device="cuda" if torch.cuda.is_available() else "cpu",
         dtype=torch.float32,
-        preserve_metadata=True
+        preserve_metadata=True,
     )
 
     print(f"   Device: {'CUDA' if torch.cuda.is_available() else 'CPU'}")
@@ -54,7 +54,7 @@ def main():
         "t1": "subject001_t1.nii.gz",
         "t2": "subject001_t2.nii.gz",
         "flair": "subject001_flair.nii.gz",
-        "segmentation": "subject001_seg.nii.gz"
+        "segmentation": "subject001_seg.nii.gz",
     }
 
     # Create MetaTensor crop transform
@@ -62,11 +62,10 @@ def main():
         keys=["t1", "t2", "flair", "segmentation"],
         crop_size=(96, 96, 96),
         spatial_normalizer=medrs.SpatialNormalizer(
-            target_spacing=(1.0, 1.0, 1.0),
-            target_orientation="RAS"
+            target_spacing=(1.0, 1.0, 1.0), target_orientation="RAS"
         ),
         device="cuda" if torch.cuda.is_available() else "cpu",
-        preserve_metadata=True
+        preserve_metadata=True,
     )
 
     print(f"   Input: {len(multi_modal_data)} modalities")
@@ -82,19 +81,20 @@ def main():
             keys=["image", "label"],
             crop_size=(128, 128, 128),
             spatial_normalizer=medrs.SpatialNormalizer(
-                target_spacing=(0.75, 0.75, 0.75),
-                target_orientation="RAS"
+                target_spacing=(0.75, 0.75, 0.75), target_orientation="RAS"
             ),
             device="cuda" if torch.cuda.is_available() else "cpu",
-            preserve_metadata=True
+            preserve_metadata=True,
         )
     )
 
     # Complete pipeline
-    complete_pipeline = Compose([
-        metatensor_transform,                 # Load as MetaTensors
-        EnsureChannelFirst(keys=["image", "label"]),  # Add channel dim
-    ])
+    complete_pipeline = Compose(
+        [
+            metatensor_transform,  # Load as MetaTensors
+            EnsureChannelFirst(keys=["image", "label"]),  # Add channel dim
+        ]
+    )
 
     print("   Pipeline: MetaTensor loading + MONAI transforms")
     print("   Benefits:")

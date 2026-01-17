@@ -293,13 +293,14 @@ pub fn reorient(image: &NiftiImage, target: Orientation) -> Result<NiftiImage, E
     header.datatype = DataType::Float32;
     header.scl_slope = 1.0;
     header.scl_inter = 0.0;
-    header.dim = [1u16; 7];
+    header.dim = [1i64; 7];
     for (i, &d) in new_shape.iter().enumerate() {
-        header.dim[i] = d as u16;
+        header.dim[i] = d as i64;
     }
-    header.pixdim = [1.0f32; 8];
+    header.pixdim = [1.0f64; 8];
+    let spacing = image.spacing();
     for i in 0..3 {
-        header.pixdim[i + 1] = image.spacing()[perm[i]];
+        header.pixdim[i + 1] = spacing[perm[i]] as f64;
     }
     header.set_affine(new_affine);
 
@@ -330,15 +331,22 @@ fn permute_axes(
     let (nd, nh, nw) = (new_shape[0], new_shape[1], new_shape[2]);
     let old_strides = [old_shape[1] * old_shape[2], old_shape[2], 1];
 
+    let inv_perm = {
+        let mut inv = [0usize; 3];
+        for (i, &p) in perm.iter().enumerate() {
+            inv[p] = i;
+        }
+        inv
+    };
+
     for d in 0..nd {
         for h in 0..nh {
             for w in 0..nw {
                 let new_coords = [d, h, w];
-                // perm is a permutation of [0,1,2], so position() always succeeds
                 let old_coords = [
-                    new_coords[perm.iter().position(|&p| p == 0).expect("perm contains 0")],
-                    new_coords[perm.iter().position(|&p| p == 1).expect("perm contains 1")],
-                    new_coords[perm.iter().position(|&p| p == 2).expect("perm contains 2")],
+                    new_coords[inv_perm[0]],
+                    new_coords[inv_perm[1]],
+                    new_coords[inv_perm[2]],
                 ];
 
                 let old_idx = old_coords[0] * old_strides[0]

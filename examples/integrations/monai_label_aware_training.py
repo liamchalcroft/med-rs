@@ -16,7 +16,7 @@ from monai.transforms import (
     ScaleIntensityd,
     RandFlipd,
     RandRotated,
-    ToTensord
+    ToTensord,
 )
 
 import medrs
@@ -37,7 +37,7 @@ class MedrsLabelAwareCropd:
         pos_neg_ratio: float = 1.0,
         background_label: float = 0.0,
         device: Optional[str] = None,
-        dtype: str = "float32"
+        dtype: str = "float32",
     ):
         self.keys = keys
         self.patch_size = patch_size
@@ -59,7 +59,7 @@ class MedrsLabelAwareCropd:
                         data[key],
                         output_shape=self.patch_size,
                         device=self.device,
-                        dtype=self.dtype
+                        dtype=self.dtype,
                     )
                 elif key.endswith("_label"):
                     # Load label with same crop for alignment
@@ -67,7 +67,7 @@ class MedrsLabelAwareCropd:
                         data[key],
                         output_shape=self.patch_size,
                         device="cpu",  # Keep labels on CPU for processing
-                        dtype=torch.long
+                        dtype=torch.long,
                     )
 
         return result
@@ -81,19 +81,21 @@ def create_training_pipeline():
         keys=["image", "label"],
         patch_size=(96, 96, 96),
         pos_neg_ratio=2.0,
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
     # Complete MONAI pipeline
-    train_transforms = Compose([
-        medrs_transform,                        # High-performance crop-first loading
-        EnsureChannelFirstd(keys=["image", "label"]),  # Add channel dimension
-        CastToTyped(keys=["image", "label"], dtype=("float32", "long")),  # Proper dtypes
-        ScaleIntensityd(keys=["image"]),       # Intensity normalization
-        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),     # Augmentation
-        RandRotated(keys=["image", "label"], range_x=0.1, prob=0.3),      # Augmentation
-        ToTensord(keys=["image", "label"])     # Convert to tensors
-    ])
+    train_transforms = Compose(
+        [
+            medrs_transform,  # High-performance crop-first loading
+            EnsureChannelFirstd(keys=["image", "label"]),  # Add channel dimension
+            CastToTyped(keys=["image", "label"], dtype=("float32", "long")),  # Proper dtypes
+            ScaleIntensityd(keys=["image"]),  # Intensity normalization
+            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),  # Augmentation
+            RandRotated(keys=["image", "label"], range_x=0.1, prob=0.3),  # Augmentation
+            ToTensord(keys=["image", "label"]),  # Convert to tensors
+        ]
+    )
 
     return train_transforms
 
@@ -102,10 +104,7 @@ def example_usage():
     """Demonstrate usage with sample data."""
 
     # Sample data paths
-    data_dict = {
-        "image": "patient_T1.nii.gz",
-        "label": "patient_seg.nii.gz"
-    }
+    data_dict = {"image": "patient_T1.nii.gz", "label": "patient_seg.nii.gz"}
 
     # Create transform
     transform = create_training_pipeline()

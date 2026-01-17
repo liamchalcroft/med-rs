@@ -31,29 +31,82 @@ AffineArray = list[list[float]]
 Shape3D = tuple[int, int, int] | list[int] | Sequence[int]
 Spacing3D = tuple[float, float, float] | list[float] | Sequence[float]
 DType = Literal[
-    "float32", "f32",
-    "float64", "f64",
-    "float16", "f16",
-    "bfloat16", "bf16",
-    "int8", "i8",
-    "uint8", "u8",
-    "int16", "i16",
-    "uint16", "u16",
-    "int32", "i32",
-    "uint32", "u32",
-    "int64", "i64",
-    "uint64", "u64",
+    "float32",
+    "f32",
+    "float64",
+    "f64",
+    "float16",
+    "f16",
+    "bfloat16",
+    "bf16",
+    "int8",
+    "i8",
+    "uint8",
+    "u8",
+    "int16",
+    "i16",
+    "uint16",
+    "u16",
+    "int32",
+    "i32",
+    "uint32",
+    "u32",
+    "int64",
+    "i64",
+    "uint64",
+    "u64",
 ]
 Orientation = Literal[
-    "RAS", "LAS", "RPS", "LPS", "RSA", "LSA", "RPA", "LPA",
-    "ARS", "ALS", "PRS", "PLS", "ASR", "ASL", "PSR", "PSL",
-    "SAR", "SAL", "SPR", "SPL", "IAR", "IAL", "IPR", "IPL",
-    "SRA", "SLA", "IRA", "ILA", "SRP", "SLP", "IRP", "ILP",
-    "RAI", "LAI", "RPI", "LPI", "RSI", "LSI", "RII", "LII",
-    "ARI", "ALI", "PRI", "PLI", "ASI", "ALI", "PSI", "PLI",
+    "RAS",
+    "LAS",
+    "RPS",
+    "LPS",
+    "RSA",
+    "LSA",
+    "RPA",
+    "LPA",
+    "ARS",
+    "ALS",
+    "PRS",
+    "PLS",
+    "ASR",
+    "ASL",
+    "PSR",
+    "PSL",
+    "SAR",
+    "SAL",
+    "SPR",
+    "SPL",
+    "IAR",
+    "IAL",
+    "IPR",
+    "IPL",
+    "SRA",
+    "SLA",
+    "IRA",
+    "ILA",
+    "SRP",
+    "SLP",
+    "IRP",
+    "ILP",
+    "RAI",
+    "LAI",
+    "RPI",
+    "LPI",
+    "RSI",
+    "LSI",
+    "RII",
+    "LII",
+    "ARI",
+    "ALI",
+    "PRI",
+    "PLI",
+    "ASI",
+    "ALI",
+    "PSI",
+    "PLI",
 ]
 InterpolationMethod = Literal["trilinear", "linear", "nearest"]
-
 
 class NiftiImage:
     """A NIfTI medical image with header metadata and voxel data.
@@ -84,29 +137,6 @@ class NiftiImage:
         Args:
             data: Numpy array with at least 3 dimensions (D, H, W)
             affine: Optional 4x4 affine transformation matrix
-        """
-        ...
-
-    @staticmethod
-    def from_numpy(
-        data: npt.NDArray[np.float32],
-        affine: Optional[AffineArray] = None,
-    ) -> "NiftiImage":
-        """Create a NIfTI image from a numpy array.
-
-        This is a convenience factory method equivalent to the constructor.
-
-        Args:
-            data: Numpy array with at least 3 dimensions (D, H, W)
-            affine: Optional 4x4 affine transformation matrix
-
-        Returns:
-            New NiftiImage instance
-
-        Example:
-            >>> import numpy as np
-            >>> data = np.random.rand(64, 64, 32).astype(np.float32)
-            >>> img = NiftiImage.from_numpy(data)
         """
         ...
 
@@ -152,23 +182,58 @@ class NiftiImage:
         ...
 
     # Data conversion methods
-    def to_numpy(self) -> npt.NDArray[np.float32]:
+    def to_numpy(self, copy: bool = True) -> npt.NDArray[np.float32]:
         """Get image data as float32 numpy array.
 
         Similar to nibabel's get_fdata(). Applies scaling factors if present.
 
+        Args:
+            copy: If True (default), always returns a copy of the data.
+                  If False, attempts zero-copy access and raises ValueError
+                  if zero-copy is not possible.
+
+        Zero-copy is possible when:
+        - Data is from an uncompressed .nii file (mmap-backed)
+        - Data type is float32
+        - Native endianness (little-endian on x86/ARM)
+        - No scaling required (slope=1 or 0, intercept=0)
+        - Memory is properly aligned
+
         Returns:
             Numpy array with shape matching self.shape
+
+        Raises:
+            ValueError: If copy=False and zero-copy is not possible
+
+        Example:
+            >>> # Standard copy (always works)
+            >>> arr = img.to_numpy()
+            >>>
+            >>> # Zero-copy (fails if not possible)
+            >>> if img.can_zero_copy():
+            ...     arr = img.to_numpy(copy=False)  # True zero-copy!
         """
         ...
 
-    def to_numpy_view(self) -> npt.NDArray[np.float32]:
-        """Get image data as numpy view when possible.
+    def can_zero_copy(self) -> bool:
+        """Check if zero-copy numpy access is possible.
 
-        Attempts zero-copy access; falls back to copy if not contiguous.
+        Returns True if to_numpy(copy=False) would succeed.
+
+        Zero-copy is possible when:
+        - Data is from an uncompressed .nii file (mmap-backed)
+        - Data type is float32
+        - Native endianness
+        - No scaling required (slope=1 or 0, intercept=0)
 
         Returns:
-            Numpy array (view or copy)
+            True if zero-copy access is possible
+
+        Example:
+            >>> if img.can_zero_copy():
+            ...     arr = img.to_numpy(copy=False)  # No memory copy!
+            ... else:
+            ...     arr = img.to_numpy()  # Standard copy
         """
         ...
 
@@ -396,10 +461,8 @@ class NiftiImage:
 
     def __repr__(self) -> str: ...
 
-
 # Alias for MedicalImage
 MedicalImage = NiftiImage
-
 
 class TrainingDataLoader:
     """High-performance training data loader with prefetching and caching.
@@ -464,6 +527,54 @@ class TrainingDataLoader:
     def __iter__(self) -> Iterator[NiftiImage]: ...
     def __next__(self) -> NiftiImage: ...
 
+class FastLoader:
+    """Ultra-fast parallel prefetching loader for training on large .nii.gz datasets.
+
+    Uses a worker pool to decompress and extract random crops in parallel.
+    Designed for maximum throughput when training on 100k+ gzipped files.
+
+    Example:
+        >>> loader = medrs.FastLoader(
+        ...     volumes=glob.glob("data/*.nii.gz"),
+        ...     patch_shape=[64, 64, 64],
+        ...     prefetch=16,
+        ...     workers=4
+        ... )
+        >>> for patch in loader:
+        ...     tensor = patch.to_torch()
+    """
+
+    def __init__(
+        self,
+        volumes: list[str],
+        patch_shape: Shape3D,
+        prefetch: int = 16,
+        workers: Optional[int] = None,
+        shuffle: bool = True,
+        seed: Optional[int] = None,
+        mgzip_threads: int = 0,
+    ) -> None:
+        """Create a fast loader.
+
+        Args:
+            volumes: List of NIfTI file paths (.nii.gz)
+            patch_shape: Shape of random crop to extract [d, h, w]
+            prefetch: Number of samples to prefetch (default: 16)
+            workers: Number of worker threads (default: num_cpus)
+            shuffle: Shuffle file order (default: True)
+            seed: Random seed for reproducibility
+            mgzip_threads: Threads for Mgzip parallel decompression per file (0 = disabled)
+        """
+        ...
+
+    @property
+    def patch_shape(self) -> Shape3D:
+        """Shape of patches being extracted."""
+        ...
+
+    def __len__(self) -> int: ...
+    def __iter__(self) -> Iterator[NiftiImage]: ...
+    def __next__(self) -> NiftiImage: ...
 
 class TransformPipeline:
     """Composable transform pipeline with lazy evaluation.
@@ -520,7 +631,6 @@ class TransformPipeline:
 
     def __repr__(self) -> str: ...
 
-
 # I/O Functions
 
 def load(path: str) -> NiftiImage:
@@ -539,6 +649,140 @@ def load(path: str) -> NiftiImage:
     """
     ...
 
+def load_cached(path: str) -> NiftiImage:
+    """Load a NIfTI image with caching for repeated access.
+
+    For gzipped files, this caches the decompressed data so subsequent
+    loads of the same file are nearly instant (pseudo-zero-copy). For
+    uncompressed files, this behaves identically to `load()`.
+
+    Particularly useful in training pipelines where the same volume
+    may be accessed multiple times across epochs.
+
+    Args:
+        path: Path to the NIfTI file
+
+    Returns:
+        NiftiImage instance
+
+    Example:
+        >>> # First load decompresses and caches
+        >>> img1 = medrs.load_cached("brain.nii.gz")
+        >>> # Second load returns cached data (very fast)
+        >>> img2 = medrs.load_cached("brain.nii.gz")
+        >>> # Clear cache when done
+        >>> medrs.clear_decompression_cache()
+    """
+    ...
+
+def clear_decompression_cache() -> None:
+    """Clear the global decompression cache.
+
+    Call this to free memory used by cached decompressed files
+    from `load_cached()` calls.
+
+    Example:
+        >>> medrs.clear_decompression_cache()
+    """
+    ...
+
+def set_cache_size(max_entries: int) -> None:
+    """Set the maximum size of the decompression cache.
+
+    Default is 10 entries. Set to 0 to disable caching.
+
+    Args:
+        max_entries: Maximum number of files to cache
+
+    Example:
+        >>> medrs.set_cache_size(20)  # Cache up to 20 files
+        >>> medrs.set_cache_size(0)   # Disable caching
+    """
+    ...
+
+# File configuration for load_multi
+FileConfig = dict[str, Any]  # {'path': str, 'is_label': bool, 'key': Optional[str]}
+
+def load_multi(
+    files: list[FileConfig],
+    target_spacing: Optional[Spacing3D] = None,
+    crop_start: Optional[Shape3D] = None,
+    crop_size: Optional[Shape3D] = None,
+    reference_index: int = 0,
+    use_cache: bool = True,
+) -> list[NiftiImage]:
+    """Load multiple related files in parallel with spatial alignment.
+
+    This is the main entry point for loading related medical images (e.g., MRI, CT,
+    segmentation) that need to be processed together with consistent spatial operations.
+
+    All files are:
+    1. Loaded in parallel using multiple threads
+    2. Resampled to a common voxel spacing
+    3. Cropped to the same region (if specified)
+
+    Labels/segmentations use nearest-neighbor interpolation to preserve discrete values.
+
+    Args:
+        files: List of file configurations, each containing:
+            - 'path': Path to the NIfTI file
+            - 'is_label': Whether this is a label/segmentation (uses nearest-neighbor)
+            - 'key': Optional name/key for this file
+        target_spacing: Target voxel spacing [x, y, z] (uses reference if not provided)
+        crop_start: Crop region start [d, h, w] (optional)
+        crop_size: Crop region size [d, h, w] (optional)
+        reference_index: Index of reference file for spatial alignment (default: 0)
+        use_cache: Whether to use caching for gzipped files (default: true)
+
+    Returns:
+        List of NiftiImage instances in the same order as input files
+
+    Example:
+        >>> files = [
+        ...     {'path': 'mri.nii.gz', 'is_label': False, 'key': 'mri'},
+        ...     {'path': 'ct.nii.gz', 'is_label': False, 'key': 'ct'},
+        ...     {'path': 'seg.nii.gz', 'is_label': True, 'key': 'label'},
+        ... ]
+        >>> images = medrs.load_multi(
+        ...     files,
+        ...     target_spacing=[1.0, 1.0, 1.0],
+        ...     crop_start=[32, 32, 32],
+        ...     crop_size=[64, 64, 64]
+        ... )
+    """
+    ...
+
+def load_image_label_pair(
+    image_path: str,
+    label_path: str,
+    target_spacing: Optional[Spacing3D] = None,
+    crop_start: Optional[Shape3D] = None,
+    crop_size: Optional[Shape3D] = None,
+) -> tuple[NiftiImage, NiftiImage]:
+    """Load an image and label pair with coordinated spatial processing.
+
+    Convenience function for loading one image with its corresponding segmentation.
+
+    Args:
+        image_path: Path to the image file
+        label_path: Path to the label/segmentation file
+        target_spacing: Target voxel spacing [x, y, z] (optional)
+        crop_start: Crop region start [d, h, w] (optional)
+        crop_size: Crop region size [d, h, w] (optional)
+
+    Returns:
+        Tuple of (image, label) NiftiImage instances
+
+    Example:
+        >>> image, label = medrs.load_image_label_pair(
+        ...     "mri.nii.gz",
+        ...     "segmentation.nii.gz",
+        ...     target_spacing=[1.0, 1.0, 1.0],
+        ...     crop_start=[32, 32, 32],
+        ...     crop_size=[64, 64, 64]
+        ... )
+    """
+    ...
 
 def load_to_torch(
     path: str,
@@ -564,7 +808,6 @@ def load_to_torch(
     """
     ...
 
-
 def load_cropped(
     path: str,
     crop_offset: Shape3D,
@@ -588,7 +831,6 @@ def load_cropped(
     """
     ...
 
-
 def load_resampled(
     path: str,
     output_shape: Shape3D,
@@ -611,7 +853,6 @@ def load_resampled(
         NiftiImage with processed data
     """
     ...
-
 
 def load_cropped_to_torch(
     path: str,
@@ -649,7 +890,6 @@ def load_cropped_to_torch(
     """
     ...
 
-
 def load_cropped_to_jax(
     path: str,
     output_shape: Shape3D,
@@ -675,13 +915,11 @@ def load_cropped_to_jax(
     """
     ...
 
-
 # Transform functions
 
 def z_normalization(image: NiftiImage) -> NiftiImage:
     """Z-score normalize an image (zero mean, unit variance)."""
     ...
-
 
 def rescale_intensity(
     image: NiftiImage,
@@ -690,16 +928,13 @@ def rescale_intensity(
     """Rescale intensity to the provided range."""
     ...
 
-
 def clamp(image: NiftiImage, min_value: float, max_value: float) -> NiftiImage:
     """Clamp intensity values into a fixed range."""
     ...
 
-
 def crop_or_pad(image: NiftiImage, target_shape: Shape3D) -> NiftiImage:
     """Crop or pad an image to the target shape."""
     ...
-
 
 def resample(
     image: NiftiImage,
@@ -709,11 +944,9 @@ def resample(
     """Resample to target voxel spacing."""
     ...
 
-
 def reorient(image: NiftiImage, orientation: Orientation) -> NiftiImage:
     """Reorient an image to the target orientation code."""
     ...
-
 
 # Random augmentation functions
 
@@ -736,7 +969,6 @@ def random_flip(
     """
     ...
 
-
 def random_gaussian_noise(
     image: NiftiImage,
     std: Optional[float] = None,
@@ -753,7 +985,6 @@ def random_gaussian_noise(
         Augmented image
     """
     ...
-
 
 def random_intensity_scale(
     image: NiftiImage,
@@ -774,7 +1005,6 @@ def random_intensity_scale(
     """
     ...
 
-
 def random_intensity_shift(
     image: NiftiImage,
     shift_range: Optional[float] = None,
@@ -794,7 +1024,6 @@ def random_intensity_shift(
     """
     ...
 
-
 def random_rotate_90(
     image: NiftiImage,
     axes: tuple[int, int],
@@ -811,7 +1040,6 @@ def random_rotate_90(
         Augmented image
     """
     ...
-
 
 def random_gamma(
     image: NiftiImage,
@@ -832,7 +1060,6 @@ def random_gamma(
     """
     ...
 
-
 def random_augment(
     image: NiftiImage,
     seed: Optional[int] = None,
@@ -849,7 +1076,6 @@ def random_augment(
         Augmented image
     """
     ...
-
 
 # Crop region functions
 
@@ -878,7 +1104,6 @@ def load_label_aware_cropped(
     """
     ...
 
-
 def compute_crop_regions(
     image_path: str,
     label_path: str,
@@ -906,7 +1131,6 @@ def compute_crop_regions(
     """
     ...
 
-
 def compute_random_spatial_crops(
     image_path: str,
     patch_size: Shape3D,
@@ -930,7 +1154,6 @@ def compute_random_spatial_crops(
     """
     ...
 
-
 def compute_center_crop(
     image_path: str,
     patch_size: Shape3D,
@@ -945,5 +1168,90 @@ def compute_center_crop(
 
     Returns:
         Crop region dict with 'start', 'end', 'size'
+    """
+    ...
+
+# Mgzip functions for parallel compression/decompression
+
+def save_mgzip(
+    image: NiftiImage,
+    path: str,
+    num_threads: int = 0,
+) -> None:
+    """Save a NIfTI image in Mgzip format for parallel decompression.
+
+    Mgzip (multi-member gzip) stores data in independent blocks that can be
+    decompressed in parallel, providing 3-5x speedup on multi-core systems.
+
+    Args:
+        image: NiftiImage to save
+        path: Output file path (typically .nii.mgz or .mgz.nii.gz)
+        num_threads: Number of compression threads (0 = auto-detect)
+
+    Example:
+        >>> img = medrs.load("brain.nii.gz")
+        >>> medrs.save_mgzip(img, "brain.mgz.nii.gz", num_threads=8)
+    """
+    ...
+
+def load_mgzip(
+    path: str,
+    num_threads: int = 0,
+) -> NiftiImage:
+    """Load a NIfTI image from Mgzip format with parallel decompression.
+
+    Provides 3-5x faster loading compared to standard gzip on multi-core systems.
+    The file should have been created with `save_mgzip()` for best performance.
+
+    Args:
+        path: Path to the Mgzip file
+        num_threads: Number of decompression threads (0 = auto-detect)
+
+    Returns:
+        NiftiImage instance
+
+    Example:
+        >>> img = medrs.load_mgzip("brain.mgz.nii.gz", num_threads=8)
+    """
+    ...
+
+def convert_to_mgzip(
+    input_path: str,
+    output_path: Optional[str] = None,
+    num_threads: int = 0,
+) -> str:
+    """Convert a standard gzip NIfTI file to Mgzip format.
+
+    Reads an existing .nii.gz file and saves it as Mgzip for faster future loading.
+    The original file is not modified.
+
+    Args:
+        input_path: Path to input .nii.gz file
+        output_path: Path for output file (None = auto-generate from input)
+        num_threads: Number of compression threads (0 = auto-detect)
+
+    Returns:
+        Path to the output file
+
+    Example:
+        >>> medrs.convert_to_mgzip("brain.nii.gz")  # Creates brain.nii.mgz
+        >>> medrs.convert_to_mgzip("brain.nii.gz", "output/brain.mgz.nii.gz")
+    """
+    ...
+
+def is_mgzip(path: str) -> bool:
+    """Check if a file appears to be in Mgzip (multi-member gzip) format.
+
+    Performs a quick heuristic check by looking for multiple gzip member signatures.
+
+    Args:
+        path: Path to the file to check
+
+    Returns:
+        True if file appears to be Mgzip format
+
+    Example:
+        >>> if medrs.is_mgzip("brain.nii.gz"):
+        ...     img = medrs.load_mgzip("brain.nii.gz")
     """
     ...

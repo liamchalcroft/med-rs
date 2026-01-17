@@ -23,15 +23,13 @@ def main():
     # Example 1: Spatial Normalization
     print("1. Spatial Normalization")
     data_dict = {
-        "t1": "subject001_t1.nii.gz",      # 1mm isotropic, RAS
-        "t2": "subject001_t2.nii.gz",      # 1.2x1.0x3.0mm, LAS
-        "flair": "subject001_flair.nii.gz", # 0.8x0.8x5.0mm, RAS
+        "t1": "subject001_t1.nii.gz",  # 1mm isotropic, RAS
+        "t2": "subject001_t2.nii.gz",  # 1.2x1.0x3.0mm, LAS
+        "flair": "subject001_flair.nii.gz",  # 0.8x0.8x5.0mm, RAS
     }
 
     normalizer = medrs.SpatialNormalizer(
-        target_spacing=(1.0, 1.0, 1.0),
-        target_orientation="RAS",
-        reference_key="t1"
+        target_spacing=(1.0, 1.0, 1.0), target_orientation="RAS", reference_key="t1"
     )
 
     print(f"   Input modalities: {list(data_dict.keys())}")
@@ -45,7 +43,7 @@ def main():
         crop_size=(96, 96, 96),
         reference_key="t1",
         spatial_normalizer=normalizer,
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
     print("   Crop size: 96x96x96")
@@ -58,18 +56,19 @@ def main():
             keys=["image", "label"],
             crop_size=(96, 96, 96),
             spatial_normalizer=medrs.SpatialNormalizer(
-                target_spacing=(1.0, 1.0, 1.0),
-                target_orientation="RAS"
+                target_spacing=(1.0, 1.0, 1.0), target_orientation="RAS"
             ),
-            device="cuda" if torch.cuda.is_available() else "cpu"
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
     )
 
     # Complete MONAI pipeline
-    transform_pipeline = Compose([
-        medrs_transform,                    # High-performance loading
-        EnsureChannelFirst(keys=["image", "label"]),  # Add channel dim
-    ])
+    transform_pipeline = Compose(
+        [
+            medrs_transform,  # High-performance loading
+            EnsureChannelFirst(keys=["image", "label"]),  # Add channel dim
+        ]
+    )
 
     print("   Pipeline: medrs loading + MONAI transforms")
     print("   Benefits: Reduced memory + faster I/O")

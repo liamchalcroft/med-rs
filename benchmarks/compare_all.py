@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Compare benchmark results across medrs, MONAI, and TorchIO.
+Compare benchmark results across all medical imaging libraries.
 
 Run individual benchmarks first:
   python benchmarks/bench_medrs.py
+  python benchmarks/bench_nibabel.py
   python benchmarks/bench_monai.py
   python benchmarks/bench_torchio.py
+  python benchmarks/bench_simpleitk.py
 
 Then compare:
   python benchmarks/compare_all.py
@@ -32,7 +34,7 @@ def format_speedup(ratio: float) -> str:
     if ratio >= 1.0:
         return f"\033[32m{ratio:.2f}x faster\033[0m"  # Green
     else:
-        return f"\033[31m{1/ratio:.2f}x slower\033[0m"  # Red
+        return f"\033[31m{1 / ratio:.2f}x slower\033[0m"  # Red
 
 
 def compare_libraries(results: Dict[str, Dict]) -> None:
@@ -150,8 +152,11 @@ def run_all_benchmarks(quick: bool = False, full: bool = False) -> None:
 
     scripts = [
         "bench_medrs.py",
+        "bench_nibabel.py",
         "bench_monai.py",
         "bench_torchio.py",
+        "bench_simpleitk.py",
+        "bench_mgzip.py",
     ]
 
     args = []
@@ -186,14 +191,14 @@ def run_all_benchmarks(quick: bool = False, full: bool = False) -> None:
 
 def main():
     parser = argparse.ArgumentParser(description="Compare benchmark results")
-    parser.add_argument("--run", action="store_true",
-                        help="Run all benchmarks before comparing")
-    parser.add_argument("--quick", action="store_true",
-                        help="Use quick benchmark config (with --run)")
-    parser.add_argument("--full", action="store_true",
-                        help="Use full benchmark config (with --run)")
-    parser.add_argument("--results-dir", "-d", type=str,
-                        help="Directory containing result files")
+    parser.add_argument("--run", action="store_true", help="Run all benchmarks before comparing")
+    parser.add_argument(
+        "--quick", action="store_true", help="Use quick benchmark config (with --run)"
+    )
+    parser.add_argument(
+        "--full", action="store_true", help="Use full benchmark config (with --run)"
+    )
+    parser.add_argument("--results-dir", "-d", type=str, help="Directory containing result files")
     args = parser.parse_args()
 
     # Optionally run benchmarks first
@@ -205,8 +210,10 @@ def main():
 
     result_files = {
         "medrs": results_dir / "medrs_results.json",
+        "nibabel": results_dir / "nibabel_results.json",
         "monai": results_dir / "monai_results.json",
         "torchio": results_dir / "torchio_results.json",
+        "simpleitk": results_dir / "simpleitk_results.json",
     }
 
     results = {}
@@ -215,14 +222,14 @@ def main():
         if data:
             results[lib] = data
             print(f"Loaded {lib} results from {path}")
-        else:
-            print(f"No results found for {lib} at {path}")
 
     if not results:
         print("\nNo results files found. Run benchmarks first:")
         print("  python benchmarks/bench_medrs.py")
+        print("  python benchmarks/bench_nibabel.py")
         print("  python benchmarks/bench_monai.py")
         print("  python benchmarks/bench_torchio.py")
+        print("  python benchmarks/bench_simpleitk.py")
         print("\nOr use --run to run all benchmarks:")
         print("  python benchmarks/compare_all.py --run")
         return

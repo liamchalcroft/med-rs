@@ -29,9 +29,7 @@ def demonstrate_jax_loading():
 
         # Load directly to JAX array
         jax_array = medrs.load_cropped_to_jax(
-            volume_path,
-            output_shape=[64, 64, 64],
-            dtype=jnp.float32
+            volume_path, output_shape=[64, 64, 64], dtype=jnp.float32
         )
 
         load_time = time.time() - start_time
@@ -54,7 +52,7 @@ def demonstrate_jax_loading():
             normalized[jnp.newaxis, jnp.newaxis, ...],
             kernel[jnp.newaxis, jnp.newaxis, ...],
             window_strides=[1, 1, 1],
-            padding='SAME'
+            padding="SAME",
         ).squeeze()
 
         jax_time = time.time() - start_time
@@ -76,7 +74,7 @@ def demonstrate_jax_loading():
                 normalized[jnp.newaxis, jnp.newaxis, ...],
                 sobel_x[jnp.newaxis, jnp.newaxis, jnp.newaxis, :],
                 window_strides=[1, 1, 1],
-                padding='SAME'
+                padding="SAME",
             ).squeeze()
             return jnp.abs(edges)
 
@@ -110,7 +108,7 @@ def demonstrate_jax_loading():
 
         print(f"    Batch shape: {batch_array.shape}")
         print(f"     Batch load time: {batch_time:.4f}s")
-        print(f"    Average per volume: {batch_time/5:.4f}s")
+        print(f"    Average per volume: {batch_time / 5:.4f}s")
 
         # Performance comparison
         print("\n5. Performance Comparison:")
@@ -123,7 +121,7 @@ def demonstrate_jax_loading():
 
         print(f"    NumPy normalization: {numpy_time:.6f}s")
         print(f"    JAX normalization: {jax_time:.6f}s")
-        print(f"    JAX speedup: {numpy_time/jax_time:.1f}x")
+        print(f"    JAX speedup: {numpy_time / jax_time:.1f}x")
 
     except FileNotFoundError:
         print(f" File not found: {volume_path}")
@@ -170,7 +168,7 @@ def demonstrate_jax_vmap():
 
     print(f"    Vectorized time: {vectorized_time:.6f}s")
     print(f"    Individual time: {individual_time:.6f}s")
-    print(f"    Speedup: {individual_time/vectorized_time:.1f}x")
+    print(f"    Speedup: {individual_time / vectorized_time:.1f}x")
 
 
 def demonstrate_gpu_acceleration():
@@ -182,7 +180,7 @@ def demonstrate_gpu_acceleration():
     devices = jax.devices()
     print(f"     Available devices: {[str(d) for d in devices]}")
 
-    if any('gpu' in str(device).lower() for device in devices):
+    if any("gpu" in str(device).lower() for device in devices):
         print("    GPU acceleration available")
 
         # Transfer to GPU

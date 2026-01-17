@@ -37,6 +37,7 @@ import numpy as np
 # Optional dependencies
 try:
     import torch
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -47,6 +48,7 @@ try:
     from monai.config import KeysCollection
     from monai.transforms import MapTransform, Transform
     from monai.utils import ensure_tuple
+
     MONAI_AVAILABLE = True
 except ImportError:
     MONAI_AVAILABLE = False
@@ -59,6 +61,7 @@ except ImportError:
         if isinstance(x, (list, tuple)):
             return tuple(x)
         return (x,)
+
 
 # Import medrs core functions
 from . import (
@@ -181,7 +184,9 @@ class MedrsLoadImage(Transform if MONAI_AVAILABLE else object):
         self.dtype = dtype
         self.ensure_channel_first = ensure_channel_first
 
-    def __call__(self, filename: Union[str, Path]) -> Union["MetaTensor", Tuple["MetaTensor", Dict]]:
+    def __call__(
+        self, filename: Union[str, Path]
+    ) -> Union["MetaTensor", Tuple["MetaTensor", Dict]]:
         """Load image from file.
 
         Args:
@@ -247,7 +252,11 @@ class MedrsLoadImaged(MapTransform if MONAI_AVAILABLE else object):
             super().__init__(keys, allow_missing_keys)
         self.keys = ensure_tuple(keys)
         self.dtype = dtype
-        self.meta_keys = ensure_tuple(meta_keys) if meta_keys else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        self.meta_keys = (
+            ensure_tuple(meta_keys)
+            if meta_keys
+            else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        )
         self.meta_key_postfix = meta_key_postfix
         self.overwriting = overwriting
         self.ensure_channel_first = ensure_channel_first
@@ -457,7 +466,11 @@ class MedrsSaveImaged(MapTransform if MONAI_AVAILABLE else object):
         if MONAI_AVAILABLE:
             super().__init__(keys, allow_missing_keys)
         self.keys = ensure_tuple(keys)
-        self.meta_keys = ensure_tuple(meta_keys) if meta_keys else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        self.meta_keys = (
+            ensure_tuple(meta_keys)
+            if meta_keys
+            else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        )
         self.allow_missing_keys = allow_missing_keys
         self._saver = MedrsSaveImage(
             output_dir=output_dir,
@@ -557,7 +570,11 @@ class MedrsRandCropByPosNegLabeld(MapTransform if MONAI_AVAILABLE else object):
         self.image_threshold = image_threshold
         self.fg_indices_key = fg_indices_key
         self.bg_indices_key = bg_indices_key
-        self.meta_keys = ensure_tuple(meta_keys) if meta_keys else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        self.meta_keys = (
+            ensure_tuple(meta_keys)
+            if meta_keys
+            else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        )
         self.meta_key_postfix = meta_key_postfix
         self.allow_smaller = allow_smaller
         self.allow_missing_keys = allow_missing_keys
@@ -677,15 +694,15 @@ class MedrsRandCropByPosNegLabeld(MapTransform if MONAI_AVAILABLE else object):
                 if has_channel:
                     cropped = arr[
                         :,
-                        crop_start[0]:crop_end[0],
-                        crop_start[1]:crop_end[1],
-                        crop_start[2]:crop_end[2],
+                        crop_start[0] : crop_end[0],
+                        crop_start[1] : crop_end[1],
+                        crop_start[2] : crop_end[2],
                     ]
                 else:
                     cropped = arr[
-                        crop_start[0]:crop_end[0],
-                        crop_start[1]:crop_end[1],
-                        crop_start[2]:crop_end[2],
+                        crop_start[0] : crop_end[0],
+                        crop_start[1] : crop_end[1],
+                        crop_start[2] : crop_end[2],
                     ]
 
                 # Convert back to MetaTensor
@@ -750,7 +767,11 @@ class MedrsRandSpatialCropd(MapTransform if MONAI_AVAILABLE else object):
         self.max_roi_size = ensure_tuple(max_roi_size) if max_roi_size else None
         self.random_center = random_center
         self.random_size = random_size
-        self.meta_keys = ensure_tuple(meta_keys) if meta_keys else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        self.meta_keys = (
+            ensure_tuple(meta_keys)
+            if meta_keys
+            else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        )
         self.allow_missing_keys = allow_missing_keys
 
     def __call__(self, data: Mapping[Hashable, Any]) -> Dict[Hashable, Any]:
@@ -784,7 +805,11 @@ class MedrsRandSpatialCropd(MapTransform if MONAI_AVAILABLE else object):
             crop_start = []
             for s, r in zip(shape, self.roi_size):
                 max_start = max(0, s - r)
-                start = np.random.randint(0, max_start + 1) if self.random_center and max_start > 0 else max_start // 2
+                start = (
+                    np.random.randint(0, max_start + 1)
+                    if self.random_center and max_start > 0
+                    else max_start // 2
+                )
                 crop_start.append(start)
             crop_size = list(self.roi_size)
 
@@ -793,12 +818,21 @@ class MedrsRandSpatialCropd(MapTransform if MONAI_AVAILABLE else object):
             img_data = d[key]
 
             if isinstance(img_data, (str, Path)):
-                # Load cropped directly
-                cropped = load_cropped(str(img_data), crop_start, crop_size)
+                img_path = str(img_data)
+                if img_path.endswith(".nii.gz") or img_path.endswith(".gz"):
+                    full_img = load(img_path)
+                    arr = full_img.to_numpy()
+                    cropped_arr = arr[
+                        crop_start[0] : crop_start[0] + crop_size[0],
+                        crop_start[1] : crop_start[1] + crop_size[1],
+                        crop_start[2] : crop_start[2] + crop_size[2],
+                    ]
+                    cropped = NiftiImage.from_numpy(cropped_arr.copy(), affine=full_img.affine)
+                else:
+                    cropped = load_cropped(img_path, crop_start, crop_size)
                 d[key] = _medrs_to_metatensor(cropped, ensure_channel_first=True)
                 d[meta_key] = dict(d[key].meta)
             else:
-                # Crop in memory
                 if isinstance(img_data, (MetaTensor, torch.Tensor)):
                     arr = img_data
                     meta = dict(img_data.meta) if hasattr(img_data, "meta") else d.get(meta_key, {})
@@ -810,15 +844,15 @@ class MedrsRandSpatialCropd(MapTransform if MONAI_AVAILABLE else object):
                 if arr.ndim == 4:
                     cropped = arr[
                         :,
-                        crop_start[0]:crop_start[0] + crop_size[0],
-                        crop_start[1]:crop_start[1] + crop_size[1],
-                        crop_start[2]:crop_start[2] + crop_size[2],
+                        crop_start[0] : crop_start[0] + crop_size[0],
+                        crop_start[1] : crop_start[1] + crop_size[1],
+                        crop_start[2] : crop_start[2] + crop_size[2],
                     ]
                 else:
                     cropped = arr[
-                        crop_start[0]:crop_start[0] + crop_size[0],
-                        crop_start[1]:crop_start[1] + crop_size[1],
-                        crop_start[2]:crop_start[2] + crop_size[2],
+                        crop_start[0] : crop_start[0] + crop_size[0],
+                        crop_start[1] : crop_start[1] + crop_size[1],
+                        crop_start[2] : crop_start[2] + crop_size[2],
                     ]
 
                 if MONAI_AVAILABLE:
@@ -865,7 +899,11 @@ class MedrsCenterSpatialCropd(MapTransform if MONAI_AVAILABLE else object):
         self.roi_size = ensure_tuple(roi_size)
         if len(self.roi_size) == 1:
             self.roi_size = self.roi_size * 3
-        self.meta_keys = ensure_tuple(meta_keys) if meta_keys else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        self.meta_keys = (
+            ensure_tuple(meta_keys)
+            if meta_keys
+            else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        )
         self.allow_missing_keys = allow_missing_keys
 
     def __call__(self, data: Mapping[Hashable, Any]) -> Dict[Hashable, Any]:
@@ -896,7 +934,18 @@ class MedrsCenterSpatialCropd(MapTransform if MONAI_AVAILABLE else object):
             img_data = d[key]
 
             if isinstance(img_data, (str, Path)):
-                cropped = load_cropped(str(img_data), crop_start, crop_size)
+                img_path = str(img_data)
+                if img_path.endswith(".nii.gz") or img_path.endswith(".gz"):
+                    full_img = load(img_path)
+                    arr = full_img.to_numpy()
+                    cropped_arr = arr[
+                        crop_start[0] : crop_start[0] + crop_size[0],
+                        crop_start[1] : crop_start[1] + crop_size[1],
+                        crop_start[2] : crop_start[2] + crop_size[2],
+                    ]
+                    cropped = NiftiImage.from_numpy(cropped_arr.copy(), affine=full_img.affine)
+                else:
+                    cropped = load_cropped(img_path, crop_start, crop_size)
                 d[key] = _medrs_to_metatensor(cropped, ensure_channel_first=True)
                 d[meta_key] = dict(d[key].meta)
             else:
@@ -910,15 +959,15 @@ class MedrsCenterSpatialCropd(MapTransform if MONAI_AVAILABLE else object):
                 if arr.ndim == 4:
                     cropped = arr[
                         :,
-                        crop_start[0]:crop_start[0] + crop_size[0],
-                        crop_start[1]:crop_start[1] + crop_size[1],
-                        crop_start[2]:crop_start[2] + crop_size[2],
+                        crop_start[0] : crop_start[0] + crop_size[0],
+                        crop_start[1] : crop_start[1] + crop_size[1],
+                        crop_start[2] : crop_start[2] + crop_size[2],
                     ]
                 else:
                     cropped = arr[
-                        crop_start[0]:crop_start[0] + crop_size[0],
-                        crop_start[1]:crop_start[1] + crop_size[1],
-                        crop_start[2]:crop_start[2] + crop_size[2],
+                        crop_start[0] : crop_start[0] + crop_size[0],
+                        crop_start[1] : crop_start[1] + crop_size[1],
+                        crop_start[2] : crop_start[2] + crop_size[2],
                     ]
 
                 if MONAI_AVAILABLE:
@@ -1009,7 +1058,11 @@ class MedrsOrientationd(MapTransform if MONAI_AVAILABLE else object):
         if MONAI_AVAILABLE:
             super().__init__(keys, allow_missing_keys)
         self.keys = ensure_tuple(keys)
-        self.meta_keys = ensure_tuple(meta_keys) if meta_keys else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        self.meta_keys = (
+            ensure_tuple(meta_keys)
+            if meta_keys
+            else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        )
         self.allow_missing_keys = allow_missing_keys
         self._orient = MedrsOrientation(axcodes=axcodes, as_closest_canonical=as_closest_canonical)
 
@@ -1121,7 +1174,11 @@ class MedrsResampled(MapTransform if MONAI_AVAILABLE else object):
         if MONAI_AVAILABLE:
             super().__init__(keys, allow_missing_keys)
         self.keys = ensure_tuple(keys)
-        self.meta_keys = ensure_tuple(meta_keys) if meta_keys else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        self.meta_keys = (
+            ensure_tuple(meta_keys)
+            if meta_keys
+            else tuple(f"{k}{meta_key_postfix}" for k in self.keys)
+        )
         self.allow_missing_keys = allow_missing_keys
         self._resample = MedrsResample(mode=mode, dtype=dtype)
 
@@ -1147,6 +1204,167 @@ class MedrsResampled(MapTransform if MONAI_AVAILABLE else object):
 
 
 # =============================================================================
+# FASTLOADER MONAI INTEGRATION
+# =============================================================================
+
+
+class MedrsFastLoaderDataset:
+    """MONAI-compatible IterableDataset using FastLoader for high-throughput .nii.gz loading.
+
+    Wraps medrs FastLoader to work with MONAI Compose pipelines. Returns MetaTensor
+    with proper metadata for seamless integration with MONAI transforms.
+
+    This is the recommended approach for training pipelines with 100k+ .nii.gz files
+    where parallel prefetching provides significant speedups.
+
+    Args:
+        volumes: List of NIfTI file paths
+        patch_shape: Patch shape to extract [d, h, w]
+        keys: Dictionary keys for the output (default: ["image"])
+        prefetch: Number of patches to prefetch (default: 16)
+        workers: Number of worker threads (default: auto)
+        shuffle: Whether to shuffle file order (default: True)
+        seed: Random seed for reproducibility
+        transform: Optional MONAI transform to apply after loading
+        device: Target device for tensors (default: "cpu")
+        dtype: Target dtype for tensors (default: None, preserves original)
+        ensure_channel_first: Add channel dimension if needed (default: True)
+
+    Example:
+        >>> from monai.transforms import Compose, RandFlipd, NormalizeIntensityd
+        >>> from medrs.monai_compat import MedrsFastLoaderDataset
+        >>>
+        >>> # Create dataset with transforms
+        >>> dataset = MedrsFastLoaderDataset(
+        ...     volumes=glob.glob("data/*.nii.gz"),
+        ...     patch_shape=[64, 64, 64],
+        ...     keys=["image"],
+        ...     prefetch=16,
+        ...     workers=4,
+        ...     transform=Compose([
+        ...         RandFlipd(keys=["image"], prob=0.5),
+        ...         NormalizeIntensityd(keys=["image"]),
+        ...     ])
+        ... )
+        >>>
+        >>> # Use with PyTorch DataLoader (set num_workers=0, FastLoader handles parallelism)
+        >>> from torch.utils.data import DataLoader
+        >>> loader = DataLoader(dataset, batch_size=None, num_workers=0)
+        >>> for batch in loader:
+        ...     image = batch["image"]  # MetaTensor with shape [1, D, H, W]
+    """
+
+    def __init__(
+        self,
+        volumes: List[str],
+        patch_shape: List[int],
+        keys: Optional[List[str]] = None,
+        prefetch: int = 16,
+        workers: Optional[int] = None,
+        shuffle: bool = True,
+        seed: Optional[int] = None,
+        transform: Optional[Callable] = None,
+        device: str = "cpu",
+        dtype: Optional["torch.dtype"] = None,
+        ensure_channel_first: bool = True,
+    ):
+        from . import FastLoader
+
+        self.keys = keys or ["image"]
+        if len(self.keys) != 1:
+            raise ValueError(
+                "MedrsFastLoaderDataset currently supports single-key loading. "
+                "For multi-key (image + label), use MedrsLoadImaged with separate transforms."
+            )
+
+        self._volumes = volumes
+        self._patch_shape = patch_shape
+        self._prefetch = prefetch
+        self._workers = workers
+        self._shuffle = shuffle
+        self._seed = seed
+        self._transform = transform
+        self._device = device
+        self._dtype = dtype
+        self._ensure_channel_first = ensure_channel_first
+        self._loader = self._create_loader()
+
+    def _create_loader(self):
+        """Create or recreate the FastLoader."""
+        from . import FastLoader
+
+        builder_kwargs = {
+            "volumes": self._volumes,
+            "patch_shape": self._patch_shape,
+            "prefetch": self._prefetch,
+            "shuffle": self._shuffle,
+        }
+        if self._workers is not None:
+            builder_kwargs["workers"] = self._workers
+        if self._seed is not None:
+            builder_kwargs["seed"] = self._seed
+
+        return FastLoader(**builder_kwargs)
+
+    def __iter__(self):
+        for patch in self._loader:
+            data = {
+                self.keys[0]: _medrs_to_metatensor(
+                    patch,
+                    ensure_channel_first=self._ensure_channel_first,
+                    dtype=self._dtype,
+                )
+            }
+
+            if self._device != "cpu" and TORCH_AVAILABLE:
+                for key in self.keys:
+                    if hasattr(data[key], "to"):
+                        data[key] = data[key].to(self._device)
+
+            if self._transform is not None:
+                data = self._transform(data)
+
+            yield data
+
+    def __len__(self) -> int:
+        """Return total number of patches."""
+        return len(self._loader)
+
+    def reset(self) -> None:
+        """Reset the loader for a new epoch.
+
+        Note: FastLoader is not reusable after exhaustion. This creates a new one.
+        """
+        self._loader = self._create_loader()
+
+
+class MedrsFastLoaderIterableDataset:
+    """torch.utils.data.IterableDataset-compatible version of MedrsFastLoaderDataset.
+
+    Use this when you need PyTorch DataLoader compatibility with the IterableDataset protocol.
+
+    Example:
+        >>> from torch.utils.data import DataLoader
+        >>> dataset = MedrsFastLoaderIterableDataset(
+        ...     volumes=paths,
+        ...     patch_shape=[64, 64, 64],
+        ... )
+        >>> # IMPORTANT: num_workers=0 because FastLoader handles parallelism internally
+        >>> loader = DataLoader(dataset, batch_size=4, num_workers=0)
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._base = MedrsFastLoaderDataset(*args, **kwargs)
+
+    def __iter__(self):
+        self._base.reset()
+        return iter(self._base)
+
+    def __len__(self):
+        return len(self._base)
+
+
+# =============================================================================
 # EXPORTS
 # =============================================================================
 
@@ -1167,4 +1385,7 @@ __all__ = [
     # Resample transforms
     "MedrsResample",
     "MedrsResampled",
+    # FastLoader integration
+    "MedrsFastLoaderDataset",
+    "MedrsFastLoaderIterableDataset",
 ]

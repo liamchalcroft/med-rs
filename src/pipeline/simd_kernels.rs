@@ -86,29 +86,21 @@ pub fn sum_and_sum_sq_f32(input: &[f32]) -> (f64, f64, usize) {
     let chunks = len / SIMD_WIDTH;
     let remainder = len % SIMD_WIDTH;
 
-    // Use f64 accumulators for precision
-    let mut sum_acc = [0.0f64; SIMD_WIDTH];
-    let mut sq_acc = [0.0f64; SIMD_WIDTH];
+    let mut sum_vec = f32x8::splat(0.0);
+    let mut sq_vec_acc = f32x8::splat(0.0);
 
     for i in 0..chunks {
         let base = i * SIMD_WIDTH;
         let in_vec = f32x8::from(&input[base..base + SIMD_WIDTH]);
-        let sq_vec = in_vec * in_vec;
-
-        let in_arr: [f32; 8] = in_vec.into();
-        let sq_arr: [f32; 8] = sq_vec.into();
-
-        for j in 0..SIMD_WIDTH {
-            sum_acc[j] += in_arr[j] as f64;
-            sq_acc[j] += sq_arr[j] as f64;
-        }
+        sum_vec += in_vec;
+        sq_vec_acc += in_vec * in_vec;
     }
 
-    // Sum across SIMD lanes
-    let mut sum: f64 = sum_acc.iter().sum();
-    let mut sum_sq: f64 = sq_acc.iter().sum();
+    let sum_arr: [f32; 8] = sum_vec.into();
+    let sq_arr: [f32; 8] = sq_vec_acc.into();
+    let mut sum: f64 = sum_arr.iter().map(|&x| x as f64).sum();
+    let mut sum_sq: f64 = sq_arr.iter().map(|&x| x as f64).sum();
 
-    // Handle remainder
     let base = chunks * SIMD_WIDTH;
     for i in 0..remainder {
         let v = input[base + i] as f64;
@@ -185,6 +177,557 @@ pub fn clamp_f32_inplace(data: &mut [f32], min: f32, max: f32) {
     let base = chunks * SIMD_WIDTH;
     for i in 0..remainder {
         data[base + i] = data[base + i].clamp(min, max);
+    }
+}
+
+// =============================================================================
+// SIMD BYTE-SWAPPING FOR NON-NATIVE ENDIAN DATA
+// =============================================================================
+
+const BYTESWAP_CHUNK: usize = 16;
+
+/// Byte-swap 16-bit values in-place using SIMD.
+///
+/// Swaps byte pairs: [a, b, c, d] -> [b, a, d, c]
+/// Useful for i16/u16/f16/bf16 endianness conversion.
+#[inline]
+pub fn byteswap_16_inplace(data: &mut [u8]) {
+    let len = data.len();
+    let chunks = len / BYTESWAP_CHUNK;
+
+    for i in 0..chunks {
+        let base = i * BYTESWAP_CHUNK;
+        for j in (0..BYTESWAP_CHUNK).step_by(2) {
+            data.swap(base + j, base + j + 1);
+        }
+    }
+
+    let base = chunks * BYTESWAP_CHUNK;
+    let remaining = &mut data[base..];
+    for chunk in remaining.chunks_exact_mut(2) {
+        chunk.swap(0, 1);
+    }
+}
+
+/// Byte-swap 32-bit values in-place.
+///
+/// Swaps bytes: [a, b, c, d] -> [d, c, b, a]
+/// Useful for i32/u32/f32 endianness conversion.
+#[inline]
+pub fn byteswap_32_inplace(data: &mut [u8]) {
+    for chunk in data.chunks_exact_mut(4) {
+        chunk.swap(0, 3);
+        chunk.swap(1, 2);
+    }
+}
+
+/// Byte-swap 64-bit values in-place.
+///
+/// Swaps bytes: [a, b, c, d, e, f, g, h] -> [h, g, f, e, d, c, b, a]
+/// Useful for i64/u64/f64 endianness conversion.
+#[inline]
+pub fn byteswap_64_inplace(data: &mut [u8]) {
+    for chunk in data.chunks_exact_mut(8) {
+        chunk.swap(0, 7);
+        chunk.swap(1, 6);
+        chunk.swap(2, 5);
+        chunk.swap(3, 4);
+    }
+}
+
+/// Byte-swap and convert u8 bytes to f32 slice with scaling.
+///
+/// For 8-bit types (no swap needed), just applies scaling.
+#[inline]
+pub fn u8_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len());
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base = i * SIMD_WIDTH;
+        // Convert 8 u8s to f32s
+        let v: [f32; 8] = [
+            input[base] as f32,
+            input[base + 1] as f32,
+            input[base + 2] as f32,
+            input[base + 3] as f32,
+            input[base + 4] as f32,
+            input[base + 5] as f32,
+            input[base + 6] as f32,
+            input[base + 7] as f32,
+        ];
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base..base + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    // Scalar remainder
+    let base = chunks * SIMD_WIDTH;
+    for i in base..len {
+        output[i] = input[i] as f32 * slope + inter;
+    }
+}
+
+/// Byte-swap 16-bit values and convert to f32 with scaling.
+///
+/// Performs endianness swap + type conversion + scaling in a single pass.
+#[inline]
+pub fn i16_swap_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len() * 2);
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base_in = i * SIMD_WIDTH * 2;
+        let base_out = i * SIMD_WIDTH;
+
+        // Read and byte-swap 8 i16 values
+        let v: [f32; 8] = [
+            i16::from_be_bytes([input[base_in], input[base_in + 1]]) as f32,
+            i16::from_be_bytes([input[base_in + 2], input[base_in + 3]]) as f32,
+            i16::from_be_bytes([input[base_in + 4], input[base_in + 5]]) as f32,
+            i16::from_be_bytes([input[base_in + 6], input[base_in + 7]]) as f32,
+            i16::from_be_bytes([input[base_in + 8], input[base_in + 9]]) as f32,
+            i16::from_be_bytes([input[base_in + 10], input[base_in + 11]]) as f32,
+            i16::from_be_bytes([input[base_in + 12], input[base_in + 13]]) as f32,
+            i16::from_be_bytes([input[base_in + 14], input[base_in + 15]]) as f32,
+        ];
+
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base_out..base_out + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    // Scalar remainder
+    let base_out = chunks * SIMD_WIDTH;
+    let base_in = base_out * 2;
+    for i in 0..(len - base_out) {
+        let idx = base_in + i * 2;
+        let val = i16::from_be_bytes([input[idx], input[idx + 1]]) as f32;
+        output[base_out + i] = val * slope + inter;
+    }
+}
+
+/// Byte-swap 32-bit floats and convert to f32 with scaling.
+///
+/// Performs endianness swap + scaling in a single pass.
+#[inline]
+pub fn f32_swap_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len() * 4);
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base_in = i * SIMD_WIDTH * 4;
+        let base_out = i * SIMD_WIDTH;
+
+        // Read and byte-swap 8 f32 values
+        let v: [f32; 8] = [
+            f32::from_be_bytes([
+                input[base_in],
+                input[base_in + 1],
+                input[base_in + 2],
+                input[base_in + 3],
+            ]),
+            f32::from_be_bytes([
+                input[base_in + 4],
+                input[base_in + 5],
+                input[base_in + 6],
+                input[base_in + 7],
+            ]),
+            f32::from_be_bytes([
+                input[base_in + 8],
+                input[base_in + 9],
+                input[base_in + 10],
+                input[base_in + 11],
+            ]),
+            f32::from_be_bytes([
+                input[base_in + 12],
+                input[base_in + 13],
+                input[base_in + 14],
+                input[base_in + 15],
+            ]),
+            f32::from_be_bytes([
+                input[base_in + 16],
+                input[base_in + 17],
+                input[base_in + 18],
+                input[base_in + 19],
+            ]),
+            f32::from_be_bytes([
+                input[base_in + 20],
+                input[base_in + 21],
+                input[base_in + 22],
+                input[base_in + 23],
+            ]),
+            f32::from_be_bytes([
+                input[base_in + 24],
+                input[base_in + 25],
+                input[base_in + 26],
+                input[base_in + 27],
+            ]),
+            f32::from_be_bytes([
+                input[base_in + 28],
+                input[base_in + 29],
+                input[base_in + 30],
+                input[base_in + 31],
+            ]),
+        ];
+
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base_out..base_out + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    // Scalar remainder
+    let base_out = chunks * SIMD_WIDTH;
+    let base_in = base_out * 4;
+    for i in 0..(len - base_out) {
+        let idx = base_in + i * 4;
+        let val = f32::from_be_bytes([input[idx], input[idx + 1], input[idx + 2], input[idx + 3]]);
+        output[base_out + i] = val * slope + inter;
+    }
+}
+
+/// Byte-swap 16-bit unsigned values and convert to f32 with scaling.
+#[inline]
+pub fn u16_swap_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len() * 2);
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base_in = i * SIMD_WIDTH * 2;
+        let base_out = i * SIMD_WIDTH;
+
+        let v: [f32; 8] = [
+            u16::from_be_bytes([input[base_in], input[base_in + 1]]) as f32,
+            u16::from_be_bytes([input[base_in + 2], input[base_in + 3]]) as f32,
+            u16::from_be_bytes([input[base_in + 4], input[base_in + 5]]) as f32,
+            u16::from_be_bytes([input[base_in + 6], input[base_in + 7]]) as f32,
+            u16::from_be_bytes([input[base_in + 8], input[base_in + 9]]) as f32,
+            u16::from_be_bytes([input[base_in + 10], input[base_in + 11]]) as f32,
+            u16::from_be_bytes([input[base_in + 12], input[base_in + 13]]) as f32,
+            u16::from_be_bytes([input[base_in + 14], input[base_in + 15]]) as f32,
+        ];
+
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base_out..base_out + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    let base_out = chunks * SIMD_WIDTH;
+    let base_in = base_out * 2;
+    for i in 0..(len - base_out) {
+        let idx = base_in + i * 2;
+        let val = u16::from_be_bytes([input[idx], input[idx + 1]]) as f32;
+        output[base_out + i] = val * slope + inter;
+    }
+}
+
+/// Byte-swap 32-bit signed values and convert to f32 with scaling.
+#[inline]
+pub fn i32_swap_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len() * 4);
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base_in = i * SIMD_WIDTH * 4;
+        let base_out = i * SIMD_WIDTH;
+
+        let v: [f32; 8] = [
+            i32::from_be_bytes([
+                input[base_in],
+                input[base_in + 1],
+                input[base_in + 2],
+                input[base_in + 3],
+            ]) as f32,
+            i32::from_be_bytes([
+                input[base_in + 4],
+                input[base_in + 5],
+                input[base_in + 6],
+                input[base_in + 7],
+            ]) as f32,
+            i32::from_be_bytes([
+                input[base_in + 8],
+                input[base_in + 9],
+                input[base_in + 10],
+                input[base_in + 11],
+            ]) as f32,
+            i32::from_be_bytes([
+                input[base_in + 12],
+                input[base_in + 13],
+                input[base_in + 14],
+                input[base_in + 15],
+            ]) as f32,
+            i32::from_be_bytes([
+                input[base_in + 16],
+                input[base_in + 17],
+                input[base_in + 18],
+                input[base_in + 19],
+            ]) as f32,
+            i32::from_be_bytes([
+                input[base_in + 20],
+                input[base_in + 21],
+                input[base_in + 22],
+                input[base_in + 23],
+            ]) as f32,
+            i32::from_be_bytes([
+                input[base_in + 24],
+                input[base_in + 25],
+                input[base_in + 26],
+                input[base_in + 27],
+            ]) as f32,
+            i32::from_be_bytes([
+                input[base_in + 28],
+                input[base_in + 29],
+                input[base_in + 30],
+                input[base_in + 31],
+            ]) as f32,
+        ];
+
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base_out..base_out + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    let base_out = chunks * SIMD_WIDTH;
+    let base_in = base_out * 4;
+    for i in 0..(len - base_out) {
+        let idx = base_in + i * 4;
+        let val =
+            i32::from_be_bytes([input[idx], input[idx + 1], input[idx + 2], input[idx + 3]]) as f32;
+        output[base_out + i] = val * slope + inter;
+    }
+}
+
+/// Byte-swap 32-bit unsigned values and convert to f32 with scaling.
+#[inline]
+pub fn u32_swap_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len() * 4);
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base_in = i * SIMD_WIDTH * 4;
+        let base_out = i * SIMD_WIDTH;
+
+        let v: [f32; 8] = [
+            u32::from_be_bytes([
+                input[base_in],
+                input[base_in + 1],
+                input[base_in + 2],
+                input[base_in + 3],
+            ]) as f32,
+            u32::from_be_bytes([
+                input[base_in + 4],
+                input[base_in + 5],
+                input[base_in + 6],
+                input[base_in + 7],
+            ]) as f32,
+            u32::from_be_bytes([
+                input[base_in + 8],
+                input[base_in + 9],
+                input[base_in + 10],
+                input[base_in + 11],
+            ]) as f32,
+            u32::from_be_bytes([
+                input[base_in + 12],
+                input[base_in + 13],
+                input[base_in + 14],
+                input[base_in + 15],
+            ]) as f32,
+            u32::from_be_bytes([
+                input[base_in + 16],
+                input[base_in + 17],
+                input[base_in + 18],
+                input[base_in + 19],
+            ]) as f32,
+            u32::from_be_bytes([
+                input[base_in + 20],
+                input[base_in + 21],
+                input[base_in + 22],
+                input[base_in + 23],
+            ]) as f32,
+            u32::from_be_bytes([
+                input[base_in + 24],
+                input[base_in + 25],
+                input[base_in + 26],
+                input[base_in + 27],
+            ]) as f32,
+            u32::from_be_bytes([
+                input[base_in + 28],
+                input[base_in + 29],
+                input[base_in + 30],
+                input[base_in + 31],
+            ]) as f32,
+        ];
+
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base_out..base_out + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    let base_out = chunks * SIMD_WIDTH;
+    let base_in = base_out * 4;
+    for i in 0..(len - base_out) {
+        let idx = base_in + i * 4;
+        let val =
+            u32::from_be_bytes([input[idx], input[idx + 1], input[idx + 2], input[idx + 3]]) as f32;
+        output[base_out + i] = val * slope + inter;
+    }
+}
+
+/// Native-endian i16 to f32 with scaling (SIMD accelerated).
+#[inline]
+pub fn i16_native_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len() * 2);
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base_in = i * SIMD_WIDTH * 2;
+        let base_out = i * SIMD_WIDTH;
+
+        let v: [f32; 8] = [
+            i16::from_ne_bytes([input[base_in], input[base_in + 1]]) as f32,
+            i16::from_ne_bytes([input[base_in + 2], input[base_in + 3]]) as f32,
+            i16::from_ne_bytes([input[base_in + 4], input[base_in + 5]]) as f32,
+            i16::from_ne_bytes([input[base_in + 6], input[base_in + 7]]) as f32,
+            i16::from_ne_bytes([input[base_in + 8], input[base_in + 9]]) as f32,
+            i16::from_ne_bytes([input[base_in + 10], input[base_in + 11]]) as f32,
+            i16::from_ne_bytes([input[base_in + 12], input[base_in + 13]]) as f32,
+            i16::from_ne_bytes([input[base_in + 14], input[base_in + 15]]) as f32,
+        ];
+
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base_out..base_out + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    let base_out = chunks * SIMD_WIDTH;
+    let base_in = base_out * 2;
+    for i in 0..(len - base_out) {
+        let idx = base_in + i * 2;
+        let val = i16::from_ne_bytes([input[idx], input[idx + 1]]) as f32;
+        output[base_out + i] = val * slope + inter;
+    }
+}
+
+/// Native-endian f32 with scaling (SIMD accelerated).
+#[inline]
+pub fn f32_native_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len() * 4);
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base_in = i * SIMD_WIDTH * 4;
+        let base_out = i * SIMD_WIDTH;
+
+        let v: [f32; 8] = [
+            f32::from_ne_bytes([
+                input[base_in],
+                input[base_in + 1],
+                input[base_in + 2],
+                input[base_in + 3],
+            ]),
+            f32::from_ne_bytes([
+                input[base_in + 4],
+                input[base_in + 5],
+                input[base_in + 6],
+                input[base_in + 7],
+            ]),
+            f32::from_ne_bytes([
+                input[base_in + 8],
+                input[base_in + 9],
+                input[base_in + 10],
+                input[base_in + 11],
+            ]),
+            f32::from_ne_bytes([
+                input[base_in + 12],
+                input[base_in + 13],
+                input[base_in + 14],
+                input[base_in + 15],
+            ]),
+            f32::from_ne_bytes([
+                input[base_in + 16],
+                input[base_in + 17],
+                input[base_in + 18],
+                input[base_in + 19],
+            ]),
+            f32::from_ne_bytes([
+                input[base_in + 20],
+                input[base_in + 21],
+                input[base_in + 22],
+                input[base_in + 23],
+            ]),
+            f32::from_ne_bytes([
+                input[base_in + 24],
+                input[base_in + 25],
+                input[base_in + 26],
+                input[base_in + 27],
+            ]),
+            f32::from_ne_bytes([
+                input[base_in + 28],
+                input[base_in + 29],
+                input[base_in + 30],
+                input[base_in + 31],
+            ]),
+        ];
+
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base_out..base_out + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    let base_out = chunks * SIMD_WIDTH;
+    let base_in = base_out * 4;
+    for i in 0..(len - base_out) {
+        let idx = base_in + i * 4;
+        let val = f32::from_ne_bytes([input[idx], input[idx + 1], input[idx + 2], input[idx + 3]]);
+        output[base_out + i] = val * slope + inter;
     }
 }
 
@@ -685,25 +1228,24 @@ fn trilinear_x_simd_forder(
     let dx = dst_row.len();
     let chunks = dx / SIMD_WIDTH;
 
-    // SIMD weight vectors
     let w00_v = f32x8::splat(w00);
     let w01_v = f32x8::splat(w01);
     let w10_v = f32x8::splat(w10);
     let w11_v = f32x8::splat(w11);
 
+    let mut v_z0_y0_0 = [0.0f32; 8];
+    let mut v_z0_y0_1 = [0.0f32; 8];
+    let mut v_z0_y1_0 = [0.0f32; 8];
+    let mut v_z0_y1_1 = [0.0f32; 8];
+    let mut v_z1_y0_0 = [0.0f32; 8];
+    let mut v_z1_y0_1 = [0.0f32; 8];
+    let mut v_z1_y1_0 = [0.0f32; 8];
+    let mut v_z1_y1_1 = [0.0f32; 8];
+    let mut xf = [0.0f32; 8];
+    let mut xf_inv = [0.0f32; 8];
+
     for chunk_i in 0..chunks {
         let base = chunk_i * SIMD_WIDTH;
-
-        let mut v_z0_y0_0 = [0.0f32; 8];
-        let mut v_z0_y0_1 = [0.0f32; 8];
-        let mut v_z0_y1_0 = [0.0f32; 8];
-        let mut v_z0_y1_1 = [0.0f32; 8];
-        let mut v_z1_y0_0 = [0.0f32; 8];
-        let mut v_z1_y0_1 = [0.0f32; 8];
-        let mut v_z1_y1_0 = [0.0f32; 8];
-        let mut v_z1_y1_1 = [0.0f32; 8];
-        let mut xf = [0.0f32; 8];
-        let mut xf_inv = [0.0f32; 8];
 
         for i in 0..SIMD_WIDTH {
             let xi = base + i;
@@ -1076,6 +1618,385 @@ fn upsample_x_row_simd(
     }
 }
 
+// =============================================================================
+// PARALLEL SIMD DTYPE CONVERSION
+// =============================================================================
+//
+// These functions combine Rayon parallelism with SIMD for maximum throughput
+// when converting from NIfTI storage types to f32 with scaling applied.
+
+/// Chunk size for parallel conversion: 16K elements = 32-64KB per chunk.
+/// Sized to fit in L1/L2 cache while providing enough parallelism.
+const CONVERSION_CHUNK_SIZE: usize = 16384;
+
+/// Parallel SIMD u8 to f32 conversion with scaling.
+pub fn parallel_u8_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    output
+        .par_chunks_mut(CONVERSION_CHUNK_SIZE)
+        .zip(input.par_chunks(CONVERSION_CHUNK_SIZE))
+        .for_each(|(out_chunk, in_chunk)| {
+            u8_to_f32_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
+/// Parallel SIMD native-endian i16 to f32 conversion with scaling.
+pub fn parallel_i16_native_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    // Each output element corresponds to 2 input bytes
+    let elem_chunk = CONVERSION_CHUNK_SIZE;
+    let byte_chunk = elem_chunk * 2;
+
+    output
+        .par_chunks_mut(elem_chunk)
+        .zip(input.par_chunks(byte_chunk))
+        .for_each(|(out_chunk, in_chunk)| {
+            i16_native_to_f32_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
+/// Parallel SIMD byte-swapped i16 to f32 conversion with scaling.
+pub fn parallel_i16_swap_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    let elem_chunk = CONVERSION_CHUNK_SIZE;
+    let byte_chunk = elem_chunk * 2;
+
+    output
+        .par_chunks_mut(elem_chunk)
+        .zip(input.par_chunks(byte_chunk))
+        .for_each(|(out_chunk, in_chunk)| {
+            i16_swap_to_f32_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
+/// Parallel SIMD byte-swapped u16 to f32 conversion with scaling.
+pub fn parallel_u16_swap_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    let elem_chunk = CONVERSION_CHUNK_SIZE;
+    let byte_chunk = elem_chunk * 2;
+
+    output
+        .par_chunks_mut(elem_chunk)
+        .zip(input.par_chunks(byte_chunk))
+        .for_each(|(out_chunk, in_chunk)| {
+            u16_swap_to_f32_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
+/// Parallel SIMD native-endian f32 with scaling.
+pub fn parallel_f32_native_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    let elem_chunk = CONVERSION_CHUNK_SIZE;
+    let byte_chunk = elem_chunk * 4;
+
+    output
+        .par_chunks_mut(elem_chunk)
+        .zip(input.par_chunks(byte_chunk))
+        .for_each(|(out_chunk, in_chunk)| {
+            f32_native_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
+/// Parallel SIMD byte-swapped f32 to f32 conversion with scaling.
+pub fn parallel_f32_swap_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    let elem_chunk = CONVERSION_CHUNK_SIZE;
+    let byte_chunk = elem_chunk * 4;
+
+    output
+        .par_chunks_mut(elem_chunk)
+        .zip(input.par_chunks(byte_chunk))
+        .for_each(|(out_chunk, in_chunk)| {
+            f32_swap_to_f32_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
+/// Parallel SIMD byte-swapped i32 to f32 conversion with scaling.
+pub fn parallel_i32_swap_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    let elem_chunk = CONVERSION_CHUNK_SIZE;
+    let byte_chunk = elem_chunk * 4;
+
+    output
+        .par_chunks_mut(elem_chunk)
+        .zip(input.par_chunks(byte_chunk))
+        .for_each(|(out_chunk, in_chunk)| {
+            i32_swap_to_f32_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
+/// Parallel SIMD byte-swapped u32 to f32 conversion with scaling.
+pub fn parallel_u32_swap_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    let elem_chunk = CONVERSION_CHUNK_SIZE;
+    let byte_chunk = elem_chunk * 4;
+
+    output
+        .par_chunks_mut(elem_chunk)
+        .zip(input.par_chunks(byte_chunk))
+        .for_each(|(out_chunk, in_chunk)| {
+            u32_swap_to_f32_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
+/// Native-endian u16 to f32 with scaling (SIMD accelerated).
+#[inline]
+pub fn u16_native_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len() * 2);
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base_in = i * SIMD_WIDTH * 2;
+        let base_out = i * SIMD_WIDTH;
+
+        let v: [f32; 8] = [
+            u16::from_ne_bytes([input[base_in], input[base_in + 1]]) as f32,
+            u16::from_ne_bytes([input[base_in + 2], input[base_in + 3]]) as f32,
+            u16::from_ne_bytes([input[base_in + 4], input[base_in + 5]]) as f32,
+            u16::from_ne_bytes([input[base_in + 6], input[base_in + 7]]) as f32,
+            u16::from_ne_bytes([input[base_in + 8], input[base_in + 9]]) as f32,
+            u16::from_ne_bytes([input[base_in + 10], input[base_in + 11]]) as f32,
+            u16::from_ne_bytes([input[base_in + 12], input[base_in + 13]]) as f32,
+            u16::from_ne_bytes([input[base_in + 14], input[base_in + 15]]) as f32,
+        ];
+
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base_out..base_out + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    let base_out = chunks * SIMD_WIDTH;
+    let base_in = base_out * 2;
+    for i in 0..(len - base_out) {
+        let idx = base_in + i * 2;
+        let val = u16::from_ne_bytes([input[idx], input[idx + 1]]) as f32;
+        output[base_out + i] = val * slope + inter;
+    }
+}
+
+/// Parallel SIMD native-endian u16 to f32 conversion with scaling.
+pub fn parallel_u16_native_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    let elem_chunk = CONVERSION_CHUNK_SIZE;
+    let byte_chunk = elem_chunk * 2;
+
+    output
+        .par_chunks_mut(elem_chunk)
+        .zip(input.par_chunks(byte_chunk))
+        .for_each(|(out_chunk, in_chunk)| {
+            u16_native_to_f32_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
+/// Native-endian i32 to f32 with scaling (SIMD accelerated).
+#[inline]
+pub fn i32_native_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len() * 4);
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base_in = i * SIMD_WIDTH * 4;
+        let base_out = i * SIMD_WIDTH;
+
+        let v: [f32; 8] = [
+            i32::from_ne_bytes([
+                input[base_in],
+                input[base_in + 1],
+                input[base_in + 2],
+                input[base_in + 3],
+            ]) as f32,
+            i32::from_ne_bytes([
+                input[base_in + 4],
+                input[base_in + 5],
+                input[base_in + 6],
+                input[base_in + 7],
+            ]) as f32,
+            i32::from_ne_bytes([
+                input[base_in + 8],
+                input[base_in + 9],
+                input[base_in + 10],
+                input[base_in + 11],
+            ]) as f32,
+            i32::from_ne_bytes([
+                input[base_in + 12],
+                input[base_in + 13],
+                input[base_in + 14],
+                input[base_in + 15],
+            ]) as f32,
+            i32::from_ne_bytes([
+                input[base_in + 16],
+                input[base_in + 17],
+                input[base_in + 18],
+                input[base_in + 19],
+            ]) as f32,
+            i32::from_ne_bytes([
+                input[base_in + 20],
+                input[base_in + 21],
+                input[base_in + 22],
+                input[base_in + 23],
+            ]) as f32,
+            i32::from_ne_bytes([
+                input[base_in + 24],
+                input[base_in + 25],
+                input[base_in + 26],
+                input[base_in + 27],
+            ]) as f32,
+            i32::from_ne_bytes([
+                input[base_in + 28],
+                input[base_in + 29],
+                input[base_in + 30],
+                input[base_in + 31],
+            ]) as f32,
+        ];
+
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base_out..base_out + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    let base_out = chunks * SIMD_WIDTH;
+    let base_in = base_out * 4;
+    for i in 0..(len - base_out) {
+        let idx = base_in + i * 4;
+        let val =
+            i32::from_ne_bytes([input[idx], input[idx + 1], input[idx + 2], input[idx + 3]]) as f32;
+        output[base_out + i] = val * slope + inter;
+    }
+}
+
+/// Native-endian u32 to f32 with scaling (SIMD accelerated).
+#[inline]
+pub fn u32_native_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    debug_assert_eq!(input.len(), output.len() * 4);
+
+    let len = output.len();
+    let chunks = len / SIMD_WIDTH;
+
+    let slope_vec = f32x8::splat(slope);
+    let inter_vec = f32x8::splat(inter);
+
+    for i in 0..chunks {
+        let base_in = i * SIMD_WIDTH * 4;
+        let base_out = i * SIMD_WIDTH;
+
+        let v: [f32; 8] = [
+            u32::from_ne_bytes([
+                input[base_in],
+                input[base_in + 1],
+                input[base_in + 2],
+                input[base_in + 3],
+            ]) as f32,
+            u32::from_ne_bytes([
+                input[base_in + 4],
+                input[base_in + 5],
+                input[base_in + 6],
+                input[base_in + 7],
+            ]) as f32,
+            u32::from_ne_bytes([
+                input[base_in + 8],
+                input[base_in + 9],
+                input[base_in + 10],
+                input[base_in + 11],
+            ]) as f32,
+            u32::from_ne_bytes([
+                input[base_in + 12],
+                input[base_in + 13],
+                input[base_in + 14],
+                input[base_in + 15],
+            ]) as f32,
+            u32::from_ne_bytes([
+                input[base_in + 16],
+                input[base_in + 17],
+                input[base_in + 18],
+                input[base_in + 19],
+            ]) as f32,
+            u32::from_ne_bytes([
+                input[base_in + 20],
+                input[base_in + 21],
+                input[base_in + 22],
+                input[base_in + 23],
+            ]) as f32,
+            u32::from_ne_bytes([
+                input[base_in + 24],
+                input[base_in + 25],
+                input[base_in + 26],
+                input[base_in + 27],
+            ]) as f32,
+            u32::from_ne_bytes([
+                input[base_in + 28],
+                input[base_in + 29],
+                input[base_in + 30],
+                input[base_in + 31],
+            ]) as f32,
+        ];
+
+        let in_vec = f32x8::from(v);
+        let out_vec = in_vec * slope_vec + inter_vec;
+        let out_arr: [f32; 8] = out_vec.into();
+        output[base_out..base_out + SIMD_WIDTH].copy_from_slice(&out_arr);
+    }
+
+    let base_out = chunks * SIMD_WIDTH;
+    let base_in = base_out * 4;
+    for i in 0..(len - base_out) {
+        let idx = base_in + i * 4;
+        let val =
+            u32::from_ne_bytes([input[idx], input[idx + 1], input[idx + 2], input[idx + 3]]) as f32;
+        output[base_out + i] = val * slope + inter;
+    }
+}
+
+/// Parallel SIMD native-endian i32 to f32 conversion with scaling.
+pub fn parallel_i32_native_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    let elem_chunk = CONVERSION_CHUNK_SIZE;
+    let byte_chunk = elem_chunk * 4;
+
+    output
+        .par_chunks_mut(elem_chunk)
+        .zip(input.par_chunks(byte_chunk))
+        .for_each(|(out_chunk, in_chunk)| {
+            i32_native_to_f32_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
+/// Parallel SIMD native-endian u32 to f32 conversion with scaling.
+pub fn parallel_u32_native_to_f32_scaled(input: &[u8], output: &mut [f32], slope: f32, inter: f32) {
+    use rayon::prelude::*;
+
+    let elem_chunk = CONVERSION_CHUNK_SIZE;
+    let byte_chunk = elem_chunk * 4;
+
+    output
+        .par_chunks_mut(elem_chunk)
+        .zip(input.par_chunks(byte_chunk))
+        .for_each(|(out_chunk, in_chunk)| {
+            u32_native_to_f32_scaled(in_chunk, out_chunk, slope, inter);
+        });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1220,5 +2141,270 @@ mod tests {
 
         assert_eq!(min, -200.0);
         assert_eq!(max, 100.0);
+    }
+
+    #[test]
+    fn test_byteswap_16_inplace() {
+        // Test data: [0x01, 0x02, 0x03, 0x04] -> [0x02, 0x01, 0x04, 0x03]
+        let mut data = vec![0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        byteswap_16_inplace(&mut data);
+        assert_eq!(data, vec![0x02, 0x01, 0x04, 0x03, 0x06, 0x05, 0x08, 0x07]);
+
+        // Test with odd number of bytes (remainder handling)
+        let mut data2 = vec![0x01u8, 0x02, 0x03, 0x04, 0x05];
+        byteswap_16_inplace(&mut data2);
+        // Last byte is orphan, pairs swapped
+        assert_eq!(data2, vec![0x02, 0x01, 0x04, 0x03, 0x05]);
+    }
+
+    #[test]
+    fn test_byteswap_32_inplace() {
+        // [a, b, c, d] -> [d, c, b, a]
+        let mut data = vec![0x01u8, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        byteswap_32_inplace(&mut data);
+        assert_eq!(data, vec![0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05]);
+    }
+
+    #[test]
+    fn test_byteswap_64_inplace() {
+        // [a,b,c,d,e,f,g,h] -> [h,g,f,e,d,c,b,a]
+        let mut data: Vec<u8> = (1..=8).collect();
+        byteswap_64_inplace(&mut data);
+        assert_eq!(data, vec![8, 7, 6, 5, 4, 3, 2, 1]);
+    }
+
+    #[test]
+    fn test_u8_to_f32_scaled() {
+        let input: Vec<u8> = (0..20).collect();
+        let mut output = vec![0.0f32; 20];
+
+        u8_to_f32_scaled(&input, &mut output, 2.0, 10.0);
+
+        for i in 0..20 {
+            let expected = input[i] as f32 * 2.0 + 10.0;
+            assert!(
+                (output[i] - expected).abs() < 1e-5,
+                "At {}: expected {}, got {}",
+                i,
+                expected,
+                output[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_i16_swap_to_f32_scaled() {
+        // Create big-endian i16 values: 256, 512, 768, ...
+        // In BE: 256 = [0x01, 0x00], 512 = [0x02, 0x00], etc.
+        let mut input = Vec::new();
+        for i in 1..=16i16 {
+            let val = i * 256;
+            input.extend_from_slice(&val.to_be_bytes());
+        }
+
+        let mut output = vec![0.0f32; 16];
+        i16_swap_to_f32_scaled(&input, &mut output, 1.0, 0.0);
+
+        for i in 0..16 {
+            let expected = ((i + 1) * 256) as f32;
+            assert!(
+                (output[i] - expected).abs() < 1e-5,
+                "At {}: expected {}, got {}",
+                i,
+                expected,
+                output[i]
+            );
+        }
+
+        // Test with scaling
+        let mut output2 = vec![0.0f32; 16];
+        i16_swap_to_f32_scaled(&input, &mut output2, 0.5, 100.0);
+
+        for i in 0..16 {
+            let expected = ((i + 1) * 256) as f32 * 0.5 + 100.0;
+            assert!(
+                (output2[i] - expected).abs() < 1e-5,
+                "At {}: expected {}, got {}",
+                i,
+                expected,
+                output2[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_f32_swap_to_f32_scaled() {
+        // Create big-endian f32 values
+        let values: Vec<f32> = (0..16).map(|i| i as f32 * 1.5).collect();
+        let mut input = Vec::new();
+        for v in &values {
+            input.extend_from_slice(&v.to_be_bytes());
+        }
+
+        let mut output = vec![0.0f32; 16];
+        f32_swap_to_f32_scaled(&input, &mut output, 1.0, 0.0);
+
+        for i in 0..16 {
+            assert!(
+                (output[i] - values[i]).abs() < 1e-5,
+                "At {}: expected {}, got {}",
+                i,
+                values[i],
+                output[i]
+            );
+        }
+
+        // Test with scaling
+        let mut output2 = vec![0.0f32; 16];
+        f32_swap_to_f32_scaled(&input, &mut output2, 2.0, -5.0);
+
+        for i in 0..16 {
+            let expected = values[i] * 2.0 - 5.0;
+            assert!(
+                (output2[i] - expected).abs() < 1e-5,
+                "At {}: expected {}, got {}",
+                i,
+                expected,
+                output2[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_i16_native_to_f32_scaled() {
+        // Create native-endian i16 values
+        let values: Vec<i16> = (-8..8).collect();
+        let mut input = Vec::new();
+        for v in &values {
+            input.extend_from_slice(&v.to_ne_bytes());
+        }
+
+        let mut output = vec![0.0f32; 16];
+        i16_native_to_f32_scaled(&input, &mut output, 1.0, 0.0);
+
+        for i in 0..16 {
+            let expected = values[i] as f32;
+            assert!(
+                (output[i] - expected).abs() < 1e-5,
+                "At {}: expected {}, got {}",
+                i,
+                expected,
+                output[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_f32_native_scaled() {
+        // Create native-endian f32 values
+        let values: Vec<f32> = (0..16).map(|i| i as f32 * 3.14).collect();
+        let mut input = Vec::new();
+        for v in &values {
+            input.extend_from_slice(&v.to_ne_bytes());
+        }
+
+        let mut output = vec![0.0f32; 16];
+        f32_native_scaled(&input, &mut output, 1.0, 0.0);
+
+        for i in 0..16 {
+            assert!(
+                (output[i] - values[i]).abs() < 1e-5,
+                "At {}: expected {}, got {}",
+                i,
+                values[i],
+                output[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_u16_swap_to_f32_scaled() {
+        // Create big-endian u16 values
+        let values: Vec<u16> = (0..16).map(|i| i * 1000).collect();
+        let mut input = Vec::new();
+        for v in &values {
+            input.extend_from_slice(&v.to_be_bytes());
+        }
+
+        let mut output = vec![0.0f32; 16];
+        u16_swap_to_f32_scaled(&input, &mut output, 1.0, 0.0);
+
+        for i in 0..16 {
+            let expected = values[i] as f32;
+            assert!(
+                (output[i] - expected).abs() < 1e-5,
+                "At {}: expected {}, got {}",
+                i,
+                expected,
+                output[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_i32_swap_to_f32_scaled() {
+        // Create big-endian i32 values
+        let values: Vec<i32> = (-8..8).map(|i| i * 100000).collect();
+        let mut input = Vec::new();
+        for v in &values {
+            input.extend_from_slice(&v.to_be_bytes());
+        }
+
+        let mut output = vec![0.0f32; 16];
+        i32_swap_to_f32_scaled(&input, &mut output, 1.0, 0.0);
+
+        for i in 0..16 {
+            let expected = values[i] as f32;
+            assert!(
+                (output[i] - expected).abs() < 1.0, // f32 precision limits
+                "At {}: expected {}, got {}",
+                i,
+                expected,
+                output[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_u32_swap_to_f32_scaled() {
+        // Create big-endian u32 values
+        let values: Vec<u32> = (0..16).map(|i| i * 50000).collect();
+        let mut input = Vec::new();
+        for v in &values {
+            input.extend_from_slice(&v.to_be_bytes());
+        }
+
+        let mut output = vec![0.0f32; 16];
+        u32_swap_to_f32_scaled(&input, &mut output, 1.0, 0.0);
+
+        for i in 0..16 {
+            let expected = values[i] as f32;
+            assert!(
+                (output[i] - expected).abs() < 1.0,
+                "At {}: expected {}, got {}",
+                i,
+                expected,
+                output[i]
+            );
+        }
+    }
+
+    #[test]
+    fn test_conversion_with_remainder() {
+        // Test that functions handle non-multiple-of-8 sizes correctly
+        let input: Vec<u8> = (0..13).collect();
+        let mut output = vec![0.0f32; 13];
+
+        u8_to_f32_scaled(&input, &mut output, 1.0, 0.0);
+
+        for i in 0..13 {
+            assert!(
+                (output[i] - i as f32).abs() < 1e-5,
+                "At {}: expected {}, got {}",
+                i,
+                i as f32,
+                output[i]
+            );
+        }
     }
 }

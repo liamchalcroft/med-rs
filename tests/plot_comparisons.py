@@ -9,8 +9,12 @@ from pathlib import Path
 import nibabel as nib
 import medrs
 from monai.transforms import (
-    LoadImage, ScaleIntensity, ScaleIntensityRange, Flip,
-    CenterSpatialCrop, EnsureChannelFirst
+    LoadImage,
+    ScaleIntensity,
+    ScaleIntensityRange,
+    Flip,
+    CenterSpatialCrop,
+    EnsureChannelFirst,
 )
 
 # Output directory for plots
@@ -24,9 +28,9 @@ def get_center_slices(data):
     """Get center slices for each axis."""
     shape = data.shape
     return {
-        'axial': data[:, :, shape[2] // 2],
-        'coronal': data[:, shape[1] // 2, :],
-        'sagittal': data[shape[0] // 2, :, :],
+        "axial": data[:, :, shape[2] // 2],
+        "coronal": data[:, shape[1] // 2, :],
+        "sagittal": data[shape[0] // 2, :, :],
     }
 
 
@@ -46,7 +50,7 @@ def plot_comparison(data_dict, title, filename, diff=True):
     # Get center slices for each source
     slices_dict = {name: get_center_slices(data) for name, data in data_dict.items()}
 
-    views = ['axial', 'coronal', 'sagittal']
+    views = ["axial", "coronal", "sagittal"]
 
     if diff and n_sources >= 2:
         # Show sources + difference maps
@@ -55,15 +59,15 @@ def plot_comparison(data_dict, title, filename, diff=True):
     else:
         fig, axes = plt.subplots(3, n_sources, figsize=(4 * n_sources, 12))
 
-    fig.suptitle(title, fontsize=14, fontweight='bold')
+    fig.suptitle(title, fontsize=14, fontweight="bold")
 
     for row, view in enumerate(views):
         for col, name in enumerate(names):
             ax = axes[row, col] if n_sources > 1 or diff else axes[row]
             slice_data = slices_dict[name][view]
-            im = ax.imshow(slice_data.T, cmap='gray', origin='lower')
+            im = ax.imshow(slice_data.T, cmap="gray", origin="lower")
             ax.set_title(f"{name}\n{view}" if row == 0 else view)
-            ax.axis('off')
+            ax.axis("off")
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
         # Add difference map if requested
@@ -72,15 +76,19 @@ def plot_comparison(data_dict, title, filename, diff=True):
             # Difference between first two sources
             diff_data = slices_dict[names[0]][view] - slices_dict[names[1]][view]
             max_diff = np.abs(diff_data).max()
-            im = ax.imshow(diff_data.T, cmap='RdBu_r', origin='lower',
-                          vmin=-max_diff if max_diff > 0 else -1,
-                          vmax=max_diff if max_diff > 0 else 1)
+            im = ax.imshow(
+                diff_data.T,
+                cmap="RdBu_r",
+                origin="lower",
+                vmin=-max_diff if max_diff > 0 else -1,
+                vmax=max_diff if max_diff > 0 else 1,
+            )
             ax.set_title(f"Diff ({names[0]}-{names[1]})\n{view}" if row == 0 else view)
-            ax.axis('off')
+            ax.axis("off")
             plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / filename, dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / filename, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {OUTPUT_DIR / filename}")
 
@@ -102,9 +110,9 @@ def plot_basic_loading():
     print(f"Max diff: {np.abs(nib_data - medrs_data).max():.6f}")
 
     plot_comparison(
-        {'nibabel': nib_data, 'medrs': medrs_data},
-        'Basic Loading: nibabel vs medrs',
-        '01_basic_loading.png'
+        {"nibabel": nib_data, "medrs": medrs_data},
+        "Basic Loading: nibabel vs medrs",
+        "01_basic_loading.png",
     )
 
 
@@ -127,8 +135,7 @@ def plot_intensity_rescale():
     loader = LoadImage(image_only=True)
     monai_data = loader(TEST_IMAGE)
     rescaler = ScaleIntensityRange(
-        a_min=float(monai_data.min()), a_max=float(monai_data.max()),
-        b_min=0.0, b_max=1.0
+        a_min=float(monai_data.min()), a_max=float(monai_data.max()), b_min=0.0, b_max=1.0
     )
     monai_rescaled = np.asarray(rescaler(monai_data))
 
@@ -137,17 +144,17 @@ def plot_intensity_rescale():
     print(f"monai range: [{monai_rescaled.min():.4f}, {monai_rescaled.max():.4f}]")
 
     plot_comparison(
-        {'nibabel': nib_rescaled, 'medrs': medrs_rescaled, 'monai': monai_rescaled},
-        'Intensity Rescale [0, 1]: nibabel vs medrs vs MONAI',
-        '02_intensity_rescale.png',
-        diff=False
+        {"nibabel": nib_rescaled, "medrs": medrs_rescaled, "monai": monai_rescaled},
+        "Intensity Rescale [0, 1]: nibabel vs medrs vs MONAI",
+        "02_intensity_rescale.png",
+        diff=False,
     )
 
     # Also plot medrs vs monai diff
     plot_comparison(
-        {'medrs': medrs_rescaled, 'monai': monai_rescaled},
-        'Intensity Rescale [0, 1]: medrs vs MONAI (with diff)',
-        '02b_intensity_rescale_diff.png'
+        {"medrs": medrs_rescaled, "monai": monai_rescaled},
+        "Intensity Rescale [0, 1]: medrs vs MONAI (with diff)",
+        "02b_intensity_rescale_diff.png",
     )
 
 
@@ -171,9 +178,9 @@ def plot_z_normalize():
     print(f"Max diff: {np.abs(nib_znorm - medrs_znorm).max():.6f}")
 
     plot_comparison(
-        {'nibabel': nib_znorm, 'medrs': medrs_znorm},
-        'Z-Normalization: nibabel vs medrs',
-        '03_z_normalize.png'
+        {"nibabel": nib_znorm, "medrs": medrs_znorm},
+        "Z-Normalization: nibabel vs medrs",
+        "03_z_normalize.png",
     )
 
 
@@ -196,9 +203,9 @@ def plot_clamp():
     print(f"medrs range: [{medrs_clamped.min():.4f}, {medrs_clamped.max():.4f}]")
 
     plot_comparison(
-        {'nibabel': nib_clamped, 'medrs': medrs_clamped},
-        'Clamp [0, 100]: nibabel vs medrs',
-        '04_clamp.png'
+        {"nibabel": nib_clamped, "medrs": medrs_clamped},
+        "Clamp [0, 100]: nibabel vs medrs",
+        "04_clamp.png",
     )
 
 
@@ -224,9 +231,9 @@ def plot_flip():
         print(f"Axis {axis} - Max diff: {np.abs(medrs_flipped - monai_flipped).max():.6f}")
 
         plot_comparison(
-            {'medrs': medrs_flipped, 'monai': monai_flipped},
-            f'Flip Axis {axis}: medrs vs MONAI',
-            f'05_flip_axis{axis}.png'
+            {"medrs": medrs_flipped, "monai": monai_flipped},
+            f"Flip Axis {axis}: medrs vs MONAI",
+            f"05_flip_axis{axis}.png",
         )
 
 
@@ -247,23 +254,23 @@ def plot_resample():
 
     # For visualization, we'll just show the resampled result
     fig, axes = plt.subplots(2, 3, figsize=(12, 8))
-    fig.suptitle('Resample: Original vs 2mm spacing', fontsize=14, fontweight='bold')
+    fig.suptitle("Resample: Original vs 2mm spacing", fontsize=14, fontweight="bold")
 
-    views = ['axial', 'coronal', 'sagittal']
+    views = ["axial", "coronal", "sagittal"]
     orig_slices = get_center_slices(original)
     resamp_slices = get_center_slices(medrs_resampled)
 
     for col, view in enumerate(views):
-        axes[0, col].imshow(orig_slices[view].T, cmap='gray', origin='lower')
-        axes[0, col].set_title(f'Original {view}\n{original.shape}')
-        axes[0, col].axis('off')
+        axes[0, col].imshow(orig_slices[view].T, cmap="gray", origin="lower")
+        axes[0, col].set_title(f"Original {view}\n{original.shape}")
+        axes[0, col].axis("off")
 
-        axes[1, col].imshow(resamp_slices[view].T, cmap='gray', origin='lower')
-        axes[1, col].set_title(f'Resampled {view}\n{medrs_resampled.shape}')
-        axes[1, col].axis('off')
+        axes[1, col].imshow(resamp_slices[view].T, cmap="gray", origin="lower")
+        axes[1, col].set_title(f"Resampled {view}\n{medrs_resampled.shape}")
+        axes[1, col].axis("off")
 
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / '06_resample.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / "06_resample.png", dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {OUTPUT_DIR / '06_resample.png'}")
 
@@ -293,9 +300,9 @@ def plot_crop():
     print(f"Max diff: {np.abs(medrs_cropped - monai_cropped).max():.6f}")
 
     plot_comparison(
-        {'medrs': medrs_cropped, 'monai': monai_cropped},
-        f'Center Crop {crop_size}: medrs vs MONAI',
-        '07_center_crop.png'
+        {"medrs": medrs_cropped, "monai": monai_cropped},
+        f"Center Crop {crop_size}: medrs vs MONAI",
+        "07_center_crop.png",
     )
 
 
@@ -320,28 +327,28 @@ def plot_crop_or_pad():
     print(f"Cropped shape: {medrs_cropped.shape}")
 
     fig, axes = plt.subplots(3, 3, figsize=(12, 12))
-    fig.suptitle('Crop or Pad: Original vs Padded vs Cropped', fontsize=14, fontweight='bold')
+    fig.suptitle("Crop or Pad: Original vs Padded vs Cropped", fontsize=14, fontweight="bold")
 
-    views = ['axial', 'coronal', 'sagittal']
+    views = ["axial", "coronal", "sagittal"]
     orig_slices = get_center_slices(original)
     pad_slices = get_center_slices(medrs_padded)
     crop_slices = get_center_slices(medrs_cropped)
 
     for col, view in enumerate(views):
-        axes[0, col].imshow(orig_slices[view].T, cmap='gray', origin='lower')
-        axes[0, col].set_title(f'Original {view}\n{original.shape}')
-        axes[0, col].axis('off')
+        axes[0, col].imshow(orig_slices[view].T, cmap="gray", origin="lower")
+        axes[0, col].set_title(f"Original {view}\n{original.shape}")
+        axes[0, col].axis("off")
 
-        axes[1, col].imshow(pad_slices[view].T, cmap='gray', origin='lower')
-        axes[1, col].set_title(f'Padded {view}\n{medrs_padded.shape}')
-        axes[1, col].axis('off')
+        axes[1, col].imshow(pad_slices[view].T, cmap="gray", origin="lower")
+        axes[1, col].set_title(f"Padded {view}\n{medrs_padded.shape}")
+        axes[1, col].axis("off")
 
-        axes[2, col].imshow(crop_slices[view].T, cmap='gray', origin='lower')
-        axes[2, col].set_title(f'Cropped {view}\n{medrs_cropped.shape}')
-        axes[2, col].axis('off')
+        axes[2, col].imshow(crop_slices[view].T, cmap="gray", origin="lower")
+        axes[2, col].set_title(f"Cropped {view}\n{medrs_cropped.shape}")
+        axes[2, col].axis("off")
 
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / '08_crop_or_pad.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / "08_crop_or_pad.png", dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {OUTPUT_DIR / '08_crop_or_pad.png'}")
 
@@ -354,39 +361,39 @@ def plot_pipeline():
 
     # Typical preprocessing pipeline
     steps = {
-        '1. Original': medrs_img.to_numpy(),
-        '2. Resampled (1.5mm)': medrs_img.resample([1.5, 1.5, 1.5]).to_numpy(),
+        "1. Original": medrs_img.to_numpy(),
+        "2. Resampled (1.5mm)": medrs_img.resample([1.5, 1.5, 1.5]).to_numpy(),
     }
 
     # Continue pipeline
     resampled = medrs_img.resample([1.5, 1.5, 1.5])
-    steps['3. Z-Normalized'] = resampled.z_normalize().to_numpy()
+    steps["3. Z-Normalized"] = resampled.z_normalize().to_numpy()
 
     normalized = resampled.z_normalize()
-    steps['4. Clamped [-3, 3]'] = normalized.clamp(-3.0, 3.0).to_numpy()
+    steps["4. Clamped [-3, 3]"] = normalized.clamp(-3.0, 3.0).to_numpy()
 
     clamped = normalized.clamp(-3.0, 3.0)
-    steps['5. Cropped [128,128,128]'] = clamped.crop_or_pad([128, 128, 128]).to_numpy()
+    steps["5. Cropped [128,128,128]"] = clamped.crop_or_pad([128, 128, 128]).to_numpy()
 
     n_steps = len(steps)
     fig, axes = plt.subplots(3, n_steps, figsize=(4 * n_steps, 12))
-    fig.suptitle('Typical Preprocessing Pipeline', fontsize=14, fontweight='bold')
+    fig.suptitle("Typical Preprocessing Pipeline", fontsize=14, fontweight="bold")
 
-    views = ['axial', 'coronal', 'sagittal']
+    views = ["axial", "coronal", "sagittal"]
 
     for col, (name, data) in enumerate(steps.items()):
         slices = get_center_slices(data)
         for row, view in enumerate(views):
             ax = axes[row, col]
-            im = ax.imshow(slices[view].T, cmap='gray', origin='lower')
+            im = ax.imshow(slices[view].T, cmap="gray", origin="lower")
             if row == 0:
-                ax.set_title(f'{name}\n{data.shape}\n{view}')
+                ax.set_title(f"{name}\n{data.shape}\n{view}")
             else:
                 ax.set_title(view)
-            ax.axis('off')
+            ax.axis("off")
 
     plt.tight_layout()
-    plt.savefig(OUTPUT_DIR / '09_pipeline.png', dpi=150, bbox_inches='tight')
+    plt.savefig(OUTPUT_DIR / "09_pipeline.png", dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {OUTPUT_DIR / '09_pipeline.png'}")
 
@@ -405,9 +412,9 @@ def plot_load_cropped():
     # Manual crop from full image
     full_data = medrs_full.to_numpy()
     manual_crop = full_data[
-        offset[0]:offset[0]+size[0],
-        offset[1]:offset[1]+size[1],
-        offset[2]:offset[2]+size[2]
+        offset[0] : offset[0] + size[0],
+        offset[1] : offset[1] + size[1],
+        offset[2] : offset[2] + size[2],
     ]
 
     # Load cropped directly
@@ -419,9 +426,9 @@ def plot_load_cropped():
     print(f"Max diff: {np.abs(manual_crop - cropped_data).max():.6f}")
 
     plot_comparison(
-        {'manual_crop': manual_crop, 'load_cropped': cropped_data},
-        f'Load Cropped: Manual vs load_cropped (offset={offset}, size={size})',
-        '10_load_cropped.png'
+        {"manual_crop": manual_crop, "load_cropped": cropped_data},
+        f"Load Cropped: Manual vs load_cropped (offset={offset}, size={size})",
+        "10_load_cropped.png",
     )
 
 
@@ -440,7 +447,7 @@ def plot_save_load_roundtrip():
     transformed_data = transformed.to_numpy()
 
     # Save and reload with medrs
-    with tempfile.NamedTemporaryFile(suffix='.nii.gz', delete=False) as f:
+    with tempfile.NamedTemporaryFile(suffix=".nii.gz", delete=False) as f:
         temp_path = f.name
 
     try:
@@ -459,10 +466,10 @@ def plot_save_load_roundtrip():
         print(f"nibabel read diff: {np.abs(transformed_data - nib_data).max():.6f}")
 
         plot_comparison(
-            {'original': transformed_data, 'medrs_reload': reloaded_data, 'nibabel_read': nib_data},
-            'Save/Load Roundtrip: Original vs Reloaded',
-            '11_roundtrip.png',
-            diff=False
+            {"original": transformed_data, "medrs_reload": reloaded_data, "nibabel_read": nib_data},
+            "Save/Load Roundtrip: Original vs Reloaded",
+            "11_roundtrip.png",
+            diff=False,
         )
     finally:
         os.unlink(temp_path)

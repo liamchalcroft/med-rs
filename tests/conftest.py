@@ -28,6 +28,7 @@ if sys.version_info < (3, 10):
 
 try:
     import torch
+
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
@@ -35,25 +36,26 @@ except ImportError:
 try:
     import jax
     import jax.numpy as jnp
+
     HAS_JAX = True
 except ImportError:
     HAS_JAX = False
 
 try:
     import nibabel as nib
+
     HAS_NIBABEL = True
 except ImportError:
     HAS_NIBABEL = False
 
 try:
     import medrs
+
     HAS_MEDRS = True
 except ImportError:
     HAS_MEDRS = False
 
-from tests.test_utils import (
-    create_test_nifti_file
-)
+from tests.test_utils import create_test_nifti_file
 
 
 def pytest_addoption(parser):
@@ -62,13 +64,13 @@ def pytest_addoption(parser):
         "--run-slow",
         action="store_true",
         default=False,
-        help="Run slow tests (including large file tests)"
+        help="Run slow tests (including large file tests)",
     )
     parser.addoption(
         "--test-device",
         choices=["cpu", "cuda", "all"],
         default="cpu",
-        help="Device to test on (cpu, cuda, or all)"
+        help="Device to test on (cpu, cuda, or all)",
     )
 
 
@@ -77,12 +79,8 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "slow: marks tests as slow (deselect with '-m \"not slow\"')"
     )
-    config.addinivalue_line(
-        "markers", "cuda: marks tests that require CUDA"
-    )
-    config.addinivalue_line(
-        "markers", "integration: marks tests as integration tests"
-    )
+    config.addinivalue_line("markers", "cuda: marks tests that require CUDA")
+    config.addinivalue_line("markers", "integration: marks tests as integration tests")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -96,7 +94,9 @@ def pytest_collection_modifyitems(config, items):
     # Skip CUDA tests if not requested
     test_device = config.getoption("--test-device")
     if test_device == "cpu":
-        skip_cuda = pytest.mark.skip(reason="need --test-device=cuda or --test-device=all to run CUDA tests")
+        skip_cuda = pytest.mark.skip(
+            reason="need --test-device=cuda or --test-device=all to run CUDA tests"
+        )
         for item in items:
             if "cuda" in item.keywords:
                 item.add_marker(skip_cuda)
@@ -133,7 +133,7 @@ def temp_nifti_dir(test_data_dir: Path) -> Generator[Path, None, None]:
             file_path,
             shape=shape,
             add_structure=True,
-            seed=hash(filename)  # Reproducible but different files
+            seed=hash(filename),  # Reproducible but different files
         )
 
         # Set anisotropic spacing for the anisotropic file
@@ -169,15 +169,22 @@ def torch_device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
-@pytest.fixture(params=[
-    pytest.param("float32", marks=pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")),
-    pytest.param("float16", marks=pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")),
-])
+@pytest.fixture(
+    params=[
+        pytest.param(
+            "float32", marks=pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+        ),
+        pytest.param(
+            "float16", marks=pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
+        ),
+    ]
+)
 def torch_dtype(request):
     """Parameterized fixture for different torch dtypes."""
     if not HAS_TORCH:
         pytest.skip("PyTorch not available")
     import torch
+
     dtype_map = {"float32": torch.float32, "float16": torch.float16}
     return dtype_map[request.param]
 
@@ -245,12 +252,14 @@ class PropertyBasedTestHelper:
         """Generate valid 3D shapes for testing."""
         shapes = []
         for base in [8, 16, 32, 64]:
-            shapes.extend([
-                (base, base, base),
-                (base * 2, base, base),
-                (base, base * 2, base),
-                (base, base, base * 2),
-            ])
+            shapes.extend(
+                [
+                    (base, base, base),
+                    (base * 2, base, base),
+                    (base, base * 2, base),
+                    (base, base, base * 2),
+                ]
+            )
         return shapes
 
     @staticmethod
@@ -279,12 +288,14 @@ class PropertyBasedTestHelper:
         # With rotation
         for angle in [30, 45, 90, 180]:
             theta = np.radians(angle)
-            rot = np.array([
-                [np.cos(theta), -np.sin(theta), 0, 0],
-                [np.sin(theta), np.cos(theta), 0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1]
-            ])
+            rot = np.array(
+                [
+                    [np.cos(theta), -np.sin(theta), 0, 0],
+                    [np.sin(theta), np.cos(theta), 0, 0],
+                    [0, 0, 1, 0],
+                    [0, 0, 0, 1],
+                ]
+            )
             affines.append(rot)
 
         # With scaling
@@ -337,16 +348,22 @@ def sample_medical_volume():
         lesion_center = [
             np.random.randint(radius, shape[0] - radius),
             np.random.randint(radius, shape[1] - radius),
-            np.random.randint(radius, shape[2] - radius)
+            np.random.randint(radius, shape[2] - radius),
         ]
         lesion_radius = np.random.randint(2, 5)
 
-        for i in range(max(0, lesion_center[0] - lesion_radius),
-                      min(shape[0], lesion_center[0] + lesion_radius)):
-            for j in range(max(0, lesion_center[1] - lesion_radius),
-                          min(shape[1], lesion_center[1] + lesion_radius)):
-                for k in range(max(0, lesion_center[2] - lesion_radius),
-                              min(shape[2], lesion_center[2] + lesion_radius)):
+        for i in range(
+            max(0, lesion_center[0] - lesion_radius),
+            min(shape[0], lesion_center[0] + lesion_radius),
+        ):
+            for j in range(
+                max(0, lesion_center[1] - lesion_radius),
+                min(shape[1], lesion_center[1] + lesion_radius),
+            ):
+                for k in range(
+                    max(0, lesion_center[2] - lesion_radius),
+                    min(shape[2], lesion_center[2] + lesion_radius),
+                ):
                     dist = np.sqrt(((np.array([i, j, k]) - np.array(lesion_center)) ** 2).sum())
                     if dist < lesion_radius:
                         data[i, j, k] = np.random.normal(1.5, 0.2)
@@ -364,7 +381,9 @@ pytest.mark.slow = pytest.mark.slow
 
 # Skip conditions
 skip_if_no_torch = pytest.mark.skipif(not HAS_TORCH, reason="PyTorch not available")
-skip_if_no_cuda = pytest.mark.skipif(not (HAS_TORCH and torch.cuda.is_available()), reason="CUDA not available")
+skip_if_no_cuda = pytest.mark.skipif(
+    not (HAS_TORCH and torch.cuda.is_available()), reason="CUDA not available"
+)
 skip_if_no_jax = pytest.mark.skipif(not HAS_JAX, reason="JAX not available")
 skip_if_no_nibabel = pytest.mark.skipif(not HAS_NIBABEL, reason="nibabel not available")
 skip_if_no_medrs = pytest.mark.skipif(not HAS_MEDRS, reason="medrs not available")

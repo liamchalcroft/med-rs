@@ -227,11 +227,8 @@ class NiftiImage:
     def spacing(self) -> Tuple[float, ...]:
         """Get voxel spacing in mm."""
 
-    def to_numpy(self) -> np.ndarray:
-        """Get image data as numpy array."""
-
-    def to_numpy_view(self) -> np.ndarray:
-        """Get zero-copy numpy view when possible."""
+    def to_numpy(self, copy: bool = True) -> np.ndarray:
+        """Get image data as numpy array (set copy=False to attempt zero-copy)."""
 
     def to_torch(
         self,

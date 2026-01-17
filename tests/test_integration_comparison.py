@@ -17,6 +17,7 @@ TEST_IMAGE = Path("tests/fixtures/mprage_img.nii")
 # Fixtures
 # ============================================================================
 
+
 @pytest.fixture
 def test_image_path():
     """Path to test NIfTI image."""
@@ -28,6 +29,7 @@ def test_image_path():
 def nibabel_data(test_image_path):
     """Load test image with nibabel as reference."""
     import nibabel as nib
+
     img = nib.load(test_image_path)
     return {
         "data": img.get_fdata(),
@@ -41,12 +43,14 @@ def nibabel_data(test_image_path):
 def medrs_image(test_image_path):
     """Load test image with medrs."""
     import medrs
+
     return medrs.load(test_image_path)
 
 
 # ============================================================================
 # Basic Loading Tests
 # ============================================================================
+
 
 class TestBasicLoading:
     """Tests for basic image loading functionality."""
@@ -99,6 +103,7 @@ class TestBasicLoading:
 # MONAI Comparison Tests
 # ============================================================================
 
+
 class TestMonaiComparison:
     """Tests comparing medrs against MONAI."""
 
@@ -106,6 +111,7 @@ class TestMonaiComparison:
     def monai_data(self, test_image_path):
         """Load test image with MONAI."""
         from monai.transforms import LoadImage
+
         loader = LoadImage(image_only=True)
         data = loader(test_image_path)
         return np.asarray(data)
@@ -173,12 +179,15 @@ class TestMonaiComparison:
 
         # Shapes should match or be very close (interpolation edge effects)
         shape_diff = np.abs(np.array(medrs_resampled.shape) - np.array(monai_resampled_arr.shape))
-        assert np.all(shape_diff <= 2), f"Resample shape mismatch: medrs={medrs_resampled.shape}, monai={monai_resampled_arr.shape}"
+        assert np.all(shape_diff <= 2), (
+            f"Resample shape mismatch: medrs={medrs_resampled.shape}, monai={monai_resampled_arr.shape}"
+        )
 
 
 # ============================================================================
 # Loading Variants Tests
 # ============================================================================
+
 
 class TestLoadingVariants:
     """Tests for different loading functions."""
@@ -186,13 +195,13 @@ class TestLoadingVariants:
     def test_load_to_numpy_methods_consistent(self, medrs_image):
         """Verify different to_numpy methods return consistent data."""
         data1 = medrs_image.to_numpy()
-        data2 = medrs_image.to_numpy_view()
+        data2 = medrs_image.to_numpy(copy=True)
         data3 = medrs_image.to_numpy_native()
 
         # All should have same shape
         assert data1.shape == data2.shape == data3.shape
 
-        # to_numpy and to_numpy_view should be identical (both return f32)
+        # to_numpy and to_numpy(copy=True) should be identical (both return f32)
         assert np.allclose(data1, data2, atol=1e-6)
 
     def test_load_cropped(self, test_image_path, nibabel_data):
@@ -211,7 +220,9 @@ class TestLoadingVariants:
         # Verify the crop contains valid data from the original
         nib_data = nibabel_data["data"]
         expected_crop = nib_data[32:96, 32:96, 32:96]
-        assert np.allclose(data, expected_crop, atol=1e-5), "Cropped data doesn't match expected region"
+        assert np.allclose(data, expected_crop, atol=1e-5), (
+            "Cropped data doesn't match expected region"
+        )
 
     def test_load_resampled(self, test_image_path):
         """Test load_resampled function."""
@@ -223,8 +234,9 @@ class TestLoadingVariants:
         resampled = medrs.load_resampled(test_image_path, output_shape)
 
         # Verify shape is correct (cropped to specified shape)
-        assert tuple(resampled.shape) == tuple(output_shape), \
+        assert tuple(resampled.shape) == tuple(output_shape), (
             f"Shape mismatch: expected {output_shape}, got {resampled.shape}"
+        )
 
         # Verify F-contiguous
         data = resampled.to_numpy()
@@ -260,6 +272,7 @@ class TestLoadingVariants:
 # ============================================================================
 # Transform Tests
 # ============================================================================
+
 
 class TestTransforms:
     """Tests for image transformation operations."""
@@ -309,8 +322,9 @@ class TestTransforms:
         target_shape = [100, 100, 100]
         result = medrs_image.crop_or_pad(target_shape)
 
-        assert tuple(result.shape) == tuple(target_shape), \
+        assert tuple(result.shape) == tuple(target_shape), (
             f"Expected {target_shape}, got {result.shape}"
+        )
 
     def test_crop_or_pad_pad(self, medrs_image):
         """Verify crop_or_pad with larger target size."""
@@ -318,8 +332,9 @@ class TestTransforms:
         target_shape = [s + 50 for s in original_shape]
         result = medrs_image.crop_or_pad(target_shape)
 
-        assert tuple(result.shape) == tuple(target_shape), \
+        assert tuple(result.shape) == tuple(target_shape), (
             f"Expected {target_shape}, got {result.shape}"
+        )
 
     def test_flip(self, medrs_image):
         """Verify flip operation."""
@@ -348,6 +363,7 @@ class TestTransforms:
 # Method Chaining Tests
 # ============================================================================
 
+
 class TestMethodChaining:
     """Tests for method chaining functionality."""
 
@@ -363,10 +379,7 @@ class TestMethodChaining:
 
     def test_chain_crop_clamp_rescale(self, medrs_image):
         """Test chaining crop, clamp, and rescale."""
-        result = (medrs_image
-                  .crop_or_pad([128, 128, 128])
-                  .clamp(0.0, 500.0)
-                  .rescale(0.0, 1.0))
+        result = medrs_image.crop_or_pad([128, 128, 128]).clamp(0.0, 500.0).rescale(0.0, 1.0)
 
         data = result.to_numpy()
         assert data.shape == (128, 128, 128)
@@ -388,6 +401,7 @@ class TestMethodChaining:
 # Edge Cases Tests
 # ============================================================================
 
+
 class TestEdgeCases:
     """Tests for edge cases and boundary conditions."""
 
@@ -404,7 +418,7 @@ class TestEdgeCases:
 
         # Create from nibabel data
         original = nibabel_data["data"].astype(np.float32)
-        img = medrs.NiftiImage.from_numpy(original)
+        img = medrs.NiftiImage(original)
         recovered = img.to_numpy()
 
         assert np.allclose(original, recovered, atol=1e-6)
@@ -414,7 +428,7 @@ class TestEdgeCases:
         import medrs
 
         f_array = np.asfortranarray(np.random.rand(10, 20, 30).astype(np.float32))
-        img = medrs.NiftiImage.from_numpy(f_array)
+        img = medrs.NiftiImage(f_array)
         recovered = img.to_numpy()
 
         assert np.allclose(f_array, recovered, atol=1e-6)
@@ -425,7 +439,7 @@ class TestEdgeCases:
         import medrs
 
         c_array = np.ascontiguousarray(np.random.rand(10, 20, 30).astype(np.float32))
-        img = medrs.NiftiImage.from_numpy(c_array)
+        img = medrs.NiftiImage(c_array)
         recovered = img.to_numpy()
 
         assert np.allclose(c_array, recovered, atol=1e-6)
@@ -435,7 +449,7 @@ class TestEdgeCases:
         import medrs
 
         small = np.random.rand(2, 3, 4).astype(np.float32)
-        img = medrs.NiftiImage.from_numpy(small)
+        img = medrs.NiftiImage(small)
 
         assert tuple(img.shape) == (2, 3, 4)
         assert np.allclose(small, img.to_numpy(), atol=1e-6)
@@ -445,7 +459,7 @@ class TestEdgeCases:
         import medrs
 
         single_slice = np.random.rand(64, 64, 1).astype(np.float32)
-        img = medrs.NiftiImage.from_numpy(single_slice)
+        img = medrs.NiftiImage(single_slice)
 
         assert tuple(img.shape) == (64, 64, 1)
 
@@ -478,6 +492,7 @@ class TestEdgeCases:
 # ============================================================================
 # Save/Load Roundtrip Tests
 # ============================================================================
+
 
 class TestSaveLoadRoundtrip:
     """Tests for saving and loading images."""
@@ -533,6 +548,7 @@ class TestSaveLoadRoundtrip:
 # Advanced MONAI Comparison Tests
 # ============================================================================
 
+
 class TestAdvancedMonaiComparison:
     """Additional MONAI comparison tests for transforms."""
 
@@ -544,16 +560,22 @@ class TestAdvancedMonaiComparison:
         monai_data = np.asarray(loader(test_image_path))
 
         # MONAI rescale to [0, 1]
-        scaler = ScaleIntensityRange(a_min=float(monai_data.min()), a_max=float(monai_data.max()),
-                                      b_min=0.0, b_max=1.0, clip=True)
+        scaler = ScaleIntensityRange(
+            a_min=float(monai_data.min()),
+            a_max=float(monai_data.max()),
+            b_min=0.0,
+            b_max=1.0,
+            clip=True,
+        )
         monai_rescaled = np.asarray(scaler(monai_data))
 
         # medrs rescale
         medrs_rescaled = medrs_image.rescale(0.0, 1.0).to_numpy()
 
         # Both should be in [0, 1] and close
-        assert np.allclose(medrs_rescaled, monai_rescaled, atol=1e-5), \
+        assert np.allclose(medrs_rescaled, monai_rescaled, atol=1e-5), (
             f"Rescale mismatch: max_diff={np.max(np.abs(medrs_rescaled - monai_rescaled))}"
+        )
 
     def test_clamp_matches_monai(self, medrs_image, test_image_path):
         """Compare clamp with MONAI ThresholdIntensity."""
@@ -620,6 +642,7 @@ class TestAdvancedMonaiComparison:
 # Nibabel Roundtrip Tests
 # ============================================================================
 
+
 class TestNibabelRoundtrip:
     """Tests for nibabel compatibility and roundtrips."""
 
@@ -630,8 +653,7 @@ class TestNibabelRoundtrip:
 
         # Save with nibabel
         save_path = tmp_path / "nibabel_saved.nii.gz"
-        nib_img = nib.Nifti1Image(nibabel_data["data"].astype(np.float32),
-                                   nibabel_data["affine"])
+        nib_img = nib.Nifti1Image(nibabel_data["data"].astype(np.float32), nibabel_data["affine"])
         nib.save(nib_img, str(save_path))
 
         # Load with medrs
@@ -662,17 +684,62 @@ class TestNibabelRoundtrip:
     def test_preserve_orientation_code(self, medrs_image):
         """Verify orientation code is preserved."""
         orientation = medrs_image.orientation
-        assert orientation in ["RAS", "LAS", "LPS", "RPS", "RAI", "LAI", "LPI", "RPI",
-                                "RSA", "LSA", "RSP", "LSP", "RIA", "LIA", "RIP", "LIP",
-                                "ARS", "ALS", "PRS", "PLS", "ARI", "ALI", "PRI", "PLI",
-                                "ASR", "ASL", "PSR", "PSL", "AIR", "AIL", "PIR", "PIL",
-                                "SAR", "SAL", "SPR", "SPL", "IAR", "IAL", "IPR", "IPL",
-                                "SRA", "SLA", "SRP", "SLP", "IRA", "ILA", "IRP", "ILP"]
+        assert orientation in [
+            "RAS",
+            "LAS",
+            "LPS",
+            "RPS",
+            "RAI",
+            "LAI",
+            "LPI",
+            "RPI",
+            "RSA",
+            "LSA",
+            "RSP",
+            "LSP",
+            "RIA",
+            "LIA",
+            "RIP",
+            "LIP",
+            "ARS",
+            "ALS",
+            "PRS",
+            "PLS",
+            "ARI",
+            "ALI",
+            "PRI",
+            "PLI",
+            "ASR",
+            "ASL",
+            "PSR",
+            "PSL",
+            "AIR",
+            "AIL",
+            "PIR",
+            "PIL",
+            "SAR",
+            "SAL",
+            "SPR",
+            "SPL",
+            "IAR",
+            "IAL",
+            "IPR",
+            "IPL",
+            "SRA",
+            "SLA",
+            "SRP",
+            "SLP",
+            "IRA",
+            "ILA",
+            "IRP",
+            "ILP",
+        ]
 
 
 # ============================================================================
 # Advanced Cropping Tests
 # ============================================================================
+
 
 class TestAdvancedCropping:
     """Tests for various cropping scenarios."""
@@ -732,16 +799,14 @@ class TestAdvancedCropping:
 # Pipeline Simulation Tests
 # ============================================================================
 
+
 class TestPipelineSimulation:
     """Tests simulating real-world processing pipelines."""
 
     def test_preprocessing_pipeline(self, medrs_image, nibabel_data):
         """Test typical preprocessing pipeline."""
         # Typical preprocessing: normalize -> clamp outliers -> rescale
-        processed = (medrs_image
-                     .z_normalize()
-                     .clamp(-3.0, 3.0)
-                     .rescale(0.0, 1.0))
+        processed = medrs_image.z_normalize().clamp(-3.0, 3.0).rescale(0.0, 1.0)
 
         data = processed.to_numpy()
 
@@ -758,9 +823,7 @@ class TestPipelineSimulation:
         img = medrs.load_cropped(test_image_path, [50, 50, 50], crop_size)
 
         # Apply training transforms
-        processed = (img
-                     .z_normalize()
-                     .clamp(-5.0, 5.0))
+        processed = img.z_normalize().clamp(-5.0, 5.0)
 
         data = processed.to_numpy()
         assert data.shape == tuple(crop_size)
@@ -812,6 +875,7 @@ class TestPipelineSimulation:
 # ============================================================================
 # Data Integrity Tests
 # ============================================================================
+
 
 class TestDataIntegrity:
     """Tests for data integrity across operations."""
@@ -875,6 +939,7 @@ class TestDataIntegrity:
 # ============================================================================
 # Performance Sanity Tests
 # ============================================================================
+
 
 class TestPerformanceSanity:
     """Basic sanity tests for performance (not strict benchmarks)."""

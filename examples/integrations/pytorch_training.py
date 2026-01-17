@@ -26,17 +26,10 @@ class MedicalDataset(Dataset):
 
     def __getitem__(self, idx):
         # Load only what we need - crop-first loading
-        patch = medrs.load_cropped(
-            self.volume_paths[idx],
-            crop_offset=[32, 32, 16],
-            crop_shape=self.patch_size
-        )
+        patch = medrs.load_cropped(self.volume_paths[idx], [32, 32, 16], self.patch_size)
 
         # Direct GPU placement with specified dtype
-        tensor = patch.to_torch_with_dtype_and_device(
-            dtype=torch.float32,
-            device=self.device
-        )
+        tensor = patch.to_torch_with_dtype_and_device(dtype=torch.float32, device=self.device)
 
         # Simple preprocessing
         tensor = (tensor - tensor.mean()) / (tensor.std() + 1e-8)
@@ -56,7 +49,7 @@ def create_simple_model(input_shape=(1, 64, 64, 64)):
         torch.nn.AdaptiveAvgPool3d(1),
         torch.nn.Flatten(),
         torch.nn.Linear(32, 1),
-        torch.nn.Sigmoid()
+        torch.nn.Sigmoid(),
     )
 
 
@@ -131,13 +124,15 @@ def benchmark_dataloader():
         train_time = time.time() - train_start
         total_train_time += train_time
 
-        print(f"   Batch {batch_idx+1:2d}: {load_time:.3f}s load, {train_time:.3f}s train, "
-              f"loss: {loss.item():.4f}")
+        print(
+            f"   Batch {batch_idx + 1:2d}: {load_time:.3f}s load, {train_time:.3f}s train, "
+            f"loss: {loss.item():.4f}"
+        )
 
     print("\n4. Performance Summary:")
-    print(f"    Average load time: {total_load_time/10:.3f}s")
-    print(f"    Average train time: {total_train_time/10:.3f}s")
-    print(f"    Throughput: {10*8/(total_load_time + total_train_time):.1f} patches/sec")
+    print(f"    Average load time: {total_load_time / 10:.3f}s")
+    print(f"    Average train time: {total_train_time / 10:.3f}s")
+    print(f"    Throughput: {10 * 8 / (total_load_time + total_train_time):.1f} patches/sec")
 
     # Memory usage
     if torch.cuda.is_available():
@@ -159,12 +154,12 @@ def demonstrate_memory_efficiency():
 
     print(f"    Full volume memory: {traditional_memory}MB")
     print(f"    Required patch memory: {patch_memory}MB")
-    print(f"     Wasted memory: {waste}MB ({waste/traditional_memory*100:.1f}%)")
+    print(f"     Wasted memory: {waste}MB ({waste / traditional_memory * 100:.1f}%)")
 
     # medrs approach
     print("\n2. medrs crop-first approach:")
     print(f"    Memory used: {patch_memory}MB")
-    print(f"    Memory reduction: {traditional_memory/patch_memory}x")
+    print(f"    Memory reduction: {traditional_memory / patch_memory}x")
     print("    Speed improvement: up to 40x faster I/O")
 
     print("\n3. Training batch memory calculation:")

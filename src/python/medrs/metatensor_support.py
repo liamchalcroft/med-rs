@@ -17,6 +17,7 @@ import warnings
 try:
     from monai.data import MetaTensor
     from monai.transforms import EnsureChannelFirst
+
     MONAI_AVAILABLE = True
 except ImportError:
     MONAI_AVAILABLE = False
@@ -25,6 +26,7 @@ except ImportError:
 try:
     import torch
     import numpy as np
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
@@ -32,6 +34,7 @@ except ImportError:
 # Import medrs core functions
 try:
     from . import load, load_cropped, resample, reorient, crop_or_pad
+
     MEDRS_AVAILABLE = True
 except ImportError:
     MEDRS_AVAILABLE = False
@@ -41,9 +44,11 @@ except ImportError:
 # METADATA HANDLING
 # ============================================================================
 
+
 @dataclass
 class ImageMetadata:
     """Container for NIfTI-style image metadata."""
+
     affine: Optional[np.ndarray] = None
     spacing: Tuple[float, float, float] = (1.0, 1.0, 1.0)
     orientation: str = "RAS"
@@ -57,11 +62,12 @@ class ImageMetadata:
 # METATENSOR CONVERSION
 # ============================================================================
 
+
 class MedrsMetaTensorConverter:
     """Converter between medrs MedicalImage and MONAI MetaTensor."""
 
     @staticmethod
-    def medical_image_to_metatensor(medrs_image, device: Optional[str] = None) -> 'MetaTensor':
+    def medical_image_to_metatensor(medrs_image, device: Optional[str] = None) -> "MetaTensor":
         """
         Convert medrs MedicalImage to MONAI MetaTensor with metadata.
 
@@ -98,24 +104,24 @@ class MedrsMetaTensorConverter:
         # Extract affine matrix
         affine = MedrsMetaTensorConverter._get_affine_matrix(image)
         if affine is not None:
-            metadata['affine'] = affine
+            metadata["affine"] = affine
 
         # Extract spacing
         spacing = MedrsMetaTensorConverter._get_spacing(image)
-        metadata['spacing'] = spacing
+        metadata["spacing"] = spacing
 
         # Extract orientation
         orientation = MedrsMetaTensorConverter._get_orientation(image)
-        metadata['orientation'] = orientation
+        metadata["orientation"] = orientation
 
         # Extract origin
         origin = MedrsMetaTensorConverter._get_origin(image)
-        metadata['original_origin'] = origin
+        metadata["original_origin"] = origin
 
         # Extract other properties
-        if hasattr(image, 'data'):
-            metadata['original_shape'] = image.data.shape
-            metadata['dtype'] = str(image.data.dtype)
+        if hasattr(image, "data"):
+            metadata["original_shape"] = image.data.shape
+            metadata["dtype"] = str(image.data.dtype)
 
         return metadata
 
@@ -128,9 +134,12 @@ class MedrsMetaTensorConverter:
         """
         # Direction vectors for each axis letter
         axis_map = {
-            'R': (0, 1), 'L': (0, -1),   # Right/Left -> X axis
-            'A': (1, 1), 'P': (1, -1),   # Anterior/Posterior -> Y axis
-            'S': (2, 1), 'I': (2, -1),   # Superior/Inferior -> Z axis
+            "R": (0, 1),
+            "L": (0, -1),  # Right/Left -> X axis
+            "A": (1, 1),
+            "P": (1, -1),  # Anterior/Posterior -> Y axis
+            "S": (2, 1),
+            "I": (2, -1),  # Superior/Inferior -> Z axis
         }
 
         direction = np.zeros((3, 3), dtype=np.float64)
@@ -149,14 +158,14 @@ class MedrsMetaTensorConverter:
     @staticmethod
     def _get_affine_matrix(image) -> Optional[np.ndarray]:
         """Get affine matrix from image."""
-        if hasattr(image, 'affine') and image.affine is not None:
+        if hasattr(image, "affine") and image.affine is not None:
             return np.array(image.affine, dtype=np.float64)
 
         # Try to construct from orientation and spacing
-        if hasattr(image, 'orientation') and hasattr(image, 'spacing'):
+        if hasattr(image, "orientation") and hasattr(image, "spacing"):
             orientation = str(image.orientation)
             spacing = np.array(image.spacing, dtype=np.float64)
-            shape = getattr(image, 'data', np.zeros((1, 1, 1))).shape
+            shape = getattr(image, "data", np.zeros((1, 1, 1))).shape
 
             # Get direction matrix from orientation
             direction = MedrsMetaTensorConverter._orientation_to_direction(orientation)
@@ -174,21 +183,21 @@ class MedrsMetaTensorConverter:
     @staticmethod
     def _get_spacing(image) -> Tuple[float, float, float]:
         """Get voxel spacing from image."""
-        if hasattr(image, 'spacing'):
+        if hasattr(image, "spacing"):
             return tuple(float(x) for x in image.spacing)
         return (1.0, 1.0, 1.0)
 
     @staticmethod
     def _get_orientation(image) -> str:
         """Get orientation from image."""
-        if hasattr(image, 'orientation'):
+        if hasattr(image, "orientation"):
             return str(image.orientation)
         return "RAS"
 
     @staticmethod
     def _get_origin(image) -> Tuple[float, float, float]:
         """Get origin from image."""
-        if hasattr(image, 'origin'):
+        if hasattr(image, "origin"):
             return tuple(float(x) for x in image.origin)
         return (0.0, 0.0, 0.0)
 
@@ -196,6 +205,7 @@ class MedrsMetaTensorConverter:
 # ============================================================================
 # METATENSOR LOADER
 # ============================================================================
+
 
 class MetaTensorLoader:
     """
@@ -207,7 +217,7 @@ class MetaTensorLoader:
         device: str = "cpu",
         dtype: Optional[Any] = None,
         preserve_metadata: bool = True,
-        cache_metadata: bool = True
+        cache_metadata: bool = True,
     ):
         """
         Initialize MetaTensor loader.
@@ -227,7 +237,7 @@ class MetaTensorLoader:
         self.cache_metadata = cache_metadata
         self._metadata_cache = {} if cache_metadata else None
 
-    def load(self, path: Union[str, Path]) -> 'MetaTensor':
+    def load(self, path: Union[str, Path]) -> "MetaTensor":
         """
         Load NIfTI file into MONAI MetaTensor.
 
@@ -250,7 +260,9 @@ class MetaTensorLoader:
 
             # Cache metadata if enabled
             if self._metadata_cache is not None:
-                self._metadata_cache[path] = metatensor.meta.copy() if hasattr(metatensor, 'meta') else {}
+                self._metadata_cache[path] = (
+                    metatensor.meta.copy() if hasattr(metatensor, "meta") else {}
+                )
 
             # Apply dtype if specified
             if self.dtype is not None:
@@ -262,11 +274,8 @@ class MetaTensorLoader:
             raise RuntimeError(f"Failed to load {path}: {e}")
 
     def load_cropped(
-        self,
-        path: Union[str, Path],
-        crop_offset: Sequence[int],
-        crop_shape: Sequence[int]
-    ) -> 'MetaTensor':
+        self, path: Union[str, Path], crop_offset: Sequence[int], crop_shape: Sequence[int]
+    ) -> "MetaTensor":
         """
         Load cropped NIfTI file into MONAI MetaTensor.
 
@@ -299,10 +308,8 @@ class MetaTensorLoader:
             raise RuntimeError(f"Failed to load cropped {path}: {e}")
 
     def load_multiple(
-        self,
-        paths: Sequence[Union[str, Path]],
-        keys: Optional[Sequence[str]] = None
-    ) -> Dict[str, 'MetaTensor']:
+        self, paths: Sequence[Union[str, Path]], keys: Optional[Sequence[str]] = None
+    ) -> Dict[str, "MetaTensor"]:
         """
         Load multiple NIfTI files into MetaTensors.
 
@@ -330,6 +337,7 @@ class MetaTensorLoader:
 # COORDINATED METATENSOR LOADING
 # ============================================================================
 
+
 class MetaTensorCoordinatedCropLoader:
     """
     Load and crop multiple volumes into MONAI MetaTensors with coordinated cropping.
@@ -345,7 +353,7 @@ class MetaTensorCoordinatedCropLoader:
         device: str = "cpu",
         dtype: Optional[Any] = None,
         preserve_metadata: bool = True,
-        validation_mode: bool = False
+        validation_mode: bool = False,
     ):
         """
         Initialize coordinated crop loader for MetaTensors.
@@ -372,21 +380,20 @@ class MetaTensorCoordinatedCropLoader:
 
         # Create MetaTensor loader
         self.metatensor_loader = MetaTensorLoader(
-            device=device,
-            dtype=dtype,
-            preserve_metadata=preserve_metadata
+            device=device, dtype=dtype, preserve_metadata=preserve_metadata
         )
 
         # Import dictionary transforms for spatial normalization
         try:
             from .dictionary_transforms import CoordinatedCropLoader
+
             self._base_loader = CoordinatedCropLoader(
                 keys=keys,
                 crop_size=crop_size,
                 spatial_normalizer=spatial_normalizer,
                 device=device,
                 dtype=dtype,
-                random_center=not validation_mode
+                random_center=not validation_mode,
             )
         except ImportError:
             self._base_loader = None
@@ -403,10 +410,7 @@ class MetaTensorCoordinatedCropLoader:
 
     def _calculate_crop_offsets(self, center: Tuple[int, int, int]) -> Tuple[int, int, int]:
         """Calculate crop start offsets from center."""
-        return tuple(
-            max(0, coord - size // 2)
-            for coord, size in zip(center, self.crop_size)
-        )
+        return tuple(max(0, coord - size // 2) for coord, size in zip(center, self.crop_size))
 
     def __call__(self, data_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -426,7 +430,7 @@ class MetaTensorCoordinatedCropLoader:
             normalized_dict = self._base_loader(data_dict)
             # Extract reference volume for crop calculation
             ref_key = self.spatial_normalizer.reference_key
-            if ref_key in normalized_dict and hasattr(normalized_dict[ref_key], 'data'):
+            if ref_key in normalized_dict and hasattr(normalized_dict[ref_key], "data"):
                 ref_shape = normalized_dict[ref_key].data.shape
                 crop_center = self._determine_crop_center(ref_shape)
                 crop_offsets = self._calculate_crop_offsets(crop_center)
@@ -449,16 +453,14 @@ class MetaTensorCoordinatedCropLoader:
                 if key in data_dict and self._is_path_like(data_dict[key]):
                     # Load from file path
                     metatensor = self.metatensor_loader.load_cropped(
-                        data_dict[key],
-                        crop_offsets,
-                        self.crop_size
+                        data_dict[key], crop_offsets, self.crop_size
                     )
                 else:
                     # Try to find the volume in normalized dict
-                    if hasattr(data_dict, 'get') and key in data_dict:
+                    if hasattr(data_dict, "get") and key in data_dict:
                         # Handle pre-loaded volume
                         volume = data_dict[key]
-                        if hasattr(volume, 'data'):
+                        if hasattr(volume, "data"):
                             # Apply crop to the volume data
                             data = volume.data
                             x0, y0, z0 = crop_offsets
@@ -469,13 +471,14 @@ class MetaTensorCoordinatedCropLoader:
 
                             # Build metadata
                             metadata = {}
-                            if hasattr(volume, 'spacing'):
-                                metadata['spacing'] = volume.spacing
-                            if hasattr(volume, 'orientation'):
-                                metadata['orientation'] = volume.orientation
+                            if hasattr(volume, "spacing"):
+                                metadata["spacing"] = volume.spacing
+                            if hasattr(volume, "orientation"):
+                                metadata["orientation"] = volume.orientation
 
                             # Convert cropped data to tensor
                             import torch
+
                             tensor = torch.from_numpy(np.ascontiguousarray(cropped_data))
                             if self.device:
                                 tensor = tensor.to(self.device)
@@ -502,12 +505,13 @@ class MetaTensorCoordinatedCropLoader:
 
     def _is_path_like(self, value: Any) -> bool:
         """Check if value looks like a file path."""
-        return isinstance(value, (str, Path)) and str(value).endswith(('.nii', '.nii.gz'))
+        return isinstance(value, (str, Path)) and str(value).endswith((".nii", ".nii.gz"))
 
 
 # ============================================================================
 # MONAI COMPATIBILITY
 # ============================================================================
+
 
 class MetaTensorCompatibleTransform:
     """
@@ -534,11 +538,12 @@ class MetaTensorCompatibleTransform:
 # CONVENIENCE FUNCTIONS
 # ============================================================================
 
+
 def create_metatensor_loader(
     device: str = "cpu",
     dtype: Optional[Any] = None,
     preserve_metadata: bool = True,
-    cache_metadata: bool = False
+    cache_metadata: bool = False,
 ) -> MetaTensorLoader:
     """
     Create a MetaTensor loader with default settings.
@@ -556,7 +561,7 @@ def create_metatensor_loader(
         device=device,
         dtype=dtype,
         preserve_metadata=preserve_metadata,
-        cache_metadata=cache_metadata
+        cache_metadata=cache_metadata,
     )
 
 
@@ -567,7 +572,7 @@ def create_metatensor_crop_transform(
     device: str = "cpu",
     dtype: Optional[Any] = None,
     preserve_metadata: bool = True,
-    **kwargs
+    **kwargs,
 ) -> MetaTensorCompatibleTransform:
     """
     Create a MONAI-compatible transform that returns MetaTensors.
@@ -591,12 +596,12 @@ def create_metatensor_crop_transform(
         device=device,
         dtype=dtype,
         preserve_metadata=preserve_metadata,
-        **kwargs
+        **kwargs,
     )
     return MetaTensorCompatibleTransform(loader)
 
 
-def metatensor_from_medrs(medrs_image, device: Optional[str] = None) -> 'MetaTensor':
+def metatensor_from_medrs(medrs_image, device: Optional[str] = None) -> "MetaTensor":
     """
     Convert a medrs MedicalImage to MONAI MetaTensor.
 
@@ -607,9 +612,7 @@ def metatensor_from_medrs(medrs_image, device: Optional[str] = None) -> 'MetaTen
     Returns:
         MONAI MetaTensor with preserved metadata
     """
-    return MedrsMetaTensorConverter.medical_image_to_metatensor(
-        medrs_image, device=device
-    )
+    return MedrsMetaTensorConverter.medical_image_to_metatensor(medrs_image, device=device)
 
 
 def is_metatensor_supported() -> bool:
@@ -652,9 +655,9 @@ def enhance_dictionary_transforms_for_metatensor():
                 # Convert tensors to MetaTensors
                 metatensor_result = {}
                 for key, value in result.items():
-                    if hasattr(value, 'shape') and hasattr(value, 'device'):  # It's a tensor
+                    if hasattr(value, "shape") and hasattr(value, "device"):  # It's a tensor
                         # Create MetaTensor with metadata
-                        if hasattr(value, 'meta'):  # Already a MetaTensor
+                        if hasattr(value, "meta"):  # Already a MetaTensor
                             metatensor_result[key] = value
                         else:
                             # Convert to MetaTensor
@@ -682,6 +685,7 @@ def enhance_dictionary_transforms_for_metatensor():
 # AVAILABILITY CHECKS
 # ============================================================================
 
+
 def check_availability() -> Dict[str, bool]:
     """
     Check availability of optional components.
@@ -690,11 +694,11 @@ def check_availability() -> Dict[str, bool]:
         Dictionary mapping component names to availability status.
     """
     return {
-        'monai': MONAI_AVAILABLE,
-        'metatensor': is_metatensor_supported(),
-        'torch': TORCH_AVAILABLE,
-        'numpy': True,  # Always available with Python
-        'medrs_core': MEDRS_AVAILABLE,
+        "monai": MONAI_AVAILABLE,
+        "metatensor": is_metatensor_supported(),
+        "torch": TORCH_AVAILABLE,
+        "numpy": True,  # Always available with Python
+        "medrs_core": MEDRS_AVAILABLE,
     }
 
 

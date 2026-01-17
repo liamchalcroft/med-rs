@@ -19,7 +19,7 @@ def generate_random_nifti(
     affine: Optional[np.ndarray] = None,
     dtype: np.dtype = np.float32,
     seed: Optional[int] = None,
-    add_structure: bool = False
+    add_structure: bool = False,
 ) -> nib.Nifti1Image:
     """
     Generate a random NIfTI image for testing.
@@ -82,18 +82,14 @@ def generate_structured_data(shape: Tuple[int, ...], seed: Optional[int] = None)
 
     # Smaller structures
     for _ in range(3):
-        pos = [
-            np.random.randint(0, s) for s in shape[-3:]
-        ]
+        pos = [np.random.randint(0, s) for s in shape[-3:]]
         r = np.random.randint(3, 8)
         intensity = np.random.uniform(0.5, 1.5)
         add_sphere(data, pos, r, intensity)
 
     # Add some cube-like structures
     for _ in range(2):
-        pos = [
-            np.random.randint(0, max(1, s - 10)) for s in shape[-3:]
-        ]
+        pos = [np.random.randint(0, max(1, s - 10)) for s in shape[-3:]]
         size = np.random.randint(3, 8)
         intensity = np.random.uniform(0.3, 0.8)
         add_cube(data, pos, size, intensity)
@@ -107,7 +103,7 @@ def add_sphere(data: np.ndarray, center: List[int], radius: float, intensity: fl
     coords = np.ogrid[[slice(0, s) for s in shape]]
 
     # Calculate distance from center for each voxel
-    dist_sq = sum((coord - c)**2 for coord, c in zip(coords, center))
+    dist_sq = sum((coord - c) ** 2 for coord, c in zip(coords, center))
     mask = dist_sq <= radius**2
 
     # Apply sphere with smooth edges
@@ -142,7 +138,7 @@ def create_test_nifti_file(
     dtype: np.dtype = np.float32,
     seed: Optional[int] = None,
     add_structure: bool = False,
-    compressed: bool = False
+    compressed: bool = False,
 ) -> str:
     """
     Create a test NIfTI file and return the path.
@@ -163,11 +159,11 @@ def create_test_nifti_file(
 
     # Add .nii extension if not present
     if not output_path.suffix:
-        output_path = output_path.with_suffix('.nii')
-    elif output_path.suffix == '.gz' and not output_path.stem.endswith('.nii'):
-        output_path = output_path.with_name(output_path.stem + '.nii.gz')
-    elif compressed and not output_path.suffix == '.gz':
-        output_path = output_path.with_suffix(output_path.suffix + '.gz')
+        output_path = output_path.with_suffix(".nii")
+    elif output_path.suffix == ".gz" and not output_path.stem.endswith(".nii"):
+        output_path = output_path.with_name(output_path.stem + ".nii.gz")
+    elif compressed and not output_path.suffix == ".gz":
+        output_path = output_path.with_suffix(output_path.suffix + ".gz")
 
     # Generate the image
     img = generate_random_nifti(shape, affine, dtype, seed, add_structure)
@@ -183,7 +179,7 @@ def create_test_dataset(
     num_images: int = 5,
     shapes: Optional[List[Tuple[int, ...]]] = None,
     seeds: Optional[List[int]] = None,
-    add_labels: bool = False
+    add_labels: bool = False,
 ) -> Tuple[List[str], List[str]]:
     """
     Create a test dataset of NIfTI files.
@@ -210,7 +206,7 @@ def create_test_dataset(
             elif i % 3 == 1:
                 shapes.append((128, 128, 64))  # Large
             else:
-                shapes.append((32, 32, 16))   # Small
+                shapes.append((32, 32, 16))  # Small
 
     if seeds is None:
         seeds = list(range(num_images))
@@ -222,10 +218,7 @@ def create_test_dataset(
         # Create image
         img_path = output_dir / f"image_{i:03d}.nii"
         img_path = create_test_nifti_file(
-            img_path,
-            shape=shapes[i],
-            seed=seeds[i],
-            add_structure=True
+            img_path, shape=shapes[i], seed=seeds[i], add_structure=True
         )
         image_paths.append(img_path)
 
@@ -237,7 +230,7 @@ def create_test_dataset(
                 shape=shapes[i],
                 seed=seeds[i] + 1000,  # Different seed for labels
                 dtype=np.uint8,
-                add_structure=True
+                add_structure=True,
             )
             # Convert to binary labels
             label_data = (label_img.get_fdata() > 0.5).astype(np.uint8)
@@ -281,12 +274,15 @@ def compare_nifti_images(img1_path: str, img2_path: str, tolerance: float = 1e-5
 class TempNiftiFile:
     """Context manager for temporary NIfTI files."""
 
-    def __init__(self, shape: Tuple[int, ...] = (64, 64, 32),
-                 affine: Optional[np.ndarray] = None,
-                 dtype: np.dtype = np.float32,
-                 seed: Optional[int] = None,
-                 add_structure: bool = False,
-                 compressed: bool = False):
+    def __init__(
+        self,
+        shape: Tuple[int, ...] = (64, 64, 32),
+        affine: Optional[np.ndarray] = None,
+        dtype: np.dtype = np.float32,
+        seed: Optional[int] = None,
+        add_structure: bool = False,
+        compressed: bool = False,
+    ):
         """
         Initialize temporary NIfTI file context manager.
 
@@ -310,8 +306,7 @@ class TempNiftiFile:
     def __enter__(self) -> str:
         """Create temporary file and return path."""
         self.temp_file = tempfile.NamedTemporaryFile(
-            suffix='.nii.gz' if self.compressed else '.nii',
-            delete=False
+            suffix=".nii.gz" if self.compressed else ".nii", delete=False
         )
         self.path = self.temp_file.name
         self.temp_file.close()
@@ -323,7 +318,7 @@ class TempNiftiFile:
             dtype=self.dtype,
             seed=self.seed,
             add_structure=self.add_structure,
-            compressed=self.compressed
+            compressed=self.compressed,
         )
 
         return self.path
@@ -335,14 +330,16 @@ class TempNiftiFile:
 
 
 # Convenience functions for common test scenarios
-def create_3d_test_file(shape: Tuple[int, int, int] = (64, 64, 32),
-                       seed: int = 42) -> TempNiftiFile:
+def create_3d_test_file(
+    shape: Tuple[int, int, int] = (64, 64, 32), seed: int = 42
+) -> TempNiftiFile:
     """Create a 3D test file context manager."""
     return TempNiftiFile(shape=shape, seed=seed, add_structure=True)
 
 
-def create_4d_test_file(shape: Tuple[int, int, int, int] = (10, 64, 64, 32),
-                       seed: int = 42) -> TempNiftiFile:
+def create_4d_test_file(
+    shape: Tuple[int, int, int, int] = (10, 64, 64, 32), seed: int = 42
+) -> TempNiftiFile:
     """Create a 4D test file context manager."""
     return TempNiftiFile(shape=shape, seed=seed, add_structure=True)
 

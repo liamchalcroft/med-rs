@@ -1,6 +1,5 @@
 # Rust
 /target/
-Cargo.lock
 **/*.rs.bk
 *.prof
 
@@ -29,12 +28,10 @@ MANIFEST
 
 # Virtual environments
 .env
-.venv
+.venv/
 env/
 venv/
 ENV/
-env.bak/
-venv.bak/
 
 # IDE
 .vscode/
@@ -45,11 +42,6 @@ venv.bak/
 
 # OS
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
 # Testing
@@ -57,125 +49,23 @@ Thumbs.db
 .coverage
 htmlcov/
 .tox/
-.cache
-nosetests.xml
+.cache/
+.hypothesis/
 coverage.xml
 *.cover
-.hypothesis/
 
 # Documentation
 docs/_build/
 docs/.doctrees/
-.sphinx-doctrees/
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Jupyter
+.ipynb_checkpoints/
 
-# pyenv
-.python-version
-
-# Environments
-.env
-.env.local
-.env.*.local
-
-# Temporary files
-*.tmp
-*.bak
-*.swp
-*.swo
-*~
-
-# Logs
-*.log
-logs/
-
-# Runtime data
-pids
-*.pid
-*.seed
-*.pid.lock
-
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# PyInstaller
-*.manifest
-*.spec
-
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-.hypothesis/
-.pytest_cache/
-
-# Translations
-*.mo
-*.pot
-
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-
-# Flask stuff:
-instance/
-.webassets-cache
-
-# Scrapy stuff:
-.scrapy
-
-# Sphinx documentation
-docs/_build/
-
-# PyBuilder
-target/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
+# mypy / type checking
 .mypy_cache/
 .dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
+.ruff_cache/
+.pyright/
 
 # Development
 .claude/
@@ -183,6 +73,12 @@ dmypy.json
 # Test output
 tests/output/
 
-# Benchmark outputs
-/benchmarks/results*.json
-/benchmarks/*_results.json
+# Benchmark results (regeneratable, keep out of version control)
+benchmarks/results/
+benchmarks/test_data/
+
+# Lock files (keep Cargo.lock for reproducibility, ignore uv.lock)
+uv.lock
+
+# Paper (keep separate from library code)
+paper/

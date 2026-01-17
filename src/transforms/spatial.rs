@@ -120,17 +120,9 @@ pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiIm
     // Update header dimensions (reset unused dims to 1)
     let mut header = image.header().clone();
     header.ndim = target_shape.len() as u8;
-    header.dim = [1u16; 7];
+    header.dim = [1i64; 7];
     for (i, &s) in target_shape.iter().enumerate() {
-        if s > u16::MAX as usize {
-            return Err(Error::InvalidDimensions(format!(
-                "Target shape dimension {} ({}) exceeds maximum value {}",
-                i,
-                s,
-                u16::MAX
-            )));
-        }
-        header.dim[i] = s as u16;
+        header.dim[i] = s as i64;
     }
 
     // Update origin for crop/pad offset
@@ -155,6 +147,89 @@ pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiIm
             new_affine[2][3] += affine[2][i] * shift;
         }
     }
+
+    header.set_affine(new_affine);
+
+    Ok(NiftiImage::from_parts(header, new_data))
+}
+
+/// Crop the image to a specified region.
+///
+/// # Arguments
+///
+/// * `image` - The input image
+/// * `start` - Start coordinates [d, h, w]
+/// * `end` - End coordinates (exclusive) [d, h, w]
+///
+/// # Errors
+///
+/// Returns an error if the crop region is out of bounds or data cannot be accessed.
+pub fn crop(image: &NiftiImage, start: [usize; 3], end: [usize; 3]) -> Result<NiftiImage> {
+    let shape = image.shape();
+
+    // Clamp to valid bounds
+    let start = [
+        start[0].min(shape[0]),
+        start[1].min(shape.get(1).copied().unwrap_or(1)),
+        start[2].min(shape.get(2).copied().unwrap_or(1)),
+    ];
+    let end = [
+        end[0].min(shape[0]).max(start[0]),
+        end[1].min(shape.get(1).copied().unwrap_or(1)).max(start[1]),
+        end[2].min(shape.get(2).copied().unwrap_or(1)).max(start[2]),
+    ];
+
+    let crop_size = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+
+    macro_rules! crop_array_ref {
+        ($arr:expr, $variant:ident) => {{
+            let view = $arr.slice(ndarray::s![
+                start[0]..end[0],
+                start[1]..end[1],
+                start[2]..end[2]
+            ]);
+            ArrayData::$variant(view.to_owned().into_dyn())
+        }};
+    }
+
+    let data = image.data_cow()?;
+    let new_data = match data.as_ref() {
+        ArrayData::U8(a) => crop_array_ref!(a, U8),
+        ArrayData::I8(a) => crop_array_ref!(a, I8),
+        ArrayData::I16(a) => crop_array_ref!(a, I16),
+        ArrayData::U16(a) => crop_array_ref!(a, U16),
+        ArrayData::I32(a) => crop_array_ref!(a, I32),
+        ArrayData::U32(a) => crop_array_ref!(a, U32),
+        ArrayData::I64(a) => crop_array_ref!(a, I64),
+        ArrayData::U64(a) => crop_array_ref!(a, U64),
+        ArrayData::F16(a) => crop_array_ref!(a, F16),
+        ArrayData::BF16(a) => crop_array_ref!(a, BF16),
+        ArrayData::F32(a) => crop_array_ref!(a, F32),
+        ArrayData::F64(a) => crop_array_ref!(a, F64),
+    };
+
+    // Update header dimensions
+    let mut header = image.header().clone();
+    header.ndim = 3;
+    header.dim = [1i64; 7];
+    header.dim[0] = crop_size[0] as i64;
+    header.dim[1] = crop_size[1] as i64;
+    header.dim[2] = crop_size[2] as i64;
+
+    // Update affine to reflect new origin
+    let affine = image.affine();
+    let mut new_affine = affine;
+
+    // Shift origin by start offset
+    new_affine[0][3] += affine[0][0] * start[0] as f32
+        + affine[0][1] * start[1] as f32
+        + affine[0][2] * start[2] as f32;
+    new_affine[1][3] += affine[1][0] * start[0] as f32
+        + affine[1][1] * start[1] as f32
+        + affine[1][2] * start[2] as f32;
+    new_affine[2][3] += affine[2][0] * start[0] as f32
+        + affine[2][1] * start[1] as f32
+        + affine[2][2] * start[2] as f32;
 
     header.set_affine(new_affine);
 

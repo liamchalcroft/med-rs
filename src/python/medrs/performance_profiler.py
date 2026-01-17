@@ -17,15 +17,16 @@ from collections import defaultdict, deque
 
 try:
     import torch
+
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
 
 
-
 @dataclass
 class PerformanceMetric:
     """Single performance measurement."""
+
     operation: str
     duration_ms: float
     memory_mb: float
@@ -36,6 +37,7 @@ class PerformanceMetric:
 @dataclass
 class PerformanceSummary:
     """Summary of performance metrics."""
+
     operation: str
     count: int
     avg_duration_ms: float
@@ -63,10 +65,7 @@ class PerformanceProfiler:
         return operation_id
 
     def end_operation(
-        self,
-        operation_id: str,
-        operation: str,
-        metadata: Optional[Dict[str, Any]] = None
+        self, operation_id: str, operation: str, metadata: Optional[Dict[str, Any]] = None
     ) -> float:
         """End timing an operation and record metrics."""
         end_time = time.time()
@@ -84,7 +83,7 @@ class PerformanceProfiler:
                 duration_ms=duration_ms,
                 memory_mb=memory_mb,
                 timestamp=start_time,
-                metadata=metadata or {}
+                metadata=metadata or {},
             )
 
             self.metrics.append(metric)
@@ -103,8 +102,7 @@ class PerformanceProfiler:
         """Get performance summary for operations."""
         with self._lock:
             filtered_metrics = [
-                m for m in self.metrics
-                if operation is None or m.operation == operation
+                m for m in self.metrics if operation is None or m.operation == operation
             ]
 
         if not filtered_metrics:
@@ -127,7 +125,7 @@ class PerformanceProfiler:
                 max_duration_ms=max(durations),
                 total_duration_ms=sum(durations),
                 avg_memory_mb=sum(memories) / len(memories),
-                peak_memory_mb=max(memories)
+                peak_memory_mb=max(memories),
             )
 
         return result
@@ -162,7 +160,7 @@ class PerformanceProfiler:
                     "duration_ms": m.duration_ms,
                     "memory_mb": m.memory_mb,
                     "timestamp": m.timestamp,
-                    "metadata": m.metadata
+                    "metadata": m.metadata,
                 }
                 for m in self.metrics
             ]
@@ -185,11 +183,14 @@ _global_profiler = PerformanceProfiler()
 
 def profile(operation: str, metadata: Optional[Dict[str, Any]] = None):
     """Decorator for profiling functions."""
+
     def decorator(func: Callable) -> Callable:
         def wrapper(*args, **kwargs):
             with _global_profiler.profile(operation, metadata):
                 return func(*args, **kwargs)
+
         return wrapper
+
     return decorator
 
 
@@ -202,7 +203,7 @@ def benchmark_operation(
     operation: Callable,
     num_runs: int = 10,
     warmup_runs: int = 2,
-    metadata: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     """Benchmark an operation with multiple runs."""
     if num_runs < 1:
@@ -225,8 +226,11 @@ def benchmark_operation(
         "avg_duration_ms": sum(durations) / len(durations),
         "min_duration_ms": min(durations),
         "max_duration_ms": max(durations),
-        "std_duration_ms": (sum((d - sum(durations)/len(durations))**2 for d in durations) / len(durations))**0.5,
-        "total_runs": num_runs
+        "std_duration_ms": (
+            sum((d - sum(durations) / len(durations)) ** 2 for d in durations) / len(durations)
+        )
+        ** 0.5,
+        "total_runs": num_runs,
     }
 
 
@@ -275,11 +279,11 @@ def monitor_memory():
 def format_duration(ms: float) -> str:
     """Format duration in human readable format."""
     if ms < 1:
-        return f"{ms*1000:.1f}mus"
+        return f"{ms * 1000:.1f}mus"
     elif ms < 1000:
         return f"{ms:.1f}ms"
     else:
-        return f"{ms/1000:.2f}s"
+        return f"{ms / 1000:.2f}s"
 
 
 def format_memory(mb: float) -> str:
@@ -287,4 +291,4 @@ def format_memory(mb: float) -> str:
     if mb < 1024:
         return f"{mb:.1f}MB"
     else:
-        return f"{mb/1024:.1f}GB"
+        return f"{mb / 1024:.1f}GB"

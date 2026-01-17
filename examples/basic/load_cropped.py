@@ -1,90 +1,81 @@
 #!/usr/bin/env python3
-"""
-medrs Crop-First Loading Example
-================================
+"""medrs crop-first loading example."""
 
-This example demonstrates medrs's signature crop-first loading capability,
-which only loads the specific bytes you need from a NIfTI file.
-"""
-
+import time
 import torch
 import medrs
 
 
-def demonstrate_crop_loading():
-    """Demonstrate different crop loading approaches."""
-
-    print(" Crop-First Loading Examples")
-    print("=" * 40)
-
-    # Replace with your NIfTI file
-    # Note: load_cropped requires uncompressed .nii files (not .nii.gz)
+def main():
     volume_path = "sample_volume.nii"
 
+    print("Crop-First Loading")
+    print("=" * 40)
+
     try:
-        # Method 1: Load with specific offset and shape
-        print("\n1. Load specific crop region:")
+        print("\n1. Load specific region:")
+        start = time.time()
         crop = medrs.load_cropped(
             volume_path,
-            crop_offset=[50, 50, 25],  # Starting voxel
-            crop_shape=[64, 64, 32]    # Patch size
+            crop_offset=[50, 50, 25],
+            crop_shape=[64, 64, 32],
         )
-        print(f"    Shape: {crop.data.shape}")
-        print(f"    Spacing: {crop.spacing}")
+        load_time = time.time() - start
+        print(f"   Shape: {crop.shape}")
+        print(f"   Spacing: {crop.spacing}")
+        print(f"   Time: {load_time * 1000:.2f}ms")
 
-        # Method 2: Load directly to PyTorch tensor
         print("\n2. Load directly to PyTorch:")
+        start = time.time()
         tensor = medrs.load_cropped_to_torch(
             volume_path,
             output_shape=[96, 96, 96],
-            device="cuda" if torch.cuda.is_available() else "cpu"
+            device="cuda" if torch.cuda.is_available() else "cpu",
         )
-        print(f"    Shape: {tensor.shape}")
-        print(f"    Device: {tensor.device}")
+        load_time = time.time() - start
+        print(f"   Shape: {tuple(tensor.shape)}")
+        print(f"   Device: {tensor.device}")
+        print(f"   Time: {load_time * 1000:.2f}ms")
 
-        # Method 3: Load with half precision
-        print("\n3. Load with memory optimization:")
+        print("\n3. Half precision:")
+        start = time.time()
         half_tensor = medrs.load_cropped_to_torch(
             volume_path,
             output_shape=[128, 128, 128],
             device="cuda" if torch.cuda.is_available() else "cpu",
-            dtype=torch.float16
+            dtype=torch.float16,
         )
-        print(f"    Dtype: {half_tensor.dtype}")
-        print(f"    Memory: ~{half_tensor.numel() * half_tensor.element_size() / 1024**2:.1f}MB")
+        load_time = time.time() - start
+        memory_mb = half_tensor.numel() * half_tensor.element_size() / 1024**2
+        print(f"   Dtype: {half_tensor.dtype}")
+        print(f"   Memory: {memory_mb:.1f}MB")
+        print(f"   Time: {load_time * 1000:.2f}ms")
 
-        # Method 4: Multiple crops from same volume
-        print("\n4. Load multiple crops:")
+        print("\n4. Multiple patches:")
+        offsets = [[32, 32, 16], [64, 64, 32], [96, 96, 48]]
         patches = []
-        crop_offsets = [[32, 32, 16], [64, 64, 32], [96, 96, 48]]
-
-        for i, offset in enumerate(crop_offsets):
+        for offset in offsets:
             patch = medrs.load_cropped(volume_path, offset, [32, 32, 32])
             patches.append(patch.to_torch())
-            print(f"   Patch {i+1}: {patches[-1].shape}")
+        stacked = torch.stack(patches)
+        print(f"   Stacked shape: {tuple(stacked.shape)}")
 
-        stacked_patches = torch.stack(patches)
-        print(f"    Stacked shape: {stacked_patches.shape}")
-
-        # Performance comparison
-        print("\n5. Performance comparison:")
-        sizes = [32, 64, 96, 128]
-
-        for size in sizes:
-            start_time = time.time()
+        print("\n5. Scaling test:")
+        for size in [32, 64, 96, 128]:
+            start = time.time()
             patch = medrs.load_cropped(volume_path, [0, 0, 0], [size, size, size])
-            load_time = time.time() - start_time
-            memory_mb = patch.data.nbytes / 1024**2
+            load_time = time.time() - start
+            memory_mb = patch.to_numpy().nbytes / 1024**2
+            print(f"   {size}^3: {load_time * 1000:.2f}ms, {memory_mb:.1f}MB")
 
-            print(f"   {size}^3: {load_time:.4f}s, {memory_mb:.1f}MB")
+        print("\nDone.")
 
     except FileNotFoundError:
-        print(f" File not found: {volume_path}")
-        print("Replace with a valid NIfTI file path")
+        print(f"\nFile not found: {volume_path}")
+        print("Note: load_cropped requires uncompressed .nii files")
     except Exception as e:
-        print(f" Error: {e}")
+        print(f"\nError: {e}")
 
 
 if __name__ == "__main__":
-    import time
-    demonstrate_crop_loading()
+    main()

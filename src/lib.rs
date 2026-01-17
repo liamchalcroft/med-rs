@@ -106,6 +106,7 @@ pub mod pipeline;
 pub mod transforms;
 
 #[cfg(feature = "python")]
+#[path = "python/mod.rs"]
 mod python;
 
 pub use error::{Error, Result};

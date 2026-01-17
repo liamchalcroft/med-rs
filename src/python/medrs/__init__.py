@@ -42,6 +42,7 @@ from typing import Any, Optional
 from ._medrs import (
     NiftiImage,
     TrainingDataLoader,
+    FastLoader,
     TransformPipeline,
     clamp,
     crop_or_pad,
@@ -56,7 +57,6 @@ from ._medrs import (
     resample,
     rescale_intensity,
     z_normalization,
-    # Random augmentation functions
     random_flip,
     random_gaussian_noise,
     random_intensity_scale,
@@ -64,10 +64,13 @@ from ._medrs import (
     random_rotate_90,
     random_gamma,
     random_augment,
-    # Crop region functions
     compute_crop_regions,
     compute_random_spatial_crops,
     compute_center_crop,
+    save_mgzip,
+    load_mgzip,
+    convert_to_mgzip,
+    is_mgzip,
 )
 
 # Alias for more intuitive naming
@@ -90,6 +93,7 @@ __email__ = "liam.chalcroft.20@ucl.ac.uk"
 
 
 # Convenience functions
+
 
 def get_info(path: str) -> dict[str, Any]:
     """Get image metadata without loading the full volume.
@@ -133,6 +137,7 @@ def supports_monai() -> bool:
     """
     try:
         import monai  # noqa: F401
+
         return find_spec("medrs.metatensor_support") is not None
     except ImportError:
         return False
@@ -146,6 +151,7 @@ def supports_torch() -> bool:
     """
     try:
         import torch  # noqa: F401
+
         return True
     except ImportError:
         return False
@@ -159,26 +165,24 @@ def supports_jax() -> bool:
     """
     try:
         import jax  # noqa: F401
+
         return True
     except ImportError:
         return False
 
+
 __all__ = [
-    # Image classes
     "MedicalImage",
     "NiftiImage",
-    # Data loaders
     "TrainingDataLoader",
-    # Transform pipeline
+    "FastLoader",
     "TransformPipeline",
-    # Basic transforms
     "clamp",
     "crop_or_pad",
     "reorient",
     "resample",
     "rescale_intensity",
     "z_normalization",
-    # I/O functions
     "load",
     "load_cropped",
     "load_cropped_to_jax",
@@ -186,7 +190,6 @@ __all__ = [
     "load_label_aware_cropped",
     "load_resampled",
     "load_to_torch",
-    # Random augmentation
     "random_flip",
     "random_gaussian_noise",
     "random_intensity_scale",
@@ -194,16 +197,17 @@ __all__ = [
     "random_rotate_90",
     "random_gamma",
     "random_augment",
-    # Crop region functions
     "compute_crop_regions",
     "compute_random_spatial_crops",
     "compute_center_crop",
-    # Convenience functions
+    "save_mgzip",
+    "load_mgzip",
+    "convert_to_mgzip",
+    "is_mgzip",
     "get_info",
     "supports_monai",
     "supports_torch",
     "supports_jax",
-    # Exceptions
     "ConfigurationError",
     "DeviceError",
     "LoadError",
@@ -211,7 +215,6 @@ __all__ = [
     "MemoryError",
     "TransformError",
     "ValidationError",
-    # Utilities
     "PerformanceProfiler",
 ]
 
@@ -258,21 +261,18 @@ _load_optional(
 _load_optional(
     "monai_compat",
     [
-        # Load transforms (drop-in replacements)
         "MedrsLoadImage",
         "MedrsLoadImaged",
-        # Save transforms
         "MedrsSaveImage",
         "MedrsSaveImaged",
-        # Crop transforms (crop-first loading)
         "MedrsRandCropByPosNegLabeld",
         "MedrsRandSpatialCropd",
         "MedrsCenterSpatialCropd",
-        # Spatial transforms
         "MedrsOrientation",
         "MedrsOrientationd",
-        # Resample transforms
         "MedrsResample",
         "MedrsResampled",
+        "MedrsFastLoaderDataset",
+        "MedrsFastLoaderIterableDataset",
     ],
 )

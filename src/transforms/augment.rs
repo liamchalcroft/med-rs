@@ -78,8 +78,10 @@ pub fn random_gaussian_noise(
     std: Option<f32>,
     seed: Option<u64>,
 ) -> Result<NiftiImage> {
+    const CHUNK_SIZE: usize = 8192;
+
     let std = std.unwrap_or(0.1);
-    let mut rng = get_rng(seed);
+    let base_seed = seed.unwrap_or_else(rand::random);
 
     let data = image.to_f32()?;
     let slice = data.as_slice_memory_order().ok_or_else(|| {
@@ -87,17 +89,34 @@ pub fn random_gaussian_noise(
     })?;
     let len = slice.len();
 
-    // Generate noise in parallel chunks for large arrays
     let mut output = acquire_buffer(len);
+    let n_chunks = len.div_ceil(CHUNK_SIZE);
 
-    // Use Box-Muller transform for Gaussian noise
-    for (i, out) in output.iter_mut().enumerate() {
-        let u1: f32 = rng.gen();
-        let u2: f32 = rng.gen();
-        // Avoid log(0)
-        let u1 = u1.max(1e-10);
-        let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos() * std;
-        *out = slice[i] + noise;
+    if n_chunks > 1 {
+        output
+            .par_chunks_mut(CHUNK_SIZE)
+            .enumerate()
+            .for_each(|(chunk_idx, out_chunk)| {
+                let chunk_seed = base_seed.wrapping_add(chunk_idx as u64);
+                let mut rng = ChaCha8Rng::seed_from_u64(chunk_seed);
+                let start = chunk_idx * CHUNK_SIZE;
+
+                for (i, out) in out_chunk.iter_mut().enumerate() {
+                    let u1: f32 = rng.gen::<f32>().max(1e-10);
+                    let u2: f32 = rng.gen();
+                    let noise =
+                        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos() * std;
+                    *out = slice[start + i] + noise;
+                }
+            });
+    } else {
+        let mut rng = ChaCha8Rng::seed_from_u64(base_seed);
+        for (i, out) in output.iter_mut().enumerate() {
+            let u1: f32 = rng.gen::<f32>().max(1e-10);
+            let u2: f32 = rng.gen();
+            let noise = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos() * std;
+            *out = slice[i] + noise;
+        }
     }
 
     // F-order to match NIfTI convention
@@ -297,17 +316,9 @@ fn rotate_90(image: &NiftiImage, axes: (usize, usize), k: usize) -> Result<Nifti
     }
 
     header.ndim = new_shape.len() as u8;
-    header.dim = [1u16; 7];
+    header.dim = [1i64; 7];
     for (i, &s) in new_shape.iter().enumerate() {
-        if s > u16::MAX as usize {
-            return Err(Error::InvalidDimensions(format!(
-                "Rotated dimension {} ({}) exceeds maximum value {}",
-                i,
-                s,
-                u16::MAX
-            )));
-        }
-        header.dim[i] = s as u16;
+        header.dim[i] = s as i64;
     }
 
     Ok(NiftiImage::from_parts(header, new_data))
@@ -368,27 +379,165 @@ pub fn random_gamma(
 /// - Random intensity shift
 /// - Random Gaussian noise
 ///
-/// # Arguments
-///
-/// * `image` - Input image
-/// * `seed` - Optional random seed for reproducibility
+/// For more control, use `RandomAugmentBuilder`.
 #[must_use = "this function returns a Result and does not modify the original"]
 pub fn random_augment(image: &NiftiImage, seed: Option<u64>) -> Result<NiftiImage> {
-    let mut rng = get_rng(seed);
+    RandomAugmentBuilder::new().seed_opt(seed).apply(image)
+}
 
-    // Generate seeds for each sub-operation
-    let flip_seed = rng.gen();
-    let scale_seed = rng.gen();
-    let shift_seed = rng.gen();
-    let noise_seed = rng.gen();
+/// Builder for configurable random augmentation pipelines.
+#[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct RandomAugmentBuilder {
+    flip_axes: Vec<usize>,
+    flip_prob: f32,
+    scale_range: f32,
+    shift_range: f32,
+    noise_std: f32,
+    gamma_range: Option<(f32, f32)>,
+    enable_flip: bool,
+    enable_scale: bool,
+    enable_shift: bool,
+    enable_noise: bool,
+    enable_gamma: bool,
+    seed: Option<u64>,
+}
 
-    // Apply augmentations in sequence
-    let result = random_flip(image, &[0, 1, 2], Some(0.5), Some(flip_seed))?;
-    let result = random_intensity_scale(&result, Some(0.1), Some(scale_seed))?;
-    let result = random_intensity_shift(&result, Some(0.1), Some(shift_seed))?;
-    let result = random_gaussian_noise(&result, Some(0.05), Some(noise_seed))?;
+impl Default for RandomAugmentBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    Ok(result)
+impl RandomAugmentBuilder {
+    /// Create a new augmentation builder with default settings.
+    pub fn new() -> Self {
+        Self {
+            flip_axes: vec![0, 1, 2],
+            flip_prob: 0.5,
+            scale_range: 0.1,
+            shift_range: 0.1,
+            noise_std: 0.05,
+            gamma_range: None,
+            enable_flip: true,
+            enable_scale: true,
+            enable_shift: true,
+            enable_noise: true,
+            enable_gamma: false,
+            seed: None,
+        }
+    }
+
+    /// Set the random seed for reproducibility.
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Set an optional seed.
+    pub fn seed_opt(mut self, seed: Option<u64>) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    /// Set axes for random flipping.
+    pub fn flip_axes(mut self, axes: &[usize]) -> Self {
+        self.flip_axes = axes.to_vec();
+        self
+    }
+
+    /// Set flip probability per axis.
+    pub fn flip_prob(mut self, prob: f32) -> Self {
+        self.flip_prob = prob;
+        self
+    }
+
+    /// Set intensity scale range (± this value).
+    pub fn scale_range(mut self, range: f32) -> Self {
+        self.scale_range = range;
+        self
+    }
+
+    /// Set intensity shift range (± this value).
+    pub fn shift_range(mut self, range: f32) -> Self {
+        self.shift_range = range;
+        self
+    }
+
+    /// Set Gaussian noise standard deviation.
+    pub fn noise_std(mut self, std: f32) -> Self {
+        self.noise_std = std;
+        self
+    }
+
+    /// Enable gamma correction with specified range.
+    pub fn gamma(mut self, min: f32, max: f32) -> Self {
+        self.gamma_range = Some((min, max));
+        self.enable_gamma = true;
+        self
+    }
+
+    /// Disable random flipping.
+    pub fn no_flip(mut self) -> Self {
+        self.enable_flip = false;
+        self
+    }
+
+    /// Disable intensity scaling.
+    pub fn no_scale(mut self) -> Self {
+        self.enable_scale = false;
+        self
+    }
+
+    /// Disable intensity shifting.
+    pub fn no_shift(mut self) -> Self {
+        self.enable_shift = false;
+        self
+    }
+
+    /// Disable Gaussian noise.
+    pub fn no_noise(mut self) -> Self {
+        self.enable_noise = false;
+        self
+    }
+
+    /// Apply the augmentation pipeline to an image.
+    pub fn apply(&self, image: &NiftiImage) -> Result<NiftiImage> {
+        let mut rng = get_rng(self.seed);
+        let mut result = image.clone();
+
+        if self.enable_flip && !self.flip_axes.is_empty() {
+            let flip_seed: u64 = rng.gen();
+            result = random_flip(
+                &result,
+                &self.flip_axes,
+                Some(self.flip_prob),
+                Some(flip_seed),
+            )?;
+        }
+
+        if self.enable_scale && self.scale_range > 0.0 {
+            let scale_seed: u64 = rng.gen();
+            result = random_intensity_scale(&result, Some(self.scale_range), Some(scale_seed))?;
+        }
+
+        if self.enable_shift && self.shift_range > 0.0 {
+            let shift_seed: u64 = rng.gen();
+            result = random_intensity_shift(&result, Some(self.shift_range), Some(shift_seed))?;
+        }
+
+        if self.enable_noise && self.noise_std > 0.0 {
+            let noise_seed: u64 = rng.gen();
+            result = random_gaussian_noise(&result, Some(self.noise_std), Some(noise_seed))?;
+        }
+
+        if self.enable_gamma {
+            let gamma_seed: u64 = rng.gen();
+            result = random_gamma(&result, self.gamma_range, Some(gamma_seed))?;
+        }
+
+        Ok(result)
+    }
 }
 
 #[cfg(test)]

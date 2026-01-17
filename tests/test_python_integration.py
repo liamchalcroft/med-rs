@@ -21,27 +21,25 @@ import medrs
 from monai.transforms import Compose
 
 # Import test utilities
-from tests.test_utils import (
-    create_3d_test_file, create_small_test_file
-)
+from tests.test_utils import create_3d_test_file, create_small_test_file
 
 
 class TestNumPyIntegration:
     """Test NumPy integration and array view operations."""
 
-    def test_load_and_numpy_view(self):
-        """Test basic loading and numpy view creation."""
+    def test_load_and_numpy(self):
+        """Test basic loading and numpy array creation."""
         # Create a test NIfTI file using our utility
         with create_3d_test_file(shape=(64, 64, 32), seed=42) as path:
-            # Load and test numpy view
+            # Load and test numpy array
             loaded = medrs.load(path)
-            np_view = loaded.to_numpy_view()
+            np_array = loaded.to_numpy(copy=True)
 
-            assert np_view.shape == (64, 64, 32)
-            assert np_view.dtype == np.float32
+            assert np_array.shape == (64, 64, 32)
+            assert np_array.dtype == np.float32
             # Verify data is not empty and has reasonable values
-            assert np_view.size == 64 * 64 * 32
-            assert np.isfinite(np_view).all()
+            assert np_array.size == 64 * 64 * 32
+            assert np.isfinite(np_array).all()
 
     def test_memory_efficiency_numpy_view(self):
         """Test that numpy views are zero-copy when possible."""
@@ -49,10 +47,13 @@ class TestNumPyIntegration:
         with create_small_test_file() as path:
             loaded = medrs.load(path)
 
-            # Test that we can get a numpy view
-            np_view = loaded.to_numpy_view()
-            assert list(np_view.shape) == loaded.shape
-            assert np_view.dtype == np.float32
+            # Zero-copy path (mmap-backed .nii, f32, no scaling)
+            np_zero = loaded.to_numpy(copy=False)
+            assert list(np_zero.shape) == loaded.shape
+            assert np_zero.dtype == np.float32
+            assert np_zero.base is not None
+            assert not np_zero.flags["OWNDATA"]
+            assert not np_zero.flags["WRITEABLE"]
 
             # Test that we can get numpy array
             np_array = loaded.to_numpy()
@@ -60,7 +61,7 @@ class TestNumPyIntegration:
             assert np_array.dtype == np.float32
 
             # Verify the data is consistent between view and array
-            np.testing.assert_array_equal(np_view, np_array)
+            np.testing.assert_array_equal(np_zero, np_array)
 
 
 class TestPyTorchIntegration:
@@ -69,31 +70,24 @@ class TestPyTorchIntegration:
     def test_load_to_torch_cpu(self):
         """Test direct PyTorch tensor creation on CPU."""
         # Test interface exists
-        assert hasattr(medrs, 'load_cropped_to_torch')
-        assert hasattr(medrs, 'load_to_torch')
+        assert hasattr(medrs, "load_cropped_to_torch")
+        assert hasattr(medrs, "load_to_torch")
 
         # Test with real file
         with create_small_test_file() as path:
             # Test full volume loading
-            tensor = medrs.load_to_torch(
-                path,
-                dtype=torch.float32,
-                device="cpu"
-            )
+            tensor = medrs.load_to_torch(path, dtype=torch.float32, device="cpu")
             assert isinstance(tensor, torch.Tensor)
-            assert tensor.device.type == 'cpu'
+            assert tensor.device.type == "cpu"
             assert tensor.dtype == torch.float32
 
             # Test cropped loading
             cropped_tensor = medrs.load_cropped_to_torch(
-                path,
-                output_shape=[8, 8, 4],
-                dtype=torch.float32,
-                device="cpu"
+                path, output_shape=[8, 8, 4], dtype=torch.float32, device="cpu"
             )
             assert isinstance(cropped_tensor, torch.Tensor)
             assert cropped_tensor.shape == (8, 8, 4)
-            assert cropped_tensor.device.type == 'cpu'
+            assert cropped_tensor.device.type == "cpu"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_load_to_torch_gpu(self):
@@ -103,22 +97,19 @@ class TestPyTorchIntegration:
             tensor = medrs.load_to_torch(
                 path,
                 dtype=torch.float16,  # Half precision
-                device="cuda"
+                device="cuda",
             )
             assert isinstance(tensor, torch.Tensor)
-            assert tensor.device.type == 'cuda'
+            assert tensor.device.type == "cuda"
             assert tensor.dtype == torch.float16
 
             # Test cropped GPU loading
             cropped_tensor = medrs.load_cropped_to_torch(
-                path,
-                output_shape=[8, 8, 4],
-                dtype=torch.float16,
-                device="cuda"
+                path, output_shape=[8, 8, 4], dtype=torch.float16, device="cuda"
             )
             assert isinstance(cropped_tensor, torch.Tensor)
             assert cropped_tensor.shape == (8, 8, 4)
-            assert cropped_tensor.device.type == 'cuda'
+            assert cropped_tensor.device.type == "cuda"
             assert cropped_tensor.dtype == torch.float16
 
     def test_torch_dtype_conversion(self):
@@ -127,10 +118,7 @@ class TestPyTorchIntegration:
             dtypes = [torch.float32, torch.float16]
             for dtype in dtypes:
                 tensor = medrs.load_cropped_to_torch(
-                    path,
-                    output_shape=[8, 8, 4],
-                    dtype=dtype,
-                    device="cpu"
+                    path, output_shape=[8, 8, 4], dtype=dtype, device="cpu"
                 )
                 assert isinstance(tensor, torch.Tensor)
                 assert tensor.dtype == dtype
@@ -144,13 +132,9 @@ class TestPyTorchIntegration:
                 devices.append("cuda")
 
             for device in devices:
-                tensor = medrs.load_cropped_to_torch(
-                    path,
-                    output_shape=[8, 8, 4],
-                    device=device
-                )
+                tensor = medrs.load_cropped_to_torch(path, output_shape=[8, 8, 4], device=device)
                 assert isinstance(tensor, torch.Tensor)
-                assert tensor.device.type.split(':')[0] == device.split(':')[0]
+                assert tensor.device.type.split(":")[0] == device.split(":")[0]
                 assert tensor.shape == (8, 8, 4)
 
 
@@ -160,7 +144,7 @@ class TestJAXIntegration:
     def test_load_to_jax(self):
         """Test direct JAX array creation."""
         # Test interface exists
-        assert hasattr(medrs, 'load_cropped_to_jax')
+        assert hasattr(medrs, "load_cropped_to_jax")
 
         with create_small_test_file() as path:
             # Test function with real data - may fail if JAX backend not configured
@@ -169,7 +153,7 @@ class TestJAXIntegration:
                     path,
                     output_shape=[8, 8, 4],
                 )
-                assert hasattr(jax_array, 'shape')  # JAX array-like
+                assert hasattr(jax_array, "shape")  # JAX array-like
                 assert jax_array.shape == (8, 8, 4)
             except AttributeError as e:
                 if "devices" in str(e):
@@ -179,16 +163,14 @@ class TestJAXIntegration:
     def test_jax_dtype_conversion(self):
         """Test JAX dtype conversion support."""
         try:
-            with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as f:
                 path = f.name
 
             dtypes = [jnp.float32, jnp.float16, jnp.int32]
             for dtype in dtypes:
                 with pytest.raises((OSError, ValueError)):  # Empty file raises I/O error
                     jax_array = medrs.load_cropped_to_jax(
-                        path=path,
-                        output_shape=[16, 16, 16],
-                        dtype=dtype
+                        path=path, output_shape=[16, 16, 16], dtype=dtype
                     )
         finally:
             if os.path.exists(path):
@@ -200,6 +182,7 @@ class TestMONAICompatibility:
 
     def test_monai_compose_adapter(self):
         """Test that medrs can work within MONAI Compose pipelines."""
+
         # Test that we can create a compatible interface
         class MedrsLoadImage:
             """MONAI-compatible adapter for medrs loading."""
@@ -210,7 +193,7 @@ class TestMONAICompatibility:
             def __call__(self, path):
                 # Load using medrs and return numpy array for MONAI compatibility
                 img = medrs.load(path)
-                return img.to_numpy_view()
+                return img.to_numpy(copy=True)
 
         # Test adapter creation
         loader = MedrsLoadImage()
@@ -218,17 +201,21 @@ class TestMONAICompatibility:
 
         # Test in a compose pipeline (interface test only)
         try:
-            with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as f:
                 path = f.name
 
             # Create MONAI-style transform
-            transform = Compose([
-                MedrsLoadImage(),
-                # Would add more transforms here with real data
-            ])
+            transform = Compose(
+                [
+                    MedrsLoadImage(),
+                    # Would add more transforms here with real data
+                ]
+            )
 
             # Test that the transform can be called
-            with pytest.raises((OSError, ValueError, RuntimeError)):  # Empty file raises I/O error (wrapped by MONAI)
+            with pytest.raises(
+                (OSError, ValueError, RuntimeError)
+            ):  # Empty file raises I/O error (wrapped by MONAI)
                 result = transform(path)
         finally:
             if os.path.exists(path):
@@ -237,7 +224,7 @@ class TestMONAICompatibility:
     def test_training_dataloader_compatibility(self):
         """Test TrainingDataLoader compatibility with MONAI workflows."""
         # Test that TrainingDataLoader exists and has expected interface
-        assert hasattr(medrs, 'TrainingDataLoader')
+        assert hasattr(medrs, "TrainingDataLoader")
 
         # Test interface (would need real files for full test)
         try:
@@ -251,13 +238,13 @@ class TestMONAICompatibility:
                         patch_size=[64, 64, 64],
                         patches_per_volume=4,
                         randomize=True,
-                        cache_size=1000
+                        cache_size=1000,
                     )
 
                     # Test that it has expected methods
-                    assert hasattr(loader, 'next_patch')
-                    assert hasattr(loader, 'reset')
-                    assert hasattr(loader, 'stats')
+                    assert hasattr(loader, "next_patch")
+                    assert hasattr(loader, "reset")
+                    assert hasattr(loader, "stats")
         except Exception:
             # Interface test passes even with empty volume list
             pass
@@ -268,11 +255,11 @@ class TestPerformanceFeatures:
 
     def test_byte_exact_loading_interface(self):
         """Test byte-exact loading interface exists."""
-        assert hasattr(medrs, 'load_cropped')
+        assert hasattr(medrs, "load_cropped")
 
         # Test function signature
         try:
-            with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as f:
                 path = f.name
 
             # Test interface (will fail with mock file but validates signature)
@@ -285,10 +272,10 @@ class TestPerformanceFeatures:
     def test_advanced_loading_interface(self):
         """Test advanced loading with orientation/resampling."""
         # Test interface exists
-        assert hasattr(medrs, 'load_resampled')
+        assert hasattr(medrs, "load_resampled")
 
         try:
-            with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as f:
                 path = f.name
 
             # Test advanced loading interface
@@ -297,7 +284,7 @@ class TestPerformanceFeatures:
                     path=path,
                     output_shape=[32, 32, 32],
                     target_spacing=[1.0, 1.0, 1.0],
-                    target_orientation="RAS"
+                    target_orientation="RAS",
                 )
         finally:
             if os.path.exists(path):
@@ -307,7 +294,7 @@ class TestPerformanceFeatures:
         """Test half-precision loading without upcasting."""
         # Test that interface supports half precision
         try:
-            with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as f:
                 path = f.name
 
             with pytest.raises((OSError, ValueError)):  # Empty file raises I/O error
@@ -315,14 +302,14 @@ class TestPerformanceFeatures:
                     path=path,
                     output_shape=[16, 16, 16],
                     dtype=torch.float16,  # Half precision
-                    device="cpu"
+                    device="cpu",
                 )
 
             with pytest.raises((OSError, ValueError)):  # Empty file raises I/O error
                 jax_array = medrs.load_cropped_to_jax(
                     path=path,
                     output_shape=[16, 16, 16],
-                    dtype=jnp.float16  # Half precision
+                    dtype=jnp.float16,  # Half precision
                 )
         finally:
             if os.path.exists(path):
@@ -339,7 +326,7 @@ class TestErrorHandling:
             medrs.load("nonexistent_file.nii")
 
         # Test with non-NIfTI file - should raise error for invalid format
-        with tempfile.NamedTemporaryFile(suffix='.txt', delete=False) as f:
+        with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
             f.write(b"not a nifti file")
             temp_path = f.name
 
@@ -367,7 +354,7 @@ class TestErrorHandling:
                     path=path,
                     output_shape=[8, 8, 4],
                     dtype="invalid_dtype",  # Should be torch.dtype
-                    device="cpu"
+                    device="cpu",
                 )
 
 

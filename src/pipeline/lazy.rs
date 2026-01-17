@@ -584,10 +584,10 @@ fn apply_affine(
         .map_err(|e| Error::InvalidDimensions(format!("Shape mismatch: {}", e)))?;
     let mut header = image.header().clone();
     header.ndim = 3;
-    header.dim = [1u16; 7];
-    header.dim[0] = od as u16;
-    header.dim[1] = oh as u16;
-    header.dim[2] = ow as u16;
+    header.dim = [1i64; 7];
+    header.dim[0] = od as i64;
+    header.dim[1] = oh as i64;
+    header.dim[2] = ow as i64;
     header.datatype = DataType::Float32;
     header.scl_slope = 1.0;
     header.scl_inter = 0.0;

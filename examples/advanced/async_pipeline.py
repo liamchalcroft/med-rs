@@ -27,12 +27,10 @@ class AsyncMedicalDataLoader:
         loop = asyncio.get_event_loop()
 
         # Run medrs loading in thread pool
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         tensor = await loop.run_in_executor(
             self.executor,
-            medrs.load_cropped_to_torch,
-            path,
-            patch_size,
-            "cuda" if torch.cuda.is_available() else "cpu"
+            lambda: medrs.load_cropped_to_torch(path, output_shape=patch_size, device=device),
         )
 
         return tensor
@@ -42,10 +40,7 @@ class AsyncMedicalDataLoader:
         batch_paths = self.volume_paths[:batch_size]
 
         # Create loading tasks
-        tasks = [
-            self.load_volume_async(path, patch_size)
-            for path in batch_paths
-        ]
+        tasks = [self.load_volume_async(path, patch_size) for path in batch_paths]
 
         # Wait for all loads to complete
         batch = await asyncio.gather(*tasks)
@@ -64,13 +59,11 @@ class PrefetchDataLoader:
 
     async def _load_single_volume(self, path):
         """Load a single volume with semaphore control."""
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         async with self.load_semaphore:
             return await asyncio.get_event_loop().run_in_executor(
                 None,
-                medrs.load_cropped_to_torch,
-                path,
-                (64, 64, 64),
-                "cuda" if torch.cuda.is_available() else "cpu"
+                lambda: medrs.load_cropped_to_torch(path, output_shape=(64, 64, 64), device=device),
             )
 
     async def prefetch_volumes(self):
@@ -116,7 +109,7 @@ async def demonstrate_async_loading():
     print(f"    Concurrent loading time: {concurrent_time:.3f}s")
     print(f"    Batch shape: {batch.shape}")
     print(f"    Device: {batch.device}")
-    print(f"    Throughput: {8/concurrent_time:.1f} volumes/sec")
+    print(f"    Throughput: {8 / concurrent_time:.1f} volumes/sec")
 
     # Compare with sequential loading
     print("\n3. Sequential Loading Comparison:")
@@ -134,7 +127,7 @@ async def demonstrate_async_loading():
 
     print(f"     Sequential loading time: {sequential_time:.3f}s")
     print(f"    Sequential batch shape: {sequential_batch.shape}")
-    print(f"    Speedup: {sequential_time/concurrent_time:.1f}x")
+    print(f"    Speedup: {sequential_time / concurrent_time:.1f}x")
 
 
 async def demonstrate_prefetching():
@@ -146,11 +139,7 @@ async def demonstrate_prefetching():
     volume_paths = [f"training_vol_{i:03d}.nii.gz" for i in range(50)]
 
     # Create prefetching loader
-    prefetch_loader = PrefetchDataLoader(
-        volume_paths,
-        prefetch_size=15,
-        batch_size=4
-    )
+    prefetch_loader = PrefetchDataLoader(volume_paths, prefetch_size=15, batch_size=4)
 
     print(f"    Prefetch queue size: {prefetch_loader.prefetch_size}")
     print(f"    Batch size: {prefetch_loader.batch_size}")
@@ -171,7 +160,7 @@ async def demonstrate_prefetching():
         batch_time = time.time() - start_time
         batch_times.append(batch_time)
 
-        print(f"   Batch {batch_idx+1}: {batch_time:.4f}s, shape {batch.shape}")
+        print(f"   Batch {batch_idx + 1}: {batch_time:.4f}s, shape {batch.shape}")
 
         # Simulate some processing time
         await asyncio.sleep(0.1)
@@ -181,7 +170,7 @@ async def demonstrate_prefetching():
 
     avg_batch_time = sum(batch_times) / len(batch_times)
     print(f"\n    Average batch time: {avg_batch_time:.4f}s")
-    print(f"    Effective throughput: {4/avg_batch_time:.1f} batches/sec")
+    print(f"    Effective throughput: {4 / avg_batch_time:.1f} batches/sec")
 
 
 class AsyncTrainingPipeline:
@@ -268,7 +257,7 @@ async def demonstrate_async_training():
 
     avg_time = total_time / batches_processed
     print(f"\n    Average step time: {avg_time:.3f}s")
-    print(f"    Training throughput: {6/avg_time:.1f} samples/sec")
+    print(f"    Training throughput: {6 / avg_time:.1f} samples/sec")
 
 
 async def demonstrate_memory_efficiency():
@@ -282,8 +271,8 @@ async def demonstrate_memory_efficiency():
 
     print(f"    Traditional approach: {traditional_memory:,}MB")
     print(f"    medrs async approach: {medrs_memory:,}MB")
-    print(f"    Memory reduction: {traditional_memory/medrs_memory:.0f}x")
-    print(f"    Memory saved: {(traditional_memory - medrs_memory)/1024:.1f}GB")
+    print(f"    Memory reduction: {traditional_memory / medrs_memory:.0f}x")
+    print(f"    Memory saved: {(traditional_memory - medrs_memory) / 1024:.1f}GB")
 
     # Streaming analysis
     print("\n    Streaming Benefits:")

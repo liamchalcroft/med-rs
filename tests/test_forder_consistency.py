@@ -14,18 +14,21 @@ import medrs
 # Try importing optional dependencies
 try:
     import torch
+
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
 
 try:
     import jax.numpy as jnp
+
     HAS_JAX = True
 except ImportError:
     HAS_JAX = False
 
 try:
     import nibabel as nib
+
     HAS_NIBABEL = True
 except ImportError:
     HAS_NIBABEL = False
@@ -54,7 +57,7 @@ class TestFOrderConsistency:
         img, _ = brain_image
         np_arr = img.to_numpy()
         # NIfTI uses F-order (Fortran/column-major)
-        assert np_arr.flags['F_CONTIGUOUS'], "Array should be F-contiguous for NIfTI"
+        assert np_arr.flags["F_CONTIGUOUS"], "Array should be F-contiguous for NIfTI"
 
     @pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
     def test_torch_values_match_numpy(self, brain_image):
@@ -68,15 +71,16 @@ class TestFOrderConsistency:
             (0, 0, 0),
             (10, 20, 30),
             (50, 100, 80),
-            (img.shape[0]-1, img.shape[1]-1, img.shape[2]-1),
-            (img.shape[0]//2, img.shape[1]//2, img.shape[2]//2),
+            (img.shape[0] - 1, img.shape[1] - 1, img.shape[2] - 1),
+            (img.shape[0] // 2, img.shape[1] // 2, img.shape[2] // 2),
         ]
 
         for x, y, z in test_points:
             np_val = np_arr[x, y, z]
             torch_val = torch_tensor[x, y, z].item()
-            assert abs(np_val - torch_val) < 1e-5, \
+            assert abs(np_val - torch_val) < 1e-5, (
                 f"Mismatch at ({x},{y},{z}): numpy={np_val}, torch={torch_val}"
+            )
 
     @pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
     def test_torch_full_array_match(self, brain_image):
@@ -100,15 +104,16 @@ class TestFOrderConsistency:
             (0, 0, 0),
             (10, 20, 30),
             (50, 100, 80),
-            (img.shape[0]-1, img.shape[1]-1, img.shape[2]-1),
-            (img.shape[0]//2, img.shape[1]//2, img.shape[2]//2),
+            (img.shape[0] - 1, img.shape[1] - 1, img.shape[2] - 1),
+            (img.shape[0] // 2, img.shape[1] // 2, img.shape[2] // 2),
         ]
 
         for x, y, z in test_points:
             np_val = np_arr[x, y, z]
             jax_val = float(jax_arr[x, y, z])
-            assert abs(np_val - jax_val) < 1e-5, \
+            assert abs(np_val - jax_val) < 1e-5, (
                 f"Mismatch at ({x},{y},{z}): numpy={np_val}, jax={jax_val}"
+            )
 
     @pytest.mark.skipif(not HAS_JAX, reason="jax not available")
     def test_jax_full_array_match(self, brain_image):
@@ -134,15 +139,16 @@ class TestFOrderConsistency:
             (0, 0, 0),
             (10, 20, 30),
             (50, 100, 80),
-            (img.shape[0]-1, img.shape[1]-1, img.shape[2]-1),
-            (img.shape[0]//2, img.shape[1]//2, img.shape[2]//2),
+            (img.shape[0] - 1, img.shape[1] - 1, img.shape[2] - 1),
+            (img.shape[0] // 2, img.shape[1] // 2, img.shape[2] // 2),
         ]
 
         for x, y, z in test_points:
             np_val = np_arr[x, y, z]
             nib_val = nib_data[x, y, z]
-            assert abs(np_val - nib_val) < 1e-5, \
+            assert abs(np_val - nib_val) < 1e-5, (
                 f"Mismatch vs nibabel at ({x},{y},{z}): medrs={np_val}, nibabel={nib_val}"
+            )
 
     @pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
     def test_slice_consistency_torch(self, brain_image):
@@ -184,17 +190,18 @@ class TestSyntheticFOrder:
         for x in range(shape[0]):
             for y in range(shape[1]):
                 for z in range(shape[2]):
-                    data[x, y, z] = x + 10*y + 100*z
+                    data[x, y, z] = x + 10 * y + 100 * z
 
         img = medrs.NiftiImage(data)
         np_back = img.to_numpy()
 
         test_coords = [(0, 0, 0), (1, 2, 3), (3, 4, 5), (2, 1, 4)]
         for x, y, z in test_coords:
-            expected = x + 10*y + 100*z
+            expected = x + 10 * y + 100 * z
             actual = np_back[x, y, z]
-            assert abs(expected - actual) < 1e-5, \
+            assert abs(expected - actual) < 1e-5, (
                 f"Coordinate mismatch at ({x},{y},{z}): expected={expected}, actual={actual}"
+            )
 
     @pytest.mark.skipif(not HAS_TORCH, reason="torch not available")
     def test_coordinate_encoding_torch(self):
@@ -204,17 +211,18 @@ class TestSyntheticFOrder:
         for x in range(shape[0]):
             for y in range(shape[1]):
                 for z in range(shape[2]):
-                    data[x, y, z] = x + 10*y + 100*z
+                    data[x, y, z] = x + 10 * y + 100 * z
 
         img = medrs.NiftiImage(data)
         torch_tensor = img.to_torch()
 
         test_coords = [(0, 0, 0), (1, 2, 3), (3, 4, 5), (2, 1, 4)]
         for x, y, z in test_coords:
-            expected = x + 10*y + 100*z
+            expected = x + 10 * y + 100 * z
             actual = torch_tensor[x, y, z].item()
-            assert abs(expected - actual) < 1e-5, \
+            assert abs(expected - actual) < 1e-5, (
                 f"Torch coordinate mismatch at ({x},{y},{z}): expected={expected}, actual={actual}"
+            )
 
     @pytest.mark.skipif(not HAS_JAX, reason="jax not available")
     def test_coordinate_encoding_jax(self):
@@ -224,17 +232,18 @@ class TestSyntheticFOrder:
         for x in range(shape[0]):
             for y in range(shape[1]):
                 for z in range(shape[2]):
-                    data[x, y, z] = x + 10*y + 100*z
+                    data[x, y, z] = x + 10 * y + 100 * z
 
         img = medrs.NiftiImage(data)
         jax_arr = img.to_jax()
 
         test_coords = [(0, 0, 0), (1, 2, 3), (3, 4, 5), (2, 1, 4)]
         for x, y, z in test_coords:
-            expected = x + 10*y + 100*z
+            expected = x + 10 * y + 100 * z
             actual = float(jax_arr[x, y, z])
-            assert abs(expected - actual) < 1e-5, \
+            assert abs(expected - actual) < 1e-5, (
                 f"JAX coordinate mismatch at ({x},{y},{z}): expected={expected}, actual={actual}"
+            )
 
 
 if __name__ == "__main__":

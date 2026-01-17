@@ -60,12 +60,12 @@ mod spatial;
 
 pub use augment::{
     random_augment, random_flip, random_gamma, random_gaussian_noise, random_intensity_scale,
-    random_intensity_shift, random_rotate_90,
+    random_intensity_shift, random_rotate_90, RandomAugmentBuilder,
 };
 pub use intensity::{clamp, rescale_intensity, z_normalization};
 pub use orientation::{orientation_from_affine, reorient, AxisCode, Orientation};
 pub use resample::{resample_to_shape, resample_to_spacing, Interpolation};
-pub use spatial::{crop_or_pad, flip};
+pub use spatial::{crop, crop_or_pad, flip};
 
 pub use crop::{
     compute_center_crop_regions, compute_label_aware_crop_regions,

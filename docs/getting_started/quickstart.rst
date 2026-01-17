@@ -17,8 +17,8 @@ Load a Volume
    print("shape:", img.shape())
    print("spacing:", img.spacing())
 
-   # Get a numpy view when the layout allows it
-   array = img.to_numpy_view()
+   # Get a numpy array (copy by default)
+   array = img.to_numpy(copy=True)
    print("dtype:", array.dtype)
 
 Crop-First Loading

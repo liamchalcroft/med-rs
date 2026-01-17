@@ -90,12 +90,14 @@ class TestPipelineCreation:
         from monai.transforms import Compose, RandFlipd, EnsureTyped
 
         # Create a mixed pipeline
-        pipeline = Compose([
-            MedrsLoadImaged(keys=["image"], ensure_channel_first=True),
-            MedrsRandSpatialCropd(keys=["image"], roi_size=[32, 32, 32]),
-            RandFlipd(keys=["image"], prob=0.5),
-            EnsureTyped(keys=["image"]),
-        ])
+        pipeline = Compose(
+            [
+                MedrsLoadImaged(keys=["image"], ensure_channel_first=True),
+                MedrsRandSpatialCropd(keys=["image"], roi_size=[32, 32, 32]),
+                RandFlipd(keys=["image"], prob=0.5),
+                EnsureTyped(keys=["image"]),
+            ]
+        )
 
         assert pipeline is not None
         assert callable(pipeline)
@@ -104,8 +106,8 @@ class TestPipelineCreation:
     def test_medrs_training_dataloader_interface(self):
         """Test medrs TrainingDataLoader interface."""
         # Test that TrainingDataLoader class is available
-        assert hasattr(medrs, 'TrainingDataLoader')
-        loader_class = getattr(medrs, 'TrainingDataLoader')
+        assert hasattr(medrs, "TrainingDataLoader")
+        loader_class = getattr(medrs, "TrainingDataLoader")
         assert callable(loader_class)
 
 
@@ -116,10 +118,10 @@ class TestPerformanceFeatures:
         """Test that byte-exact loading functions are available."""
         # Test that critical functions exist
         critical_functions = [
-            'load_cropped',
-            'load_resampled',
-            'load_cropped_to_torch',
-            'load_cropped_to_jax'
+            "load_cropped",
+            "load_resampled",
+            "load_cropped_to_torch",
+            "load_cropped_to_jax",
         ]
 
         for func_name in critical_functions:
@@ -129,32 +131,43 @@ class TestPerformanceFeatures:
 
     def test_training_data_loader_availability(self):
         """Test that TrainingDataLoader is available."""
-        assert hasattr(medrs, 'TrainingDataLoader')
-        loader_class = getattr(medrs, 'TrainingDataLoader')
+        assert hasattr(medrs, "TrainingDataLoader")
+        loader_class = getattr(medrs, "TrainingDataLoader")
         assert callable(loader_class)
 
     def test_framework_integration_signatures(self):
         """Test that framework integration functions have correct signatures."""
         # Test torch function signature
         import inspect
-        torch_func = getattr(medrs, 'load_cropped_to_torch')
+
+        torch_func = getattr(medrs, "load_cropped_to_torch")
         sig = inspect.signature(torch_func)
 
         expected_params = [
-            'path', 'output_shape', 'target_spacing',
-            'target_orientation', 'output_offset', 'dtype', 'device'
+            "path",
+            "output_shape",
+            "target_spacing",
+            "target_orientation",
+            "output_offset",
+            "dtype",
+            "device",
         ]
 
         for param in expected_params:
             assert param in sig.parameters, f"Missing parameter: {param}"
 
         # Test jax function signature
-        jax_func = getattr(medrs, 'load_cropped_to_jax')
+        jax_func = getattr(medrs, "load_cropped_to_jax")
         sig = inspect.signature(jax_func)
 
         expected_params = [
-            'path', 'output_shape', 'target_spacing',
-            'target_orientation', 'output_offset', 'dtype', 'device'
+            "path",
+            "output_shape",
+            "target_spacing",
+            "target_orientation",
+            "output_offset",
+            "dtype",
+            "device",
         ]
 
         for param in expected_params:
@@ -168,15 +181,12 @@ class TestPyTorchIntegration:
         """Test PyTorch tensor creation interface."""
         # Test that we can call the function (will fail with mock file but interface exists)
         try:
-            with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as f:
                 path = f.name
 
             with pytest.raises(Exception):  # Expected with mock file
                 tensor = medrs.load_cropped_to_torch(
-                    volume_path=path,
-                    output_shape=[32, 32, 16],
-                    dtype="float32",
-                    device="cpu"
+                    volume_path=path, output_shape=[32, 32, 16], dtype="float32", device="cpu"
                 )
         finally:
             if os.path.exists(path):
@@ -189,15 +199,13 @@ class TestPyTorchIntegration:
             devices.append("cuda")
 
         try:
-            with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as f:
                 path = f.name
 
             for device in devices:
                 with pytest.raises(Exception):  # Expected with mock file
                     tensor = medrs.load_cropped_to_torch(
-                        volume_path=path,
-                        output_shape=[16, 16, 16],
-                        device=device
+                        volume_path=path, output_shape=[16, 16, 16], device=device
                     )
         finally:
             if os.path.exists(path):
@@ -208,16 +216,13 @@ class TestPyTorchIntegration:
         dtypes = ["float32", "float16", "int32"]
 
         try:
-            with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as f:
                 path = f.name
 
             for dtype in dtypes:
                 with pytest.raises(Exception):  # Expected with mock file
                     tensor = medrs.load_cropped_to_torch(
-                        volume_path=path,
-                        output_shape=[16, 16, 16],
-                        dtype=dtype,
-                        device="cpu"
+                        volume_path=path, output_shape=[16, 16, 16], dtype=dtype, device="cpu"
                     )
         finally:
             if os.path.exists(path):
@@ -230,14 +235,12 @@ class TestJAXIntegration:
     def test_jax_array_creation_interface(self):
         """Test JAX array creation interface."""
         try:
-            with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as f:
                 path = f.name
 
             with pytest.raises(Exception):  # Expected with mock file
                 jax_array = medrs.load_cropped_to_jax(
-                    volume_path=path,
-                    output_shape=[32, 32, 16],
-                    dtype="float32"
+                    volume_path=path, output_shape=[32, 32, 16], dtype="float32"
                 )
         finally:
             if os.path.exists(path):
@@ -248,7 +251,7 @@ class TestJAXIntegration:
         dtypes = ["float32", "float16", "int32"]
 
         try:
-            with tempfile.NamedTemporaryFile(suffix='.nii', delete=False) as f:
+            with tempfile.NamedTemporaryFile(suffix=".nii", delete=False) as f:
                 path = f.name
 
             for dtype in dtypes:
@@ -326,11 +329,14 @@ class TestMetaTensorOrientationConversion:
         direction = MedrsMetaTensorConverter._orientation_to_direction("RAS")
 
         # RAS: X=Right(+), Y=Anterior(+), Z=Superior(+)
-        expected = np.array([
-            [1, 0, 0],  # R -> +X
-            [0, 1, 0],  # A -> +Y
-            [0, 0, 1],  # S -> +Z
-        ], dtype=np.float64)
+        expected = np.array(
+            [
+                [1, 0, 0],  # R -> +X
+                [0, 1, 0],  # A -> +Y
+                [0, 0, 1],  # S -> +Z
+            ],
+            dtype=np.float64,
+        )
         np.testing.assert_array_equal(direction, expected)
 
     def test_lpi_orientation(self):
@@ -340,11 +346,14 @@ class TestMetaTensorOrientationConversion:
         direction = MedrsMetaTensorConverter._orientation_to_direction("LPI")
 
         # LPI: X=Left(-), Y=Posterior(-), Z=Inferior(-)
-        expected = np.array([
-            [-1, 0, 0],   # L -> -X
-            [0, -1, 0],   # P -> -Y
-            [0, 0, -1],   # I -> -Z
-        ], dtype=np.float64)
+        expected = np.array(
+            [
+                [-1, 0, 0],  # L -> -X
+                [0, -1, 0],  # P -> -Y
+                [0, 0, -1],  # I -> -Z
+            ],
+            dtype=np.float64,
+        )
         np.testing.assert_array_equal(direction, expected)
 
     def test_las_orientation(self):
@@ -354,11 +363,14 @@ class TestMetaTensorOrientationConversion:
         direction = MedrsMetaTensorConverter._orientation_to_direction("LAS")
 
         # LAS: X=Left(-), Y=Anterior(+), Z=Superior(+)
-        expected = np.array([
-            [-1, 0, 0],  # L -> -X
-            [0, 1, 0],   # A -> +Y
-            [0, 0, 1],   # S -> +Z
-        ], dtype=np.float64)
+        expected = np.array(
+            [
+                [-1, 0, 0],  # L -> -X
+                [0, 1, 0],  # A -> +Y
+                [0, 0, 1],  # S -> +Z
+            ],
+            dtype=np.float64,
+        )
         np.testing.assert_array_equal(direction, expected)
 
     def test_case_insensitivity(self):

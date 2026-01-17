@@ -40,12 +40,23 @@ medrs is designed for throughput-critical medical imaging workflows, particularl
 | **float16** | **4.1 MB** | **50%** |
 | int16 | 1.2 MB | 15% |
 
+### Training Throughput (FastLoader vs DataLoaders)
+
+| Loader | Workers | Samples/sec | vs medrs |
+|--------|---------|-------------|----------|
+| **medrs FastLoader** | 4 | **1,279** | 1x |
+| TorchIO Queue | 4 | 8.7 | 147x slower |
+| MONAI DataLoader | 4 | 0.8 | **1,560x slower** |
+
+*Tested on 20 gzipped 64³ volumes with random cropping. FastLoader uses parallel prefetching and Mgzip support.*
+
 ### Key Advantages
 
 1. **Crop-First Loading**: Load 64³ patch from 512³ volume without reading entire file - **6,600x faster** than MONAI
-2. **Mixed Precision**: Save in bf16/f16 for 40-50% smaller files with minimal precision loss
-3. **MONAI Drop-in**: Replace MONAI I/O transforms with one import change
-4. **Zero-Copy**: Direct tensor creation without intermediate numpy allocations
+2. **FastLoader**: Purpose-built training loader achieves **1,560x** higher throughput than MONAI DataLoader
+3. **Mixed Precision**: Save in bf16/f16 for 40-50% smaller files with minimal precision loss
+4. **MONAI Drop-in**: Replace MONAI I/O transforms with one import change
+5. **Zero-Copy**: Direct tensor creation without intermediate numpy allocations
 
 <details>
 <summary>📊 Detailed Benchmarks (click to expand)</summary>
@@ -53,8 +64,6 @@ medrs is designed for throughput-critical medical imaging workflows, particularl
 ### Comprehensive Benchmark Results
 
 Benchmark results comparing medrs, MONAI, and TorchIO across multiple volume sizes and operations.
-
-![Benchmark Summary](benchmarks/results/plots/summary.png)
 
 #### Load Performance (Basic I/O)
 
@@ -149,6 +158,9 @@ processed.save("output.nii.gz")
 tensor = medrs.load_to_torch("brain.nii.gz", dtype=torch.float16, device="cuda")
 ```
 
+For training pipelines that repeatedly access the same files, use `load_cached()` for
+faster subsequent loads (caches decompressed data for .nii.gz files).
+
 **Rust:**
 
 ```rust
@@ -235,6 +247,60 @@ let noisy = random_gaussian_noise(&img, Some(0.1), Some(42))?;
 let augmented = random_augment(&img, Some(42))?;
 ```
 
+## Mgzip: Parallel Compressed Loading
+
+For `.nii.gz` files, medrs supports the **Mgzip** (multi-member gzip) format for parallel decompression. Mgzip files are backwards-compatible with standard gzip but can be decompressed 3-5× faster using multiple threads.
+
+### Performance (256³ volume)
+
+| Method | Time | vs nibabel |
+|--------|------|------------|
+| nibabel | 173ms | 1× |
+| medrs.load() | 126ms | 1.4× |
+| **medrs.load_mgzip(8 threads)** | **47ms** | **3.7×** |
+
+### Usage
+
+```python
+import medrs
+
+# Convert existing .nii.gz to Mgzip format (one-time)
+medrs.convert_to_mgzip("brain.nii.gz", "brain.mgz.nii.gz", num_threads=8)
+
+# Load with parallel decompression
+img = medrs.load_mgzip("brain.mgz.nii.gz", num_threads=8)
+
+# Save directly in Mgzip format
+medrs.save_mgzip(img, "output.mgz.nii.gz", num_threads=8)
+
+# Check if file is Mgzip format
+if medrs.is_mgzip("file.nii.gz"):
+    img = medrs.load_mgzip("file.nii.gz")
+```
+
+### Batch Conversion CLI
+
+Convert entire datasets with the included CLI tool:
+
+```bash
+# Convert all .nii.gz files in a directory (recursive)
+python -m medrs.cli convert-mgzip data/*.nii.gz -r -w 8 -v
+
+# Options:
+#   -r, --recursive    Search subdirectories
+#   -w, --workers N    Parallel conversion threads (default: CPU count)
+#   -v, --verbose      Show progress
+#   --suffix .mgz      Output suffix (default: replaces .nii.gz with .mgz.nii.gz)
+```
+
+### When to Use Mgzip
+
+- **Large compressed datasets** (100+ files, 256³+ volumes)
+- **Multi-core systems** (4+ cores)
+- **Repeated access** (training pipelines that load same files across epochs)
+
+Mgzip files are ~1% larger than standard gzip but provide significant speedups. Standard gzip readers (nibabel, etc.) can still read Mgzip files.
+
 ## Crop-First Loading
 
 Load only the data you need - essential for training pipelines:
@@ -264,9 +330,11 @@ tensor = medrs.load_cropped_to_torch(
 )
 ```
 
-## Training Data Loader
+## Training Data Loaders
 
-High-performance patch extraction for training:
+### TrainingDataLoader
+
+LRU-cached patch extraction with prefetching:
 
 ```python
 import medrs
@@ -281,7 +349,27 @@ loader = medrs.TrainingDataLoader(
 )
 
 for patch in loader:
-    # Training loop
+    tensor = patch.to_torch()
+```
+
+### FastLoader
+
+Parallel prefetching loader for large .nii.gz datasets (100k+ files):
+
+```python
+import glob
+import medrs
+
+loader = medrs.FastLoader(
+    volumes=glob.glob("data/*.nii.gz"),
+    patch_shape=[64, 64, 64],
+    prefetch=16,
+    workers=4,
+    shuffle=True,
+    seed=42
+)
+
+for patch in loader:
     tensor = patch.to_torch()
 ```
 
@@ -317,6 +405,7 @@ medrs uses several optimization strategies:
 - **Lazy Evaluation**: Transform pipelines compose operations before execution
 - **Memory Mapping**: Large files are memory-mapped to avoid full loads
 - **Buffer Pooling**: Reusable buffers reduce allocation overhead
+- **Parallel Decompression**: Mgzip format enables multi-threaded gzip decompression
 
 ## Examples
 

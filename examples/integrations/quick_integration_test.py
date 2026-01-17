@@ -17,6 +17,7 @@ def test_medrs_import():
 
     try:
         import medrs
+
         print(f"    medrs {medrs.__version__}")
         return True
     except ImportError as e:
@@ -30,6 +31,7 @@ def test_monai_import():
 
     try:
         import monai
+
         print(f"    MONAI {monai.__version__}")
         return True
     except ImportError as e:
@@ -43,6 +45,7 @@ def test_torch_import():
 
     try:
         import torch
+
         print(f"    PyTorch {torch.__version__} (CUDA: {torch.cuda.is_available()})")
         return True
     except ImportError as e:
@@ -80,13 +83,13 @@ def test_integration_compatibility():
         # Test that we can access medrs functions through MONAI-style workflow
         compatibility_items = []
 
-        if hasattr(medrs, 'load'):
+        if hasattr(medrs, "load"):
             compatibility_items.append("Core loading")
-        if hasattr(medrs, 'load_cropped'):
+        if hasattr(medrs, "load_cropped"):
             compatibility_items.append("Crop-first loading")
-        if hasattr(medrs, 'SpatialNormalizer'):
+        if hasattr(medrs, "SpatialNormalizer"):
             compatibility_items.append("Dictionary transforms")
-        if hasattr(medrs, 'metatensor_from_medrs'):
+        if hasattr(medrs, "metatensor_from_medrs"):
             compatibility_items.append("MetaTensor conversion")
 
         print(f"    Integration components: {', '.join(compatibility_items)}")

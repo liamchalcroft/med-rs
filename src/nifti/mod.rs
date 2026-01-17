@@ -1,33 +1,19 @@
 //! `NIfTI` file format support.
 //!
-//! `NIfTI` (Neuroimaging Informatics Technology Initiative) is the standard format
+//! `NIfTI` (Neuroimaging Informatics Technology Initiative) is a standard format
 //! for neuroimaging data. This module provides high-performance reading and writing
 //! of `.nii` and `.nii.gz` files.
-//!
-//! # Quick Start
-//!
-//! ```ignore
-//! use medrs::nifti;
-//!
-//! // Load an image
-//! let img = nifti::load("brain.nii.gz")?;
-//!
-//! // Access data as f32 array
-//! let data = img.to_f32();
-//! println!("Shape: {:?}", img.shape());
-//! println!("Affine:\n{:?}", img.affine());
-//!
-//! // Save modified image
-//! nifti::save(&img, "output.nii.gz")?;
-//! ```
 
 pub(crate) mod header;
 pub(crate) mod image;
-mod io;
+pub mod io;
 
 pub use header::{DataType, NiftiHeader, SpatialUnits, TemporalUnits};
 pub use image::{NiftiElement, NiftiImage};
 pub use io::{
-    load, load_cropped, load_cropped_config, load_header, save, BatchLoader, CropLoader,
-    CropLoaderConfig, LoadCroppedConfig, LoaderStats, TrainingDataLoader,
+    clear_decompression_cache, convert_to_mgzip, is_mgzip, load, load_cached, load_cropped,
+    load_header, load_image_label_pair, load_mgzip, load_mgzip_with_threads, load_multi,
+    load_with_crop, save, save_mgzip, save_mgzip_with_threads, set_cache_size, BatchIter,
+    BatchLoader, CropConfig, CropLoader, FastLoader, FastLoaderBuilder, FileConfig, LoaderStats,
+    MultiFileConfig, MultiFileResult, PatchConfig, TrainingDataLoader,
 };

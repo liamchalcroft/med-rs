@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 
 import medrs
-from medrs import MedicalImage
+from medrs import NiftiImage as MedicalImage
 
 
 # Test dtypes and their properties
@@ -52,7 +52,7 @@ class TestMixedPrecisionSaveLoad:
 
     def test_save_load_float32(self, test_volume, temp_dir):
         """Test float32 save/load (baseline)."""
-        img = MedicalImage.from_numpy(test_volume)
+        img = MedicalImage(test_volume)
         path = os.path.join(temp_dir, "test_f32.nii.gz")
 
         img.save(path)
@@ -64,7 +64,7 @@ class TestMixedPrecisionSaveLoad:
 
     def test_save_load_bfloat16(self, test_volume, temp_dir):
         """Test bfloat16 save/load."""
-        img = MedicalImage.from_numpy(test_volume)
+        img = MedicalImage(test_volume)
         img_bf16 = img.with_dtype("bfloat16")
 
         path = os.path.join(temp_dir, "test_bf16.nii.gz")
@@ -80,14 +80,16 @@ class TestMixedPrecisionSaveLoad:
         # Check values are close (bf16 has ~3 decimal digits of precision)
         loaded_data = loaded.to_numpy()
         np.testing.assert_allclose(
-            loaded_data, test_volume,
-            rtol=1e-2, atol=1e-2,
-            err_msg="bf16 precision loss exceeded expected bounds"
+            loaded_data,
+            test_volume,
+            rtol=1e-2,
+            atol=1e-2,
+            err_msg="bf16 precision loss exceeded expected bounds",
         )
 
     def test_save_load_float16(self, test_volume, temp_dir):
         """Test float16 (IEEE half) save/load."""
-        img = MedicalImage.from_numpy(test_volume)
+        img = MedicalImage(test_volume)
         img_f16 = img.with_dtype("float16")
 
         path = os.path.join(temp_dir, "test_f16.nii.gz")
@@ -101,9 +103,11 @@ class TestMixedPrecisionSaveLoad:
         # f16 has ~4 decimal digits of precision
         loaded_data = loaded.to_numpy()
         np.testing.assert_allclose(
-            loaded_data, test_volume,
-            rtol=1e-3, atol=1e-3,
-            err_msg="f16 precision loss exceeded expected bounds"
+            loaded_data,
+            test_volume,
+            rtol=1e-3,
+            atol=1e-3,
+            err_msg="f16 precision loss exceeded expected bounds",
         )
 
     @pytest.mark.parametrize("dtype", ["int8", "uint8", "int16", "uint16"])
@@ -115,7 +119,7 @@ class TestMixedPrecisionSaveLoad:
         else:
             data = create_test_volume(value_range=(-100, 100))
 
-        img = MedicalImage.from_numpy(data)
+        img = MedicalImage(data)
         img_int = img.with_dtype(dtype)
 
         path = os.path.join(temp_dir, f"test_{dtype}.nii.gz")
@@ -126,9 +130,7 @@ class TestMixedPrecisionSaveLoad:
 
         # Integer types have rounding error
         np.testing.assert_allclose(
-            loaded_data, np.round(data),
-            rtol=0, atol=1,
-            err_msg=f"{dtype} save/load failed"
+            loaded_data, np.round(data), rtol=0, atol=1, err_msg=f"{dtype} save/load failed"
         )
 
 
@@ -147,7 +149,7 @@ class TestDiskStorageSavings:
 
     def test_storage_savings_bf16(self, large_volume, temp_dir):
         """Verify bf16 achieves ~50% storage reduction vs f32."""
-        img = MedicalImage.from_numpy(large_volume)
+        img = MedicalImage(large_volume)
 
         path_f32 = os.path.join(temp_dir, "test_f32.nii.gz")
         path_bf16 = os.path.join(temp_dir, "test_bf16.nii.gz")
@@ -167,7 +169,7 @@ class TestDiskStorageSavings:
 
     def test_storage_savings_f16(self, large_volume, temp_dir):
         """Verify f16 achieves ~50% storage reduction vs f32."""
-        img = MedicalImage.from_numpy(large_volume)
+        img = MedicalImage(large_volume)
 
         path_f32 = os.path.join(temp_dir, "test_f32.nii.gz")
         path_f16 = os.path.join(temp_dir, "test_f16.nii.gz")
@@ -186,7 +188,7 @@ class TestDiskStorageSavings:
 
     def test_storage_comparison_all_dtypes(self, large_volume, temp_dir):
         """Compare storage for all floating point dtypes."""
-        img = MedicalImage.from_numpy(large_volume)
+        img = MedicalImage(large_volume)
 
         results = {}
         dtypes = ["float64", "float32", "float16", "bfloat16"]
@@ -207,7 +209,9 @@ class TestDiskStorageSavings:
             ratio = size / baseline
             bytes_per_voxel = DTYPE_INFO.get(dtype, {}).get("bytes", "?")
             theoretical = bytes_per_voxel / 4  # vs f32
-            print(f"{dtype:10s}: {size:>10,} bytes ({ratio:>6.1%} of f32, theoretical: {theoretical:.0%})")
+            print(
+                f"{dtype:10s}: {size:>10,} bytes ({ratio:>6.1%} of f32, theoretical: {theoretical:.0%})"
+            )
 
 
 class TestPrecisionBounds:
@@ -219,7 +223,7 @@ class TestPrecisionBounds:
 
     def test_bf16_precision_typical_values(self, test_volume):
         """Test bf16 precision on typical medical imaging values."""
-        img = MedicalImage.from_numpy(test_volume)
+        img = MedicalImage(test_volume)
         img_bf16 = img.with_dtype("bfloat16")
 
         original = test_volume
@@ -239,7 +243,7 @@ class TestPrecisionBounds:
 
     def test_f16_precision_typical_values(self, test_volume):
         """Test f16 precision on typical medical imaging values."""
-        img = MedicalImage.from_numpy(test_volume)
+        img = MedicalImage(test_volume)
         img_f16 = img.with_dtype("float16")
 
         original = test_volume
@@ -270,7 +274,7 @@ class TestRoundTrip:
     def test_roundtrip_uncompressed(self, temp_dir, dtype):
         """Test save/load roundtrip with uncompressed .nii files."""
         data = create_test_volume(shape=(32, 32, 32))
-        img = MedicalImage.from_numpy(data).with_dtype(dtype)
+        img = MedicalImage(data).with_dtype(dtype)
 
         path = os.path.join(temp_dir, f"test_{dtype}.nii")  # uncompressed
         img.save(path)
@@ -280,15 +284,16 @@ class TestRoundTrip:
         original_values = img.to_numpy()
         loaded_values = loaded.to_numpy()
         np.testing.assert_array_equal(
-            original_values, loaded_values,
-            err_msg=f"Roundtrip {dtype} values should be exactly equal"
+            original_values,
+            loaded_values,
+            err_msg=f"Roundtrip {dtype} values should be exactly equal",
         )
 
     @pytest.mark.parametrize("dtype", ["float32", "float16", "bfloat16"])
     def test_roundtrip_compressed(self, temp_dir, dtype):
         """Test save/load roundtrip with gzip compressed .nii.gz files."""
         data = create_test_volume(shape=(32, 32, 32))
-        img = MedicalImage.from_numpy(data).with_dtype(dtype)
+        img = MedicalImage(data).with_dtype(dtype)
 
         path = os.path.join(temp_dir, f"test_{dtype}.nii.gz")
         img.save(path)
@@ -297,8 +302,9 @@ class TestRoundTrip:
         original_values = img.to_numpy()
         loaded_values = loaded.to_numpy()
         np.testing.assert_array_equal(
-            original_values, loaded_values,
-            err_msg=f"Roundtrip {dtype} (gzip) values should be exactly equal"
+            original_values,
+            loaded_values,
+            err_msg=f"Roundtrip {dtype} (gzip) values should be exactly equal",
         )
 
 

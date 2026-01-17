@@ -6,6 +6,8 @@ use crate::pipeline::simd_kernels::{parallel_linear_transform_f32, parallel_sum_
 use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 use rayon::prelude::*;
 
+const NORMALIZE_CHUNK_SIZE: usize = 4096;
+
 /// Normalize image intensity to zero mean and unit variance.
 ///
 /// Formula: output = (input - mean) / std
@@ -56,7 +58,6 @@ pub fn z_normalization(image: &NiftiImage) -> Result<NiftiImage> {
         return Ok(NiftiImage::from_parts(header, ArrayData::F32(out_array)));
     }
 
-    // Generic path for other types
     macro_rules! normalize {
         ($array:expr, $to_f64:expr, $from_f32:expr) => {{
             let slice = $array.as_slice_memory_order().ok_or_else(|| {
@@ -67,10 +68,16 @@ pub fn z_normalization(image: &NiftiImage) -> Result<NiftiImage> {
             let len = slice.len();
 
             let (sum, sum_sq) = slice
-                .par_iter()
-                .map(|&v| {
-                    let val = $to_f64(v);
-                    (val, val * val)
+                .par_chunks(NORMALIZE_CHUNK_SIZE)
+                .map(|chunk| {
+                    let mut local_sum = 0.0f64;
+                    let mut local_sq = 0.0f64;
+                    for &v in chunk {
+                        let val = $to_f64(v);
+                        local_sum += val;
+                        local_sq += val * val;
+                    }
+                    (local_sum, local_sq)
                 })
                 .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
 
@@ -82,17 +89,17 @@ pub fn z_normalization(image: &NiftiImage) -> Result<NiftiImage> {
                 1.0 / variance.sqrt()
             };
 
-            // Parallel transformation (use memory pool)
             let mut output = acquire_buffer(len);
             output
-                .par_iter_mut()
-                .zip(slice.par_iter())
-                .for_each(|(out, &v)| {
-                    let val = $to_f64(v);
-                    *out = $from_f32((val - mean) * inv_std);
+                .par_chunks_mut(NORMALIZE_CHUNK_SIZE)
+                .zip(slice.par_chunks(NORMALIZE_CHUNK_SIZE))
+                .for_each(|(out_chunk, in_chunk)| {
+                    for (out, &v) in out_chunk.iter_mut().zip(in_chunk.iter()) {
+                        let val = $to_f64(v);
+                        *out = $from_f32((val - mean) * inv_std);
+                    }
                 });
 
-            // F-order to match NIfTI convention
             let shape = $array.shape();
             let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
                 Error::MemoryAllocation(format!("Failed to create output array: {}", e))

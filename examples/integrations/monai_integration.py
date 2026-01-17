@@ -10,13 +10,7 @@ import torch
 from pathlib import Path
 from typing import Dict, Any
 
-from monai.transforms import (
-    Compose,
-    EnsureChannelFirstd,
-    ScaleIntensityd,
-    RandFlipd,
-    ToTensord
-)
+from monai.transforms import Compose, EnsureChannelFirstd, ScaleIntensityd, RandFlipd, ToTensord
 from monai.data import DataLoader, Dataset
 
 import medrs
@@ -34,7 +28,7 @@ class MedrsLoadToTensor:
         keys: list,
         output_shape: tuple = (96, 96, 96),
         device: str = None,
-        dtype: torch.dtype = torch.float32
+        dtype: torch.dtype = torch.float32,
     ):
         self.keys = keys
         self.output_shape = output_shape
@@ -51,7 +45,7 @@ class MedrsLoadToTensor:
                     str(data[key]),
                     output_shape=self.output_shape,
                     device=self.device,
-                    dtype=self.dtype
+                    dtype=self.dtype,
                 )
 
         return result
@@ -64,17 +58,19 @@ def create_monai_pipeline():
     medrs_load = MedrsLoadToTensor(
         keys=["image", "label"],
         output_shape=(96, 96, 96),
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        device="cuda" if torch.cuda.is_available() else "cpu",
     )
 
     # Complete MONAI pipeline
-    transforms = Compose([
-        medrs_load,                           # Fast crop-first loading
-        EnsureChannelFirstd(keys=["image", "label"]),  # Add channel dimension
-        ScaleIntensityd(keys=["image"]),      # Normalize intensities
-        RandFlipd(keys=["image", "label"], prob=0.5),  # Data augmentation
-        ToTensord(keys=["image", "label"])    # Convert to tensors
-    ])
+    transforms = Compose(
+        [
+            medrs_load,  # Fast crop-first loading
+            EnsureChannelFirstd(keys=["image", "label"]),  # Add channel dimension
+            ScaleIntensityd(keys=["image"]),  # Normalize intensities
+            RandFlipd(keys=["image", "label"], prob=0.5),  # Data augmentation
+            ToTensord(keys=["image", "label"]),  # Convert to tensors
+        ]
+    )
 
     return transforms
 
@@ -97,7 +93,7 @@ def example_training_workflow():
         dataset,
         batch_size=2,
         shuffle=True,
-        num_workers=0  # medrs handles concurrency internally
+        num_workers=0,  # medrs handles concurrency internally
     )
 
     print("medrs + MONAI training pipeline created:")

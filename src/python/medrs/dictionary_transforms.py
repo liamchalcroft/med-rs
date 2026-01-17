@@ -20,9 +20,11 @@ from . import load, resample, reorient
 # TYPES AND PROTOCOLS
 # ============================================================================
 
+
 @dataclass
 class SpatialProperties:
     """Container for spatial image properties."""
+
     spacing: Tuple[float, float, float]
     orientation: str
     shape: Tuple[int, ...]
@@ -31,6 +33,7 @@ class SpatialProperties:
 
 class Transform(Protocol):
     """Protocol for dictionary transforms."""
+
     def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Apply the transform to the data dictionary."""
         ...
@@ -39,6 +42,7 @@ class Transform(Protocol):
 # ============================================================================
 # SPATIAL NORMALIZATION
 # ============================================================================
+
 
 class SpatialNormalizer:
     """
@@ -98,21 +102,20 @@ class SpatialNormalizer:
 
     def _is_volume_path(self, value: Any) -> bool:
         """Check if value represents a volume file path."""
-        return isinstance(value, (str, Path)) and str(value).endswith(('.nii', '.nii.gz'))
+        return isinstance(value, (str, Path)) and str(value).endswith((".nii", ".nii.gz"))
 
     def _get_volume_properties(self, key: str, path: str) -> SpatialProperties:
         """Get spatial properties for a volume."""
         img = load(path)
         return SpatialProperties(
-            spacing=getattr(img, 'spacing', (1.0, 1.0, 1.0)),
-            orientation=getattr(img, 'orientation', 'RAS'),
-            shape=getattr(img, 'data', (1, 1, 1)).shape,
-            origin=getattr(img, 'origin', (0.0, 0.0, 0.0))
+            spacing=getattr(img, "spacing", (1.0, 1.0, 1.0)),
+            orientation=getattr(img, "orientation", "RAS"),
+            shape=getattr(img, "data", (1, 1, 1)).shape,
+            origin=getattr(img, "origin", (0.0, 0.0, 0.0)),
         )
 
     def _determine_target_properties(
-        self,
-        properties: Dict[str, SpatialProperties]
+        self, properties: Dict[str, SpatialProperties]
     ) -> Tuple[Tuple[float, float, float], str]:
         """Determine target spacing and orientation."""
         # Use reference volume if specified
@@ -129,7 +132,9 @@ class SpatialNormalizer:
 
         return target_spacing, self.target_orientation
 
-    def _compute_optimal_spacing(self, properties: Dict[str, SpatialProperties]) -> Tuple[float, float, float]:
+    def _compute_optimal_spacing(
+        self, properties: Dict[str, SpatialProperties]
+    ) -> Tuple[float, float, float]:
         """Compute optimal target spacing from all volumes."""
         if not properties:
             return (1.0, 1.0, 1.0)
@@ -177,11 +182,11 @@ class SpatialNormalizer:
     def _normalize_volume(self, img, target_spacing, target_orientation):
         """Normalize a single volume to target properties."""
         # Resample to target spacing
-        if hasattr(img, 'spacing') and img.spacing != target_spacing:
+        if hasattr(img, "spacing") and img.spacing != target_spacing:
             img = resample(img, target_spacing)
 
         # Reorient to target orientation
-        if hasattr(img, 'orientation') and img.orientation != target_orientation:
+        if hasattr(img, "orientation") and img.orientation != target_orientation:
             img = reorient(img, target_orientation)
 
         return img
@@ -190,6 +195,7 @@ class SpatialNormalizer:
 # ============================================================================
 # COORDINATED CROPPING
 # ============================================================================
+
 
 class CoordinatedCropLoader:
     """
@@ -239,22 +245,20 @@ class CoordinatedCropLoader:
             return tuple(dim // 2 for dim in ref_shape)
         else:
             # Random center with margin
-            min_coords = tuple(
-                self.center_margin + size // 2
-                for size in self.crop_size
-            )
+            min_coords = tuple(self.center_margin + size // 2 for size in self.crop_size)
             max_coords = tuple(
-                dim - self.center_margin - size // 2
-                for dim, size in zip(ref_shape, self.crop_size)
+                dim - self.center_margin - size // 2 for dim, size in zip(ref_shape, self.crop_size)
             )
 
             # Validate bounds
             min_coords = tuple(max(0, coord) for coord in min_coords)
             max_coords = tuple(
-                min(dim - size, coord) for dim, size, coord in zip(ref_shape, self.crop_size, max_coords)
+                min(dim - size, coord)
+                for dim, size, coord in zip(ref_shape, self.crop_size, max_coords)
             )
 
             import random
+
             return tuple(
                 random.randint(min_coord, max_coord)
                 for min_coord, max_coord in zip(min_coords, max_coords)
@@ -262,10 +266,7 @@ class CoordinatedCropLoader:
 
     def _calculate_crop_offsets(self, center: Tuple[int, int, int]) -> Tuple[int, int, int]:
         """Calculate crop start offsets from center."""
-        return tuple(
-            max(0, coord - size // 2)
-            for coord, size in zip(center, self.crop_size)
-        )
+        return tuple(max(0, coord - size // 2) for coord, size in zip(center, self.crop_size))
 
     def __call__(self, data_dict: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -281,8 +282,10 @@ class CoordinatedCropLoader:
         normalized_dict = self.spatial_normalizer(data_dict)
 
         # Determine crop center from reference volume
-        if not hasattr(normalized_dict[self.spatial_normalizer.reference_key], 'data'):
-            raise KeyError(f"Reference key '{self.spatial_normalizer.reference_key}' not found or invalid")
+        if not hasattr(normalized_dict[self.spatial_normalizer.reference_key], "data"):
+            raise KeyError(
+                f"Reference key '{self.spatial_normalizer.reference_key}' not found or invalid"
+            )
 
         ref_volume = normalized_dict[self.spatial_normalizer.reference_key]
         ref_shape = ref_volume.data.shape
@@ -299,11 +302,11 @@ class CoordinatedCropLoader:
 
             try:
                 # Crop the volume
-                if hasattr(volume, 'data'):
+                if hasattr(volume, "data"):
                     cropped_data = volume.data[
-                        crop_offsets[0]:crop_offsets[0] + self.crop_size[0],
-                        crop_offsets[1]:crop_offsets[1] + self.crop_size[1],
-                        crop_offsets[2]:crop_offsets[2] + self.crop_size[2]
+                        crop_offsets[0] : crop_offsets[0] + self.crop_size[0],
+                        crop_offsets[1] : crop_offsets[1] + self.crop_size[1],
+                        crop_offsets[2] : crop_offsets[2] + self.crop_size[2],
                     ]
 
                     cropped_volume = self._create_cropped_volume(cropped_data, volume)
@@ -332,10 +335,7 @@ class CoordinatedCropLoader:
 
     def _convert_to_tensor(self, volume):
         """Convert volume to tensor with specified parameters."""
-        tensor = volume.to_torch(
-            device=self.device,
-            dtype=self.dtype
-        )
+        tensor = volume.to_torch(device=self.device, dtype=self.dtype)
         return tensor
 
     def _create_cropped_volume(self, cropped_data, original_volume):
@@ -348,6 +348,7 @@ class CoordinatedCropLoader:
 # ============================================================================
 # MONAI COMPATIBILITY
 # ============================================================================
+
 
 class MonaiCompatibleTransform:
     """
@@ -374,13 +375,14 @@ class MonaiCompatibleTransform:
 # CONVENIENCE FUNCTIONS
 # ============================================================================
 
+
 def create_multimodal_crop_transform(
     keys: Sequence[str],
     crop_size: Tuple[int, int, int],
     target_spacing: Optional[Tuple[float, float, float]] = None,
     device: str = "cpu",
     dtype: Optional[Any] = None,
-    **kwargs
+    **kwargs,
 ) -> CoordinatedCropLoader:
     """
     Create a transform for cropping multiple modalities.
@@ -396,10 +398,7 @@ def create_multimodal_crop_transform(
     Returns:
         CoordinatedCropLoader instance.
     """
-    normalizer = SpatialNormalizer(
-        target_spacing=target_spacing,
-        target_orientation="RAS"
-    )
+    normalizer = SpatialNormalizer(target_spacing=target_spacing, target_orientation="RAS")
 
     return CoordinatedCropLoader(
         keys=keys,
@@ -407,14 +406,12 @@ def create_multimodal_crop_transform(
         spatial_normalizer=normalizer,
         device=device,
         dtype=dtype,
-        **kwargs
+        **kwargs,
     )
 
 
 def create_monai_compatible_crop(
-    keys: Sequence[str],
-    crop_size: Tuple[int, int, int],
-    **kwargs
+    keys: Sequence[str], crop_size: Tuple[int, int, int], **kwargs
 ) -> MonaiCompatibleTransform:
     """
     Create a MONAI-compatible crop transform.

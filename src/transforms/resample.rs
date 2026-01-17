@@ -20,13 +20,37 @@ use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 use rayon::prelude::*;
 
 /// Interpolation method for resampling.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Interpolation {
     /// Nearest neighbor (fast, preserves labels).
     Nearest,
     /// Trilinear interpolation (smooth, default).
     #[default]
     Trilinear,
+}
+
+impl std::fmt::Display for Interpolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Nearest => write!(f, "nearest"),
+            Self::Trilinear => write!(f, "trilinear"),
+        }
+    }
+}
+
+impl std::str::FromStr for Interpolation {
+    type Err = crate::error::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_lowercase().as_str() {
+            "nearest" | "nn" => Ok(Self::Nearest),
+            "trilinear" | "linear" => Ok(Self::Trilinear),
+            _ => Err(crate::error::Error::Configuration(format!(
+                "unknown interpolation method: '{}' (expected 'nearest' or 'trilinear')",
+                s
+            ))),
+        }
+    }
 }
 
 /// Resample image to new voxel spacing.
@@ -94,13 +118,13 @@ pub fn resample_to_spacing(
     header.datatype = DataType::Float32;
     header.scl_slope = 1.0;
     header.scl_inter = 0.0;
-    header.dim = [1u16; 7];
+    header.dim = [1i64; 7];
     for (i, &d) in new_shape.iter().enumerate() {
-        header.dim[i] = d as u16;
+        header.dim[i] = d as i64;
     }
-    header.pixdim = [1.0f32; 8];
+    header.pixdim = [1.0f64; 8];
     for i in 0..spatial_dims {
-        header.pixdim[i + 1] = target_spacing[i];
+        header.pixdim[i + 1] = target_spacing[i] as f64;
     }
     header.set_affine(affine);
 
@@ -155,13 +179,13 @@ pub fn resample_to_shape(
     header.datatype = DataType::Float32;
     header.scl_slope = 1.0;
     header.scl_inter = 0.0;
-    header.dim = [1u16; 7];
+    header.dim = [1i64; 7];
     for (i, &d) in target_shape.iter().enumerate() {
-        header.dim[i] = d as u16;
+        header.dim[i] = d as i64;
     }
-    header.pixdim = [1.0f32; 8];
+    header.pixdim = [1.0f64; 8];
     for i in 0..spatial_dims {
-        header.pixdim[i + 1] = new_spacing[i];
+        header.pixdim[i + 1] = new_spacing[i] as f64;
     }
     header.set_affine(affine);
 
@@ -179,22 +203,18 @@ fn resample_trilinear_optimized(data: &ArrayD<f32>, new_shape: &[usize]) -> Arra
     let src_shape = [old_shape[0], old_shape[1], old_shape[2]];
     let dst_shape = [new_shape[0], new_shape[1], new_shape[2]];
 
-    // Get source data as contiguous slice
-    // For F-order arrays, as_slice_memory_order gives us F-order contiguous data
-    let src_slice = if let Some(slice) = data.as_slice_memory_order() {
-        slice.to_vec()
+    // Try to use data directly without copying if already contiguous
+    let result_vec = if let Some(slice) = data.as_slice_memory_order() {
+        trilinear_resample_forder_adaptive(slice, src_shape, dst_shape)
     } else {
-        // Fallback: create contiguous F-order copy
+        // Fallback: create contiguous F-order copy only when necessary
         let mut f_order = ArrayD::zeros(IxDyn(old_shape).f());
         f_order.assign(data);
-        f_order
+        let slice = f_order
             .as_slice_memory_order()
-            .expect("F-order array should be contiguous")
-            .to_vec()
+            .expect("F-order array should be contiguous");
+        trilinear_resample_forder_adaptive(slice, src_shape, dst_shape)
     };
-
-    // Use the optimized F-order SIMD kernel
-    let result_vec = trilinear_resample_forder_adaptive(&src_slice, src_shape, dst_shape);
 
     // Create F-order output array
     ArrayD::from_shape_vec(

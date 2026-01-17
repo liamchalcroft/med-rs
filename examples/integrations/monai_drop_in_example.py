@@ -86,17 +86,19 @@ def example_label_aware_cropping():
         image_path, label_path = create_test_data(tmpdir)
 
         # Create pipeline (same API as MONAI)
-        pipeline = Compose([
-            MedrsLoadImaged(keys=["image", "label"], ensure_channel_first=True),
-            MedrsRandCropByPosNegLabeld(
-                keys=["image", "label"],
-                label_key="label",
-                spatial_size=(32, 32, 32),
-                pos=1,
-                neg=1,
-                num_samples=2,  # Generate 2 crops
-            ),
-        ])
+        pipeline = Compose(
+            [
+                MedrsLoadImaged(keys=["image", "label"], ensure_channel_first=True),
+                MedrsRandCropByPosNegLabeld(
+                    keys=["image", "label"],
+                    label_key="label",
+                    spatial_size=(32, 32, 32),
+                    pos=1,
+                    neg=1,
+                    num_samples=2,  # Generate 2 crops
+                ),
+            ]
+        )
 
         # Run pipeline
         data = {"image": image_path, "label": label_path}
@@ -128,30 +130,28 @@ def example_full_training_pipeline():
         image_path, label_path = create_test_data(tmpdir)
 
         # Build training pipeline mixing medrs and MONAI transforms
-        train_transforms = Compose([
-            # medrs: Fast loading
-            MedrsLoadImaged(keys=["image", "label"], ensure_channel_first=True),
-
-            # medrs: Reorientation
-            MedrsOrientationd(keys=["image", "label"], axcodes="RAS"),
-
-            # medrs: Fast label-aware cropping
-            MedrsRandCropByPosNegLabeld(
-                keys=["image", "label"],
-                label_key="label",
-                spatial_size=(32, 32, 32),
-                pos=1,
-                neg=1,
-                num_samples=4,
-            ),
-
-            # MONAI: Standard augmentations (still work with medrs outputs)
-            RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
-            RandGaussianNoised(keys=["image"], prob=0.2, std=0.1),
-
-            # MONAI: Ensure correct tensor type
-            EnsureTyped(keys=["image", "label"]),
-        ])
+        train_transforms = Compose(
+            [
+                # medrs: Fast loading
+                MedrsLoadImaged(keys=["image", "label"], ensure_channel_first=True),
+                # medrs: Reorientation
+                MedrsOrientationd(keys=["image", "label"], axcodes="RAS"),
+                # medrs: Fast label-aware cropping
+                MedrsRandCropByPosNegLabeld(
+                    keys=["image", "label"],
+                    label_key="label",
+                    spatial_size=(32, 32, 32),
+                    pos=1,
+                    neg=1,
+                    num_samples=4,
+                ),
+                # MONAI: Standard augmentations (still work with medrs outputs)
+                RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+                RandGaussianNoised(keys=["image"], prob=0.2, std=0.1),
+                # MONAI: Ensure correct tensor type
+                EnsureTyped(keys=["image", "label"]),
+            ]
+        )
 
         # Run pipeline
         data = {"image": image_path, "label": label_path}
@@ -200,8 +200,8 @@ def example_performance_comparison():
         monai_time = (time.perf_counter() - start) / 10
 
         speedup = monai_time / medrs_time
-        print(f"medrs LoadImaged:  {medrs_time*1000:.2f} ms")
-        print(f"MONAI LoadImaged:  {monai_time*1000:.2f} ms")
+        print(f"medrs LoadImaged:  {medrs_time * 1000:.2f} ms")
+        print(f"MONAI LoadImaged:  {monai_time * 1000:.2f} ms")
         print(f"Speedup: {speedup:.1f}x faster with medrs")
 
 
@@ -218,16 +218,18 @@ def example_saving():
         output_dir = f"{tmpdir}/output"
 
         # Load, process, save
-        pipeline = Compose([
-            MedrsLoadImaged(keys=["image"], ensure_channel_first=True),
-            MedrsSaveImaged(
-                keys=["image"],
-                output_dir=output_dir,
-                output_postfix="processed",
-                output_ext=".nii.gz",
-                print_log=True,
-            ),
-        ])
+        pipeline = Compose(
+            [
+                MedrsLoadImaged(keys=["image"], ensure_channel_first=True),
+                MedrsSaveImaged(
+                    keys=["image"],
+                    output_dir=output_dir,
+                    output_postfix="processed",
+                    output_ext=".nii.gz",
+                    print_log=True,
+                ),
+            ]
+        )
 
         data = {"image": image_path}
         pipeline(data)

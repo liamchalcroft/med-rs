@@ -4,6 +4,10 @@
 
 use super::header::{DataType, NiftiHeader};
 use crate::error::{Error, Result};
+use crate::pipeline::simd_kernels::{
+    f32_native_scaled, f32_swap_to_f32_scaled, i16_native_to_f32_scaled, i16_swap_to_f32_scaled,
+    i32_swap_to_f32_scaled, u16_swap_to_f32_scaled, u32_swap_to_f32_scaled, u8_to_f32_scaled,
+};
 use byteorder::ByteOrder;
 use half::{bf16, f16};
 use memmap2::Mmap;
@@ -81,7 +85,7 @@ impl NiftiImage {
         offset: usize,
         len: usize,
     ) -> Self {
-        let shape: Vec<usize> = header.shape().iter().map(|&d| d as usize).collect();
+        let shape: Vec<usize> = header.shape();
         Self {
             header,
             storage: DataStorage::SharedBytes { bytes, offset, len },
@@ -96,7 +100,7 @@ impl NiftiImage {
         offset: usize,
         len: usize,
     ) -> Self {
-        let shape: Vec<usize> = header.shape().iter().map(|&d| d as usize).collect();
+        let shape: Vec<usize> = header.shape();
         Self {
             header,
             storage: DataStorage::SharedMmap { mmap, offset, len },
@@ -109,7 +113,7 @@ impl NiftiImage {
     /// This is more efficient than cloning an entire image when you only need
     /// the header metadata and have new data to associate with it.
     pub(crate) fn from_parts(header: NiftiHeader, data: ArrayData) -> Self {
-        let shape: Vec<usize> = header.shape().iter().map(|&d| d as usize).collect();
+        let shape: Vec<usize> = header.shape();
         Self {
             header,
             storage: DataStorage::Owned(data),
@@ -122,13 +126,14 @@ impl NiftiImage {
     where
         T: NiftiElement + Clone,
     {
-        let shape: Vec<u16> = array.shape().iter().map(|&d| d as u16).collect();
         let shape_cache: Vec<usize> = array.shape().to_vec();
-        let mut dim = [1u16; 7];
-        dim[..shape.len()].copy_from_slice(&shape);
+        let mut dim = [1i64; 7];
+        for (i, &d) in array.shape().iter().enumerate().take(7) {
+            dim[i] = d as i64;
+        }
 
         let mut header = NiftiHeader {
-            ndim: shape.len() as u8,
+            ndim: shape_cache.len().min(7) as u8,
             dim,
             datatype: T::DATA_TYPE,
             ..Default::default()
@@ -344,20 +349,101 @@ impl NiftiImage {
     }
 
     /// Voxel spacing.
-    pub fn spacing(&self) -> &[f32] {
+    pub fn spacing(&self) -> Vec<f32> {
         self.header.spacing()
+    }
+
+    /// Check if zero-copy numpy access is possible.
+    ///
+    /// Zero-copy is possible when:
+    /// - Data is mmap'd (uncompressed .nii file)
+    /// - Data type matches the requested type
+    /// - Native endianness
+    /// - No scaling required (slope=1, intercept=0) for float types
+    /// - Memory is properly aligned
+    pub fn can_zero_copy(&self) -> bool {
+        // Must be mmap-backed
+        let is_mmap = matches!(&self.storage, DataStorage::SharedMmap { .. });
+        if !is_mmap {
+            return false;
+        }
+
+        // Must be native endian
+        let native_le = cfg!(target_endian = "little");
+        if self.header.is_little_endian() != native_le {
+            return false;
+        }
+
+        // Check alignment
+        if let DataStorage::SharedMmap { mmap, offset, len } = &self.storage {
+            let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+            let align = self.header.datatype.byte_size();
+            if (slice.as_ptr() as usize) % align != 0 {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Check if zero-copy access to f32 data is possible.
+    ///
+    /// In addition to the basic zero-copy requirements, this also checks:
+    /// - Data type is f32
+    /// - No scaling required (slope=1 or 0, intercept=0)
+    pub fn can_zero_copy_f32(&self) -> bool {
+        if !self.can_zero_copy() {
+            return false;
+        }
+
+        // Must be f32
+        if self.header.datatype != DataType::Float32 {
+            return false;
+        }
+
+        // No scaling (slope=0 treated as 1.0 per NIfTI spec)
+        let slope = self.header.scl_slope;
+        let inter = self.header.scl_inter;
+        let has_scaling = (slope != 0.0 && slope != 1.0) || inter != 0.0;
+        if has_scaling {
+            return false;
+        }
+
+        true
+    }
+
+    /// Get a raw byte slice of the underlying data if zero-copy is possible.
+    ///
+    /// Returns None if data is not mmap-backed or not accessible.
+    pub fn raw_bytes(&self) -> Option<&[u8]> {
+        match &self.storage {
+            DataStorage::SharedMmap { mmap, offset, len } => {
+                let end = (*offset + *len).min(mmap.len());
+                Some(&mmap[*offset..end])
+            }
+            _ => None,
+        }
+    }
+
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
+    pub(crate) fn mmap_arc(&self) -> Option<Arc<Mmap>> {
+        match &self.storage {
+            DataStorage::SharedMmap { mmap, .. } => Some(Arc::clone(mmap)),
+            _ => None,
+        }
     }
 
     /// Get data as f32 array with scaling applied.
     ///
     /// This is the primary way to access image data, similar to nibabel's `get_fdata()`.
+    /// Note: scl_slope=0 is treated as 1.0 per NIfTI spec.
     pub fn to_f32(&self) -> Result<ArrayD<f32>> {
         let slope = if self.header.scl_slope == 0.0 {
-            1.0
+            1.0f32
         } else {
-            self.header.scl_slope
+            self.header.scl_slope as f32
         };
-        let inter = self.header.scl_inter;
+        let inter = self.header.scl_inter as f32;
 
         macro_rules! convert_owned {
             ($arr:expr) => {
@@ -375,17 +461,19 @@ impl NiftiImage {
                 ArrayData::U32(a) => convert_owned!(a),
                 ArrayData::I64(a) => convert_owned!(a),
                 ArrayData::U64(a) => convert_owned!(a),
-                ArrayData::F16(a) => convert_owned!(a.mapv(|v| v.to_f32() * slope + inter)),
-                ArrayData::BF16(a) => convert_owned!(a.mapv(|v| v.to_f32() * slope + inter)),
+                ArrayData::F16(a) => Ok(a.mapv(|v| v.to_f32() * slope + inter)),
+                ArrayData::BF16(a) => Ok(a.mapv(|v| v.to_f32() * slope + inter)),
                 ArrayData::F32(a) => {
                     if slope == 1.0 && inter == 0.0 {
                         Ok(a.clone())
                     } else {
-                        convert_owned!(a.mapv(|v| v * slope + inter))
+                        Ok(a.mapv(|v| v * slope + inter))
                     }
                 }
                 ArrayData::F64(a) => {
-                    convert_owned!(a.mapv(|v| (v * slope as f64 + inter as f64) as f32))
+                    let slope64 = slope as f64;
+                    let inter64 = inter as f64;
+                    Ok(a.mapv(|v| (v * slope64 + inter64) as f32))
                 }
             },
             DataStorage::SharedBytes { bytes, offset, len } => {
@@ -405,33 +493,44 @@ impl NiftiImage {
             1.0
         } else {
             self.header.scl_slope
-        } as f64;
-        let inter = self.header.scl_inter as f64;
+        };
+        let inter = self.header.scl_inter;
 
-        macro_rules! convert {
+        macro_rules! convert_owned {
             ($arr:expr) => {
                 Ok($arr.mapv(|v| v as f64 * slope + inter))
             };
         }
 
-        match self.materialize_owned()? {
-            ArrayData::U8(a) => convert!(a),
-            ArrayData::I8(a) => convert!(a),
-            ArrayData::I16(a) => convert!(a),
-            ArrayData::U16(a) => convert!(a),
-            ArrayData::I32(a) => convert!(a),
-            ArrayData::U32(a) => convert!(a),
-            ArrayData::I64(a) => convert!(a),
-            ArrayData::U64(a) => convert!(a),
-            ArrayData::F16(a) => Ok(a.mapv(|v| v.to_f64() * slope + inter)),
-            ArrayData::BF16(a) => Ok(a.mapv(|v| v.to_f64() * slope + inter)),
-            ArrayData::F32(a) => convert!(a),
-            ArrayData::F64(a) => {
-                if slope == 1.0 && inter == 0.0 {
-                    Ok(a)
-                } else {
-                    Ok(a.mapv(|v| v * slope + inter))
+        // Fast path for already-owned data (avoids clone in materialize_owned)
+        match &self.storage {
+            DataStorage::Owned(d) => match d {
+                ArrayData::U8(a) => convert_owned!(a),
+                ArrayData::I8(a) => convert_owned!(a),
+                ArrayData::I16(a) => convert_owned!(a),
+                ArrayData::U16(a) => convert_owned!(a),
+                ArrayData::I32(a) => convert_owned!(a),
+                ArrayData::U32(a) => convert_owned!(a),
+                ArrayData::I64(a) => convert_owned!(a),
+                ArrayData::U64(a) => convert_owned!(a),
+                ArrayData::F16(a) => Ok(a.mapv(|v| v.to_f64() * slope + inter)),
+                ArrayData::BF16(a) => Ok(a.mapv(|v| v.to_f64() * slope + inter)),
+                ArrayData::F32(a) => convert_owned!(a),
+                ArrayData::F64(a) => {
+                    if slope == 1.0 && inter == 0.0 {
+                        Ok(a.clone())
+                    } else {
+                        Ok(a.mapv(|v| v * slope + inter))
+                    }
                 }
+            },
+            DataStorage::SharedBytes { bytes, offset, len } => {
+                let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
+                self.shared_to_f64_slice(slice, slope, inter)
+            }
+            DataStorage::SharedMmap { mmap, offset, len } => {
+                let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+                self.shared_to_f64_slice(slice, slope, inter)
             }
         }
     }
@@ -441,38 +540,51 @@ impl NiftiImage {
     /// Useful for ML pipelines that use bfloat16 for reduced memory/storage.
     pub fn to_bf16(&self) -> Result<ArrayD<bf16>> {
         let slope = if self.header.scl_slope == 0.0 {
-            1.0
+            1.0f32
         } else {
-            self.header.scl_slope
+            self.header.scl_slope as f32
         };
-        let inter = self.header.scl_inter;
+        let inter = self.header.scl_inter as f32;
 
-        macro_rules! convert {
+        macro_rules! convert_owned {
             ($arr:expr) => {
                 Ok($arr.mapv(|v| bf16::from_f32(v as f32 * slope + inter)))
             };
         }
 
-        match self.materialize_owned()? {
-            ArrayData::U8(a) => convert!(a),
-            ArrayData::I8(a) => convert!(a),
-            ArrayData::I16(a) => convert!(a),
-            ArrayData::U16(a) => convert!(a),
-            ArrayData::I32(a) => convert!(a),
-            ArrayData::U32(a) => convert!(a),
-            ArrayData::I64(a) => convert!(a),
-            ArrayData::U64(a) => convert!(a),
-            ArrayData::F16(a) => Ok(a.mapv(|v| bf16::from_f32(v.to_f32() * slope + inter))),
-            ArrayData::BF16(a) => {
-                if slope == 1.0 && inter == 0.0 {
-                    Ok(a)
-                } else {
-                    Ok(a.mapv(|v| bf16::from_f32(v.to_f32() * slope + inter)))
+        // Fast path for already-owned data (avoids clone in materialize_owned)
+        match &self.storage {
+            DataStorage::Owned(d) => match d {
+                ArrayData::U8(a) => convert_owned!(a),
+                ArrayData::I8(a) => convert_owned!(a),
+                ArrayData::I16(a) => convert_owned!(a),
+                ArrayData::U16(a) => convert_owned!(a),
+                ArrayData::I32(a) => convert_owned!(a),
+                ArrayData::U32(a) => convert_owned!(a),
+                ArrayData::I64(a) => convert_owned!(a),
+                ArrayData::U64(a) => convert_owned!(a),
+                ArrayData::F16(a) => Ok(a.mapv(|v| bf16::from_f32(v.to_f32() * slope + inter))),
+                ArrayData::BF16(a) => {
+                    if slope == 1.0 && inter == 0.0 {
+                        Ok(a.clone())
+                    } else {
+                        Ok(a.mapv(|v| bf16::from_f32(v.to_f32() * slope + inter)))
+                    }
                 }
+                ArrayData::F32(a) => Ok(a.mapv(|v| bf16::from_f32(v * slope + inter))),
+                ArrayData::F64(a) => {
+                    Ok(a.mapv(|v| bf16::from_f32((v * slope as f64 + inter as f64) as f32)))
+                }
+            },
+            DataStorage::SharedBytes { bytes, offset, len } => {
+                let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
+                let f32_data = self.shared_to_f32_slice(slice, slope, inter)?;
+                Ok(f32_data.mapv(bf16::from_f32))
             }
-            ArrayData::F32(a) => Ok(a.mapv(|v| bf16::from_f32(v * slope + inter))),
-            ArrayData::F64(a) => {
-                Ok(a.mapv(|v| bf16::from_f32((v * slope as f64 + inter as f64) as f32)))
+            DataStorage::SharedMmap { mmap, offset, len } => {
+                let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+                let f32_data = self.shared_to_f32_slice(slice, slope, inter)?;
+                Ok(f32_data.mapv(bf16::from_f32))
             }
         }
     }
@@ -482,38 +594,51 @@ impl NiftiImage {
     /// Useful for ML pipelines that use float16 for reduced memory/storage.
     pub fn to_f16(&self) -> Result<ArrayD<f16>> {
         let slope = if self.header.scl_slope == 0.0 {
-            1.0
+            1.0f32
         } else {
-            self.header.scl_slope
+            self.header.scl_slope as f32
         };
-        let inter = self.header.scl_inter;
+        let inter = self.header.scl_inter as f32;
 
-        macro_rules! convert {
+        macro_rules! convert_owned {
             ($arr:expr) => {
                 Ok($arr.mapv(|v| f16::from_f32(v as f32 * slope + inter)))
             };
         }
 
-        match self.materialize_owned()? {
-            ArrayData::U8(a) => convert!(a),
-            ArrayData::I8(a) => convert!(a),
-            ArrayData::I16(a) => convert!(a),
-            ArrayData::U16(a) => convert!(a),
-            ArrayData::I32(a) => convert!(a),
-            ArrayData::U32(a) => convert!(a),
-            ArrayData::I64(a) => convert!(a),
-            ArrayData::U64(a) => convert!(a),
-            ArrayData::F16(a) => {
-                if slope == 1.0 && inter == 0.0 {
-                    Ok(a)
-                } else {
-                    Ok(a.mapv(|v| f16::from_f32(v.to_f32() * slope + inter)))
+        // Fast path for already-owned data (avoids clone in materialize_owned)
+        match &self.storage {
+            DataStorage::Owned(d) => match d {
+                ArrayData::U8(a) => convert_owned!(a),
+                ArrayData::I8(a) => convert_owned!(a),
+                ArrayData::I16(a) => convert_owned!(a),
+                ArrayData::U16(a) => convert_owned!(a),
+                ArrayData::I32(a) => convert_owned!(a),
+                ArrayData::U32(a) => convert_owned!(a),
+                ArrayData::I64(a) => convert_owned!(a),
+                ArrayData::U64(a) => convert_owned!(a),
+                ArrayData::F16(a) => {
+                    if slope == 1.0 && inter == 0.0 {
+                        Ok(a.clone())
+                    } else {
+                        Ok(a.mapv(|v| f16::from_f32(v.to_f32() * slope + inter)))
+                    }
                 }
+                ArrayData::BF16(a) => Ok(a.mapv(|v| f16::from_f32(v.to_f32() * slope + inter))),
+                ArrayData::F32(a) => Ok(a.mapv(|v| f16::from_f32(v * slope + inter))),
+                ArrayData::F64(a) => {
+                    Ok(a.mapv(|v| f16::from_f32((v * slope as f64 + inter as f64) as f32)))
+                }
+            },
+            DataStorage::SharedBytes { bytes, offset, len } => {
+                let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
+                let f32_data = self.shared_to_f32_slice(slice, slope, inter)?;
+                Ok(f32_data.mapv(f16::from_f32))
             }
-            ArrayData::BF16(a) => Ok(a.mapv(|v| f16::from_f32(v.to_f32() * slope + inter))),
-            ArrayData::F32(a) => Ok(a.mapv(|v| f16::from_f32(v * slope + inter))),
-            ArrayData::F64(a) => {
-                Ok(a.mapv(|v| f16::from_f32((v * slope as f64 + inter as f64) as f32)))
+            DataStorage::SharedMmap { mmap, offset, len } => {
+                let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+                let f32_data = self.shared_to_f32_slice(slice, slope, inter)?;
+                Ok(f32_data.mapv(f16::from_f32))
             }
         }
     }
@@ -584,8 +709,8 @@ impl NiftiImage {
             1.0
         } else {
             self.header.scl_slope
-        } as f64;
-        let inter = self.header.scl_inter as f64;
+        };
+        let inter = self.header.scl_inter;
 
         macro_rules! convert {
             ($arr:expr) => {
@@ -1059,48 +1184,121 @@ impl NiftiImage {
             }
         }
 
-        // Parallel/sequential conversion macros
+        // =======================================================================
+        // SIMD-accelerated fast paths for common data types (sequential only)
+        // For data sizes below parallel threshold, SIMD provides better perf
+        // than parallel iteration due to reduced overhead.
+        // =======================================================================
+
+        // SIMD path for UInt8 (very common for labels/masks)
+        // Always use SIMD - it's faster than parallel scalar for memory-bound workloads
+        if self.header.datatype == DataType::UInt8 {
+            let num_elems = bytes.len();
+            let mut out = vec![0.0f32; num_elems];
+            u8_to_f32_scaled(bytes, &mut out, slope, inter);
+            return ArrayD::from_shape_vec(IxDyn(shape).f(), out)
+                .map_err(|e| Error::InvalidDimensions(e.to_string()));
+        }
+
+        // SIMD path for Int16 (very common for medical images)
+        if self.header.datatype == DataType::Int16 {
+            let num_elems = bytes.len() / 2;
+            let mut out = vec![0.0f32; num_elems];
+            if is_native {
+                i16_native_to_f32_scaled(bytes, &mut out, slope, inter);
+            } else {
+                i16_swap_to_f32_scaled(bytes, &mut out, slope, inter);
+            }
+            return ArrayD::from_shape_vec(IxDyn(shape).f(), out)
+                .map_err(|e| Error::InvalidDimensions(e.to_string()));
+        }
+
+        // SIMD path for Float32 with scaling (native endian already handled above for identity)
+        if self.header.datatype == DataType::Float32 {
+            let num_elems = bytes.len() / 4;
+            let mut out = vec![0.0f32; num_elems];
+            if is_native {
+                f32_native_scaled(bytes, &mut out, slope, inter);
+            } else {
+                f32_swap_to_f32_scaled(bytes, &mut out, slope, inter);
+            }
+            return ArrayD::from_shape_vec(IxDyn(shape).f(), out)
+                .map_err(|e| Error::InvalidDimensions(e.to_string()));
+        }
+
+        // SIMD path for UInt16, Int32, UInt32 (non-native endian only)
+        // Native endian falls through to byteorder-based path below
+        if !is_native {
+            match self.header.datatype {
+                DataType::UInt16 => {
+                    let num_elems = bytes.len() / 2;
+                    let mut out = vec![0.0f32; num_elems];
+                    u16_swap_to_f32_scaled(bytes, &mut out, slope, inter);
+                    return ArrayD::from_shape_vec(IxDyn(shape).f(), out)
+                        .map_err(|e| Error::InvalidDimensions(e.to_string()));
+                }
+                DataType::Int32 => {
+                    let num_elems = bytes.len() / 4;
+                    let mut out = vec![0.0f32; num_elems];
+                    i32_swap_to_f32_scaled(bytes, &mut out, slope, inter);
+                    return ArrayD::from_shape_vec(IxDyn(shape).f(), out)
+                        .map_err(|e| Error::InvalidDimensions(e.to_string()));
+                }
+                DataType::UInt32 => {
+                    let num_elems = bytes.len() / 4;
+                    let mut out = vec![0.0f32; num_elems];
+                    u32_swap_to_f32_scaled(bytes, &mut out, slope, inter);
+                    return ArrayD::from_shape_vec(IxDyn(shape).f(), out)
+                        .map_err(|e| Error::InvalidDimensions(e.to_string()));
+                }
+                _ => {}
+            }
+        }
+
+        // =======================================================================
+        // Fallback: parallel scalar for large data, sequential for small data.
+        // Uses Rayon's optimized par_chunks_exact().map().collect() pattern.
+        // =======================================================================
+
+        // Sequential conversion macros
         macro_rules! convert_chunks {
             ($elem_size:expr, $read_le:expr, $read_be:expr) => {{
-                if use_parallel {
-                    bytes
-                        .par_chunks_exact($elem_size)
-                        .map(|chunk| {
-                            let v = if is_le {
-                                $read_le(chunk)
-                            } else {
-                                $read_be(chunk)
-                            };
-                            v as f32 * slope + inter
-                        })
-                        .collect()
-                } else {
-                    bytes
-                        .chunks_exact($elem_size)
-                        .map(|chunk| {
-                            let v = if is_le {
-                                $read_le(chunk)
-                            } else {
-                                $read_be(chunk)
-                            };
-                            v as f32 * slope + inter
-                        })
-                        .collect()
-                }
+                bytes
+                    .chunks_exact($elem_size)
+                    .map(|chunk| {
+                        let v = if is_le {
+                            $read_le(chunk)
+                        } else {
+                            $read_be(chunk)
+                        };
+                        v as f32 * slope + inter
+                    })
+                    .collect()
+            }};
+        }
+
+        macro_rules! convert_chunks_parallel {
+            ($elem_size:expr, $read_le:expr, $read_be:expr) => {{
+                bytes
+                    .par_chunks_exact($elem_size)
+                    .map(|chunk| {
+                        let v = if is_le {
+                            $read_le(chunk)
+                        } else {
+                            $read_be(chunk)
+                        };
+                        v as f32 * slope + inter
+                    })
+                    .collect()
             }};
         }
 
         let out: Vec<f32> = match self.header.datatype {
-            DataType::UInt8 => {
-                if use_parallel {
-                    bytes
-                        .par_iter()
-                        .map(|&b| b as f32 * slope + inter)
-                        .collect()
-                } else {
-                    bytes.iter().map(|&b| b as f32 * slope + inter).collect()
-                }
+            // UInt8, Int16, Float32 are handled by SIMD early-returns above (unreachable here)
+            DataType::UInt8 | DataType::Int16 | DataType::Float32 => {
+                unreachable!("Should be handled by SIMD paths above")
             }
+            // Int8: no SIMD path, use parallel for large data
             DataType::Int8 => {
                 if use_parallel {
                     bytes
@@ -1114,36 +1312,83 @@ impl NiftiImage {
                         .collect()
                 }
             }
-            DataType::Int16 => convert_chunks!(
-                2,
-                byteorder::LittleEndian::read_i16,
-                byteorder::BigEndian::read_i16
-            ),
-            DataType::UInt16 => convert_chunks!(
-                2,
-                byteorder::LittleEndian::read_u16,
-                byteorder::BigEndian::read_u16
-            ),
-            DataType::Int32 => convert_chunks!(
-                4,
-                byteorder::LittleEndian::read_i32,
-                byteorder::BigEndian::read_i32
-            ),
-            DataType::UInt32 => convert_chunks!(
-                4,
-                byteorder::LittleEndian::read_u32,
-                byteorder::BigEndian::read_u32
-            ),
-            DataType::Int64 => convert_chunks!(
-                8,
-                byteorder::LittleEndian::read_i64,
-                byteorder::BigEndian::read_i64
-            ),
-            DataType::UInt64 => convert_chunks!(
-                8,
-                byteorder::LittleEndian::read_u64,
-                byteorder::BigEndian::read_u64
-            ),
+            // UInt16, Int32, UInt32: non-native handled by SIMD above, native uses byteorder
+            DataType::UInt16 => {
+                if use_parallel {
+                    convert_chunks_parallel!(
+                        2,
+                        byteorder::LittleEndian::read_u16,
+                        byteorder::BigEndian::read_u16
+                    )
+                } else {
+                    convert_chunks!(
+                        2,
+                        byteorder::LittleEndian::read_u16,
+                        byteorder::BigEndian::read_u16
+                    )
+                }
+            }
+            DataType::Int32 => {
+                if use_parallel {
+                    convert_chunks_parallel!(
+                        4,
+                        byteorder::LittleEndian::read_i32,
+                        byteorder::BigEndian::read_i32
+                    )
+                } else {
+                    convert_chunks!(
+                        4,
+                        byteorder::LittleEndian::read_i32,
+                        byteorder::BigEndian::read_i32
+                    )
+                }
+            }
+            DataType::UInt32 => {
+                if use_parallel {
+                    convert_chunks_parallel!(
+                        4,
+                        byteorder::LittleEndian::read_u32,
+                        byteorder::BigEndian::read_u32
+                    )
+                } else {
+                    convert_chunks!(
+                        4,
+                        byteorder::LittleEndian::read_u32,
+                        byteorder::BigEndian::read_u32
+                    )
+                }
+            }
+            // 64-bit types and half-precision types: parallel for large, sequential for small
+            DataType::Int64 => {
+                if use_parallel {
+                    convert_chunks_parallel!(
+                        8,
+                        byteorder::LittleEndian::read_i64,
+                        byteorder::BigEndian::read_i64
+                    )
+                } else {
+                    convert_chunks!(
+                        8,
+                        byteorder::LittleEndian::read_i64,
+                        byteorder::BigEndian::read_i64
+                    )
+                }
+            }
+            DataType::UInt64 => {
+                if use_parallel {
+                    convert_chunks_parallel!(
+                        8,
+                        byteorder::LittleEndian::read_u64,
+                        byteorder::BigEndian::read_u64
+                    )
+                } else {
+                    convert_chunks!(
+                        8,
+                        byteorder::LittleEndian::read_u64,
+                        byteorder::BigEndian::read_u64
+                    )
+                }
+            }
             DataType::Float16 => {
                 if use_parallel {
                     bytes
@@ -1198,33 +1443,6 @@ impl NiftiImage {
                         .collect()
                 }
             }
-            DataType::Float32 => {
-                if use_parallel {
-                    bytes
-                        .par_chunks_exact(4)
-                        .map(|chunk| {
-                            let v = if is_le {
-                                byteorder::LittleEndian::read_f32(chunk)
-                            } else {
-                                byteorder::BigEndian::read_f32(chunk)
-                            };
-                            v * slope + inter
-                        })
-                        .collect()
-                } else {
-                    bytes
-                        .chunks_exact(4)
-                        .map(|chunk| {
-                            let v = if is_le {
-                                byteorder::LittleEndian::read_f32(chunk)
-                            } else {
-                                byteorder::BigEndian::read_f32(chunk)
-                            };
-                            v * slope + inter
-                        })
-                        .collect()
-                }
-            }
             DataType::Float64 => {
                 if use_parallel {
                     bytes
@@ -1248,6 +1466,210 @@ impl NiftiImage {
                                 byteorder::BigEndian::read_f64(chunk)
                             };
                             (v * slope as f64 + inter as f64) as f32
+                        })
+                        .collect()
+                }
+            }
+        };
+
+        ArrayD::from_shape_vec(IxDyn(shape).f(), out)
+            .map_err(|e| Error::InvalidDimensions(e.to_string()))
+    }
+
+    /// Convert shared bytes to f64 array with scaling.
+    fn shared_to_f64_slice(&self, bytes: &[u8], slope: f64, inter: f64) -> Result<ArrayD<f64>> {
+        let shape = &self.shape_cache;
+        let is_le = self.header.is_little_endian();
+        let use_parallel = bytes.len() >= PARALLEL_THRESHOLD;
+
+        macro_rules! convert_chunks {
+            ($elem_size:expr, $read_le:expr, $read_be:expr) => {{
+                if use_parallel {
+                    bytes
+                        .par_chunks_exact($elem_size)
+                        .map(|chunk| {
+                            let v = if is_le {
+                                $read_le(chunk)
+                            } else {
+                                $read_be(chunk)
+                            };
+                            v as f64 * slope + inter
+                        })
+                        .collect()
+                } else {
+                    bytes
+                        .chunks_exact($elem_size)
+                        .map(|chunk| {
+                            let v = if is_le {
+                                $read_le(chunk)
+                            } else {
+                                $read_be(chunk)
+                            };
+                            v as f64 * slope + inter
+                        })
+                        .collect()
+                }
+            }};
+        }
+
+        let out: Vec<f64> = match self.header.datatype {
+            DataType::UInt8 => {
+                if use_parallel {
+                    bytes
+                        .par_iter()
+                        .map(|&b| b as f64 * slope + inter)
+                        .collect()
+                } else {
+                    bytes.iter().map(|&b| b as f64 * slope + inter).collect()
+                }
+            }
+            DataType::Int8 => {
+                if use_parallel {
+                    bytes
+                        .par_iter()
+                        .map(|&b| (b as i8) as f64 * slope + inter)
+                        .collect()
+                } else {
+                    bytes
+                        .iter()
+                        .map(|&b| (b as i8) as f64 * slope + inter)
+                        .collect()
+                }
+            }
+            DataType::Int16 => convert_chunks!(
+                2,
+                byteorder::LittleEndian::read_i16,
+                byteorder::BigEndian::read_i16
+            ),
+            DataType::UInt16 => convert_chunks!(
+                2,
+                byteorder::LittleEndian::read_u16,
+                byteorder::BigEndian::read_u16
+            ),
+            DataType::Int32 => convert_chunks!(
+                4,
+                byteorder::LittleEndian::read_i32,
+                byteorder::BigEndian::read_i32
+            ),
+            DataType::UInt32 => convert_chunks!(
+                4,
+                byteorder::LittleEndian::read_u32,
+                byteorder::BigEndian::read_u32
+            ),
+            DataType::Int64 => convert_chunks!(
+                8,
+                byteorder::LittleEndian::read_i64,
+                byteorder::BigEndian::read_i64
+            ),
+            DataType::UInt64 => convert_chunks!(
+                8,
+                byteorder::LittleEndian::read_u64,
+                byteorder::BigEndian::read_u64
+            ),
+            DataType::Float16 => {
+                if use_parallel {
+                    bytes
+                        .par_chunks_exact(2)
+                        .map(|chunk| {
+                            let bits = if is_le {
+                                byteorder::LittleEndian::read_u16(chunk)
+                            } else {
+                                byteorder::BigEndian::read_u16(chunk)
+                            };
+                            f16::from_bits(bits).to_f64() * slope + inter
+                        })
+                        .collect()
+                } else {
+                    bytes
+                        .chunks_exact(2)
+                        .map(|chunk| {
+                            let bits = if is_le {
+                                byteorder::LittleEndian::read_u16(chunk)
+                            } else {
+                                byteorder::BigEndian::read_u16(chunk)
+                            };
+                            f16::from_bits(bits).to_f64() * slope + inter
+                        })
+                        .collect()
+                }
+            }
+            DataType::BFloat16 => {
+                if use_parallel {
+                    bytes
+                        .par_chunks_exact(2)
+                        .map(|chunk| {
+                            let bits = if is_le {
+                                byteorder::LittleEndian::read_u16(chunk)
+                            } else {
+                                byteorder::BigEndian::read_u16(chunk)
+                            };
+                            bf16::from_bits(bits).to_f64() * slope + inter
+                        })
+                        .collect()
+                } else {
+                    bytes
+                        .chunks_exact(2)
+                        .map(|chunk| {
+                            let bits = if is_le {
+                                byteorder::LittleEndian::read_u16(chunk)
+                            } else {
+                                byteorder::BigEndian::read_u16(chunk)
+                            };
+                            bf16::from_bits(bits).to_f64() * slope + inter
+                        })
+                        .collect()
+                }
+            }
+            DataType::Float32 => {
+                if use_parallel {
+                    bytes
+                        .par_chunks_exact(4)
+                        .map(|chunk| {
+                            let v = if is_le {
+                                byteorder::LittleEndian::read_f32(chunk)
+                            } else {
+                                byteorder::BigEndian::read_f32(chunk)
+                            };
+                            v as f64 * slope + inter
+                        })
+                        .collect()
+                } else {
+                    bytes
+                        .chunks_exact(4)
+                        .map(|chunk| {
+                            let v = if is_le {
+                                byteorder::LittleEndian::read_f32(chunk)
+                            } else {
+                                byteorder::BigEndian::read_f32(chunk)
+                            };
+                            v as f64 * slope + inter
+                        })
+                        .collect()
+                }
+            }
+            DataType::Float64 => {
+                if use_parallel {
+                    bytes
+                        .par_chunks_exact(8)
+                        .map(|chunk| {
+                            let v = if is_le {
+                                byteorder::LittleEndian::read_f64(chunk)
+                            } else {
+                                byteorder::BigEndian::read_f64(chunk)
+                            };
+                            v * slope + inter
+                        })
+                        .collect()
+                } else {
+                    bytes
+                        .chunks_exact(8)
+                        .map(|chunk| {
+                            let v = if is_le {
+                                byteorder::LittleEndian::read_f64(chunk)
+                            } else {
+                                byteorder::BigEndian::read_f64(chunk)
+                            };
+                            v * slope + inter
                         })
                         .collect()
                 }
