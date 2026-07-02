@@ -9,6 +9,10 @@
 //! - to_f32() materialization
 //! - save() for uncompressed and compressed
 
+// A benchmark harness has no public API to document; criterion_group! expands
+// to an undocumented public function.
+#![allow(missing_docs)]
+
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use medrs::nifti::{self, NiftiImage};
 use ndarray::{ArrayD, IxDyn, ShapeBuilder};
@@ -57,7 +61,7 @@ fn bench_load_uncompressed(c: &mut Criterion) {
             b.iter(|| {
                 let img = nifti::load(black_box(path)).unwrap();
                 black_box(img)
-            })
+            });
         });
 
         // Also benchmark load + materialize
@@ -69,7 +73,7 @@ fn bench_load_uncompressed(c: &mut Criterion) {
                     let img = nifti::load(black_box(path)).unwrap();
                     let data = img.to_f32().unwrap();
                     black_box(data)
-                })
+                });
             },
         );
 
@@ -113,7 +117,7 @@ fn bench_load_compressed(c: &mut Criterion) {
             b.iter(|| {
                 let img = nifti::load(black_box(p)).unwrap();
                 black_box(img)
-            })
+            });
         });
     }
 
@@ -145,7 +149,7 @@ fn bench_load_cropped(c: &mut Criterion) {
             b.iter(|| {
                 let img = nifti::load_cropped(black_box(path), offset, crop_shape).unwrap();
                 black_box(img)
-            })
+            });
         });
     }
 
@@ -180,7 +184,7 @@ fn bench_to_f32(c: &mut Criterion) {
                 b.iter(|| {
                     let data = img.to_f32().unwrap();
                     black_box(data)
-                })
+                });
             },
         );
 
@@ -210,7 +214,7 @@ fn bench_save(c: &mut Criterion) {
                 let path = file.path().to_str().unwrap().to_string() + ".nii";
                 nifti::save(black_box(img), &path).unwrap();
                 black_box(path)
-            })
+            });
         });
 
         // Compressed save
@@ -221,7 +225,7 @@ fn bench_save(c: &mut Criterion) {
                 let path_str = path.to_str().unwrap();
                 nifti::save(black_box(img), path_str).unwrap();
                 black_box(path_str.to_string())
-            })
+            });
         });
     }
 
