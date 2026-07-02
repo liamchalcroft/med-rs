@@ -4,6 +4,7 @@ pub mod augmentation;
 pub mod conversion;
 pub mod crops;
 pub mod image;
+pub mod jvol;
 pub mod loader;
 pub mod module;
 pub mod multi_file;

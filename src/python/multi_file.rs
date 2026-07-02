@@ -92,9 +92,11 @@ pub fn load_multi(
     }
 
     // Build multi-file config
-    let mut config = nifti::MultiFileConfig::default();
-    config.reference_index = reference_index;
-    config.use_cache = use_cache;
+    let mut config = nifti::MultiFileConfig {
+        reference_index,
+        use_cache,
+        ..Default::default()
+    };
 
     if let Some(spacing) = target_spacing {
         if spacing.len() != 3 {
@@ -116,8 +118,9 @@ pub fn load_multi(
     }
 
     // Load files
-    let result =
-        nifti::load_multi(&file_configs, config).map_err(|e| to_py_err(e, "load_multi"))?;
+    let result = py
+        .allow_threads(|| nifti::load_multi(&file_configs, config))
+        .map_err(|e| to_py_err(e, "load_multi"))?;
 
     // Convert to Python objects
     Ok(result
@@ -153,6 +156,7 @@ pub fn load_multi(
 #[pyfunction]
 #[pyo3(signature = (image_path, label_path, target_spacing=None, crop_start=None, crop_size=None))]
 pub fn load_image_label_pair(
+    py: Python<'_>,
     image_path: &str,
     label_path: &str,
     target_spacing: Option<Vec<f32>>,
@@ -187,7 +191,8 @@ pub fn load_image_label_pair(
         }
     };
 
-    let (image, label) = nifti::load_image_label_pair(image_path, label_path, spacing, crop)
+    let (image, label) = py
+        .allow_threads(|| nifti::load_image_label_pair(image_path, label_path, spacing, crop))
         .map_err(|e| to_py_err(e, "load_image_label_pair"))?;
 
     Ok((PyNiftiImage { inner: image }, PyNiftiImage { inner: label }))

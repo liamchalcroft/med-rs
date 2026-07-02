@@ -20,6 +20,22 @@ use std::sync::Arc;
 /// Threshold for parallel materialization (1MB)
 const PARALLEL_THRESHOLD: usize = 1024 * 1024;
 
+/// Slice `[offset, offset + len)` from `bytes`, clamped to the buffer end.
+///
+/// Returns an error if `offset` itself is past the end of the buffer, which
+/// avoids the `bytes.len() - offset` underflow that the raw slicing pattern
+/// would otherwise hit for an out-of-range offset.
+fn data_slice(bytes: &[u8], offset: usize, len: usize) -> Result<&[u8]> {
+    if offset > bytes.len() {
+        return Err(Error::InvalidDimensions(format!(
+            "data offset {offset} exceeds buffer length {}",
+            bytes.len()
+        )));
+    }
+    let end = offset.saturating_add(len).min(bytes.len());
+    Ok(&bytes[offset..end])
+}
+
 /// Check if file endianness matches system endianness.
 #[inline]
 fn is_native_endian(little_endian: bool) -> bool {
@@ -159,6 +175,7 @@ impl NiftiImage {
 
     /// Get owned array data (materializes shared storage if needed).
     /// Note: This clones even if data is already owned; prefer `data_cow()` to avoid copies.
+    #[cfg_attr(not(feature = "python"), allow(dead_code))]
     pub(crate) fn owned_data(&self) -> Result<ArrayData> {
         self.materialize_owned()
     }
@@ -200,7 +217,7 @@ impl NiftiImage {
         match &self.storage {
             DataStorage::Owned(ArrayData::F32(a)) => Some(a.view()),
             DataStorage::SharedBytes { bytes, offset, len } => {
-                let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
+                let slice = data_slice(bytes, *offset, *len).ok()?;
                 let elems = slice.len() / std::mem::size_of::<f32>();
                 if elems != self.shape_cache.iter().product::<usize>() {
                     return None;
@@ -220,7 +237,7 @@ impl NiftiImage {
                 Some(view)
             }
             DataStorage::SharedMmap { mmap, offset, len } => {
-                let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+                let slice = data_slice(mmap, *offset, *len).ok()?;
                 let elems = slice.len() / std::mem::size_of::<f32>();
                 if elems != self.shape_cache.iter().product::<usize>() {
                     return None;
@@ -240,6 +257,26 @@ impl NiftiImage {
                 Some(view)
             }
             DataStorage::Owned(_) => None,
+        }
+    }
+
+    /// Borrow the data as a contiguous f32 slice without copying.
+    ///
+    /// Returns `Some` only when the storage is already owned, identity-scaled
+    /// (`scl_slope == 1`, `scl_inter == 0`) f32 in contiguous memory order. All
+    /// other cases must go through [`to_f32`](Self::to_f32).
+    pub(crate) fn as_f32_slice(&self) -> Option<&[f32]> {
+        let slope = if self.header.scl_slope == 0.0 {
+            1.0
+        } else {
+            self.header.scl_slope
+        };
+        if slope != 1.0 || self.header.scl_inter != 0.0 {
+            return None;
+        }
+        match &self.storage {
+            DataStorage::Owned(ArrayData::F32(a)) => a.as_slice_memory_order(),
+            _ => None,
         }
     }
 
@@ -263,7 +300,7 @@ impl NiftiImage {
         len: usize,
         dtype: DataType,
     ) -> Option<ArrayViewD<'_, T>> {
-        let slice = &bytes[offset..offset + len.min(bytes.len() - offset)];
+        let slice = data_slice(bytes, offset, len).ok()?;
         self.build_view(slice, dtype)
     }
 
@@ -274,7 +311,7 @@ impl NiftiImage {
         len: usize,
         dtype: DataType,
     ) -> Option<ArrayViewD<'_, T>> {
-        let slice = &mmap[offset..offset + len.min(mmap.len() - offset)];
+        let slice = data_slice(mmap, offset, len).ok()?;
         self.build_view(slice, dtype)
     }
 
@@ -376,7 +413,9 @@ impl NiftiImage {
 
         // Check alignment
         if let DataStorage::SharedMmap { mmap, offset, len } = &self.storage {
-            let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+            let Ok(slice) = data_slice(mmap, *offset, *len) else {
+                return false;
+            };
             let align = self.header.datatype.byte_size();
             if (slice.as_ptr() as usize) % align != 0 {
                 return false;
@@ -417,10 +456,7 @@ impl NiftiImage {
     /// Returns None if data is not mmap-backed or not accessible.
     pub fn raw_bytes(&self) -> Option<&[u8]> {
         match &self.storage {
-            DataStorage::SharedMmap { mmap, offset, len } => {
-                let end = (*offset + *len).min(mmap.len());
-                Some(&mmap[*offset..end])
-            }
+            DataStorage::SharedMmap { mmap, offset, len } => data_slice(mmap, *offset, *len).ok(),
             _ => None,
         }
     }
@@ -477,11 +513,11 @@ impl NiftiImage {
                 }
             },
             DataStorage::SharedBytes { bytes, offset, len } => {
-                let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
+                let slice = data_slice(bytes, *offset, *len)?;
                 self.shared_to_f32_slice(slice, slope, inter)
             }
             DataStorage::SharedMmap { mmap, offset, len } => {
-                let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+                let slice = data_slice(mmap, *offset, *len)?;
                 self.shared_to_f32_slice(slice, slope, inter)
             }
         }
@@ -525,11 +561,11 @@ impl NiftiImage {
                 }
             },
             DataStorage::SharedBytes { bytes, offset, len } => {
-                let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
+                let slice = data_slice(bytes, *offset, *len)?;
                 self.shared_to_f64_slice(slice, slope, inter)
             }
             DataStorage::SharedMmap { mmap, offset, len } => {
-                let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+                let slice = data_slice(mmap, *offset, *len)?;
                 self.shared_to_f64_slice(slice, slope, inter)
             }
         }
@@ -577,12 +613,12 @@ impl NiftiImage {
                 }
             },
             DataStorage::SharedBytes { bytes, offset, len } => {
-                let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
+                let slice = data_slice(bytes, *offset, *len)?;
                 let f32_data = self.shared_to_f32_slice(slice, slope, inter)?;
                 Ok(f32_data.mapv(bf16::from_f32))
             }
             DataStorage::SharedMmap { mmap, offset, len } => {
-                let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+                let slice = data_slice(mmap, *offset, *len)?;
                 let f32_data = self.shared_to_f32_slice(slice, slope, inter)?;
                 Ok(f32_data.mapv(bf16::from_f32))
             }
@@ -631,12 +667,12 @@ impl NiftiImage {
                 }
             },
             DataStorage::SharedBytes { bytes, offset, len } => {
-                let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
+                let slice = data_slice(bytes, *offset, *len)?;
                 let f32_data = self.shared_to_f32_slice(slice, slope, inter)?;
                 Ok(f32_data.mapv(f16::from_f32))
             }
             DataStorage::SharedMmap { mmap, offset, len } => {
-                let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+                let slice = data_slice(mmap, *offset, *len)?;
                 let f32_data = self.shared_to_f32_slice(slice, slope, inter)?;
                 Ok(f32_data.mapv(f16::from_f32))
             }
@@ -881,11 +917,11 @@ impl NiftiImage {
         match &self.storage {
             DataStorage::Owned(d) => Ok(d.clone()),
             DataStorage::SharedBytes { bytes, offset, len } => {
-                let slice = &bytes[*offset..*offset + (*len).min(bytes.len() - *offset)];
+                let slice = data_slice(bytes, *offset, *len)?;
                 self.materialize_native_from_slice(slice)
             }
             DataStorage::SharedMmap { mmap, offset, len } => {
-                let slice = &mmap[*offset..*offset + (*len).min(mmap.len() - *offset)];
+                let slice = data_slice(mmap, *offset, *len)?;
                 self.materialize_native_from_slice(slice)
             }
         }
@@ -1690,7 +1726,7 @@ mod tests {
     fn test_as_view_owned() {
         let data: Vec<u16> = (0..8).collect();
         // Create F-order array to match NIfTI convention
-        let c_order = ArrayD::from_shape_vec(IxDyn(&[2, 2, 2]), data.clone()).unwrap();
+        let c_order = ArrayD::from_shape_vec(IxDyn(&[2, 2, 2]), data).unwrap();
         let mut f_order: ArrayD<u16> = ArrayD::zeros(IxDyn(&[2, 2, 2]).f());
         f_order.assign(&c_order);
         let img = NiftiImage::from_array(
@@ -1719,7 +1755,7 @@ mod tests {
         let path = dir.path().join("view.nii");
         let data: Vec<f32> = (0..8).map(|v| v as f32).collect();
         // Create F-order array to match NIfTI convention
-        let c_order = ArrayD::from_shape_vec(IxDyn(&[2, 2, 2]), data.clone()).unwrap();
+        let c_order = ArrayD::from_shape_vec(IxDyn(&[2, 2, 2]), data).unwrap();
         let mut f_order: ArrayD<f32> = ArrayD::zeros(IxDyn(&[2, 2, 2]).f());
         f_order.assign(&c_order);
         let img = NiftiImage::from_array(

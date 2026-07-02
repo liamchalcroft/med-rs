@@ -8,7 +8,7 @@
 use super::header::NiftiHeader;
 use super::image::NiftiImage;
 use crate::error::{Error, Result};
-use flate2::bufread::{GzDecoder, MultiGzDecoder};
+use flate2::bufread::MultiGzDecoder;
 use gzp::deflate::{Gzip, Mgzip};
 use gzp::par::compress::ParCompressBuilder;
 use gzp::par::decompress::ParDecompressBuilder;
@@ -63,6 +63,32 @@ fn release_decompress_buffer(buf: Vec<u8>) {
     });
 }
 
+/// Acquire the global cache for writing, recovering from a poisoned lock.
+///
+/// A worker panicking while holding the lock must not permanently disable
+/// caching for the rest of the process, so we take the inner guard on poison.
+fn cache_write() -> std::sync::RwLockWriteGuard<'static, DecompressionCache> {
+    DECOMPRESSION_CACHE
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Identity stamp for a cached file, used to invalidate stale entries when the
+/// underlying file changes on disk.
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+}
+
+fn file_stamp(path: &Path) -> FileStamp {
+    let meta = std::fs::metadata(path).ok();
+    FileStamp {
+        len: meta.as_ref().map_or(0, std::fs::Metadata::len),
+        mtime: meta.and_then(|m| m.modified().ok()),
+    }
+}
+
 /// LRU-style cache for decompressed NIfTI data.
 struct DecompressionCache {
     /// Map from file path to (decompressed data, last access time)
@@ -77,6 +103,7 @@ struct CacheEntry {
     data: Arc<Vec<u8>>,
     header: NiftiHeader,
     last_access: u64,
+    stamp: FileStamp,
 }
 
 impl DecompressionCache {
@@ -89,6 +116,14 @@ impl DecompressionCache {
     }
 
     fn get(&mut self, path: &Path) -> Option<(Arc<Vec<u8>>, NiftiHeader)> {
+        // Invalidate the entry if the file changed on disk since it was cached.
+        let current = file_stamp(path);
+        if let Some(entry) = self.entries.get(path) {
+            if entry.stamp != current {
+                self.entries.remove(path);
+                return None;
+            }
+        }
         if let Some(entry) = self.entries.get_mut(path) {
             self.access_counter += 1;
             entry.last_access = self.access_counter;
@@ -99,6 +134,11 @@ impl DecompressionCache {
     }
 
     fn insert(&mut self, path: PathBuf, data: Arc<Vec<u8>>, header: NiftiHeader) {
+        // A zero-size cache disables caching entirely.
+        if self.max_entries == 0 {
+            return;
+        }
+
         // Evict oldest entry if at capacity
         if self.entries.len() >= self.max_entries {
             if let Some(oldest_path) = self
@@ -112,12 +152,14 @@ impl DecompressionCache {
         }
 
         self.access_counter += 1;
+        let stamp = file_stamp(&path);
         self.entries.insert(
             path,
             CacheEntry {
                 data,
                 header,
                 last_access: self.access_counter,
+                stamp,
             },
         );
     }
@@ -131,52 +173,30 @@ impl DecompressionCache {
 ///
 /// Call this to free memory used by cached decompressed files.
 pub fn clear_decompression_cache() {
-    if let Ok(mut cache) = DECOMPRESSION_CACHE.write() {
-        cache.clear();
-    }
+    cache_write().clear();
 }
 
 /// Set the maximum size of the decompression cache.
 ///
 /// Default is 10 entries. Set to 0 to disable caching.
 pub fn set_cache_size(max_entries: usize) {
-    if let Ok(mut cache) = DECOMPRESSION_CACHE.write() {
-        cache.max_entries = max_entries;
-        // Evict excess entries
-        while cache.entries.len() > max_entries {
-            if let Some(oldest_path) = cache
-                .entries
-                .iter()
-                .min_by_key(|(_, e)| e.last_access)
-                .map(|(p, _)| p.clone())
-            {
-                cache.entries.remove(&oldest_path);
-            }
-        }
+    let mut cache = cache_write();
+    cache.max_entries = max_entries;
+    // Evict excess entries
+    while cache.entries.len() > max_entries {
+        let Some(oldest_path) = cache
+            .entries
+            .iter()
+            .min_by_key(|(_, e)| e.last_access)
+            .map(|(p, _)| p.clone())
+        else {
+            break;
+        };
+        cache.entries.remove(&oldest_path);
     }
+    drop(cache);
 }
 
-#[cfg(target_os = "linux")]
-fn read_file_with_readahead(path: &Path) -> Result<Vec<u8>> {
-    use std::os::unix::io::AsRawFd;
-
-    let file = File::open(path)?;
-    let fd = file.as_raw_fd();
-    let metadata = file.metadata()?;
-    let len = metadata.len() as usize;
-
-    // POSIX_FADV_SEQUENTIAL = 2, hint that we'll read sequentially
-    unsafe {
-        libc::posix_fadvise(fd, 0, len as libc::off_t, libc::POSIX_FADV_SEQUENTIAL);
-    }
-
-    let mut buffer = Vec::with_capacity(len);
-    let mut reader = BufReader::with_capacity(GZIP_BUFFER_SIZE, file);
-    reader.read_to_end(&mut buffer)?;
-    Ok(buffer)
-}
-
-#[cfg(not(target_os = "linux"))]
 fn read_file_with_readahead(path: &Path) -> Result<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }
@@ -207,6 +227,20 @@ fn ensure_no_extensions(bytes: &[u8], header: &NiftiHeader) -> Result<()> {
 #[must_use = "this function returns a loaded image that should be used"]
 pub fn load<P: AsRef<Path>>(path: P) -> Result<NiftiImage> {
     let path = path.as_ref();
+
+    if path.extension().is_some_and(|e| e == "jvol") {
+        #[cfg(feature = "jvol")]
+        {
+            return crate::jvol::load(path);
+        }
+        #[cfg(not(feature = "jvol"))]
+        {
+            return Err(Error::InvalidFileFormat(
+                "loading .jvol files requires the `jvol` cargo feature".to_string(),
+            ));
+        }
+    }
+
     let is_gzipped = path.extension().is_some_and(|e| e == "gz");
 
     if is_gzipped {
@@ -261,14 +295,37 @@ fn estimate_gzip_uncompressed_size(compressed: &[u8]) -> usize {
     }
 }
 
+/// Absolute ceiling on the eager decompression buffer (1 GiB).
+const MAX_EAGER_DECOMPRESS: usize = 1024 * 1024 * 1024;
+
+/// Size of the buffer to allocate up front for eager decompression.
+///
+/// The ISIZE trailer that [`estimate_gzip_uncompressed_size`] reads is
+/// attacker-controlled, so a crafted file could request a multi-gigabyte
+/// allocation. Cap the eager buffer to a multiple of the compressed size and an
+/// absolute ceiling; anything larger falls back to streaming decompression,
+/// which grows on demand. The ratio matches deflate's practical maximum
+/// (~1000:1) so genuinely compressible data such as sparse label masks still
+/// uses the fast eager path, while a tiny crafted file cannot force a large
+/// allocation.
+fn eager_buffer_size(compressed: &[u8]) -> usize {
+    let estimate = estimate_gzip_uncompressed_size(compressed);
+    let cap = compressed
+        .len()
+        .saturating_mul(1024)
+        .min(MAX_EAGER_DECOMPRESS);
+    estimate.min(cap).max(NiftiHeader::SIZE)
+}
+
 const GZIP_BUFFER_SIZE: usize = 256 * 1024; // 256KB buffer for streaming decompression
 
 fn decompress_gzip_streaming(compressed: &[u8]) -> Result<Vec<u8>> {
     let cursor = std::io::Cursor::new(compressed);
     let mut decoder = MultiGzDecoder::new(BufReader::with_capacity(GZIP_BUFFER_SIZE, cursor));
 
-    let estimated = estimate_gzip_uncompressed_size(compressed);
-    let mut output = Vec::with_capacity(estimated);
+    // Capped starting capacity: read_to_end grows as needed, so a bogus ISIZE
+    // cannot force a huge up-front allocation here either.
+    let mut output = Vec::with_capacity(eager_buffer_size(compressed));
 
     decoder
         .read_to_end(&mut output)
@@ -276,42 +333,26 @@ fn decompress_gzip_streaming(compressed: &[u8]) -> Result<Vec<u8>> {
     Ok(output)
 }
 
+/// Eagerly decompress a gzip stream into a single buffer.
+///
+/// When `pooled` is set the working buffer is drawn from (and returned to) the
+/// thread-local pool. Returns `(bytes, used_streaming)`; `used_streaming` is
+/// true when the eager buffer was too small and the streaming decoder produced
+/// the output instead (which also handles multi-member gzip).
 #[allow(clippy::uninit_vec)]
-fn decompress_gzip_with_fallback(compressed: &[u8]) -> Result<(Vec<u8>, bool)> {
-    let estimated_size = estimate_gzip_uncompressed_size(compressed);
-    let buffer_size = estimated_size.max(NiftiHeader::SIZE);
+#[allow(unsafe_code)]
+fn decompress_gzip_eager(compressed: &[u8], pooled: bool) -> Result<(Vec<u8>, bool)> {
+    let buffer_size = eager_buffer_size(compressed);
 
-    // SAFETY: Allocate uninitialized buffer to avoid zeroing overhead for large files.
-    // libdeflate's gzip_decompress writes directly to the buffer. We truncate to
-    // the actual written size before returning. If decompression fails, the buffer
-    // is dropped without reading uninitialized bytes.
-    let mut output = Vec::with_capacity(buffer_size);
-    unsafe {
-        output.set_len(buffer_size);
-    }
-
-    let result = DECOMPRESSOR.with(|d| d.borrow_mut().gzip_decompress(compressed, &mut output));
-
-    match result {
-        Ok(written) => {
-            output.truncate(written);
-            Ok((output, false))
-        }
-        Err(DecompressionError::InsufficientSpace) => {
-            drop(output);
-            let output = decompress_gzip_streaming(compressed)?;
-            Ok((output, true))
-        }
-        Err(e) => Err(Error::Decompression(format!("{}", e))),
-    }
-}
-
-#[allow(clippy::uninit_vec)]
-fn decompress_gzip_pooled(compressed: &[u8]) -> Result<(Vec<u8>, bool)> {
-    let estimated_size = estimate_gzip_uncompressed_size(compressed);
-    let buffer_size = estimated_size.max(NiftiHeader::SIZE);
-
-    let mut output = acquire_decompress_buffer(buffer_size);
+    // SAFETY: Allocate uninitialized buffer to avoid zeroing overhead for large
+    // files. libdeflate's gzip_decompress writes directly to the buffer and we
+    // truncate to the actual written size before returning. On failure the
+    // buffer is dropped/released without reading uninitialized bytes.
+    let mut output = if pooled {
+        acquire_decompress_buffer(buffer_size)
+    } else {
+        Vec::with_capacity(buffer_size)
+    };
     if output.capacity() < buffer_size {
         output.reserve(buffer_size - output.capacity());
     }
@@ -327,12 +368,16 @@ fn decompress_gzip_pooled(compressed: &[u8]) -> Result<(Vec<u8>, bool)> {
             Ok((output, false))
         }
         Err(DecompressionError::InsufficientSpace) => {
-            release_decompress_buffer(output);
+            if pooled {
+                release_decompress_buffer(output);
+            }
             let output = decompress_gzip_streaming(compressed)?;
             Ok((output, true))
         }
         Err(e) => {
-            release_decompress_buffer(output);
+            if pooled {
+                release_decompress_buffer(output);
+            }
             Err(Error::Decompression(format!("{}", e)))
         }
     }
@@ -353,72 +398,95 @@ fn parse_decompressed_nifti(bytes: &[u8]) -> Result<(NiftiHeader, usize, usize)>
     Ok((header, offset, data_size))
 }
 
-/// Load gzipped file with decompression caching.
+/// Parse and bounds-check a fully decompressed NIfTI buffer.
 ///
-/// Uses single-pass decompression (same optimization as `load_gzipped`).
+/// Guards against overflow of `vox_offset + data_size` and against a buffer
+/// that is smaller than the header claims.
+fn verify_nifti_bytes(bytes: &[u8]) -> Result<(NiftiHeader, usize, usize)> {
+    let (header, offset, data_size) = parse_decompressed_nifti(bytes)?;
+    let expected = offset
+        .checked_add(data_size)
+        .ok_or_else(|| Error::Decompression("vox_offset + data size overflow".into()))?;
+    if bytes.len() < expected {
+        return Err(Error::Decompression(format!(
+            "decompressed size {} smaller than expected {} (header offset {} + data size {})",
+            bytes.len(),
+            expected,
+            offset,
+            data_size
+        )));
+    }
+    Ok((header, offset, data_size))
+}
+
+/// Decompress a gzip NIfTI stream and return the verified buffer plus parsed
+/// header and data extents.
+///
+/// Falls back to streaming decompression (which handles multi-member gzip) when
+/// the eager buffer under-decompresses. Trailing padding beyond the expected
+/// data size is trimmed so it does not cause a spurious size-mismatch failure.
+fn decompress_verified(
+    compressed: &[u8],
+    pooled: bool,
+) -> Result<(Vec<u8>, NiftiHeader, usize, usize)> {
+    let (output, used_streaming) = decompress_gzip_eager(compressed, pooled)?;
+
+    let (mut output, header, offset, data_size) = match verify_nifti_bytes(&output) {
+        Ok((header, offset, data_size)) => (output, header, offset, data_size),
+        Err(e) => {
+            // The eager path decodes only the first gzip member, so a
+            // multi-member file under-decompresses. Retry with the streaming
+            // decoder unless we already used it.
+            if used_streaming {
+                return Err(e);
+            }
+            let output = decompress_gzip_streaming(compressed)?;
+            let (header, offset, data_size) = verify_nifti_bytes(&output)?;
+            (output, header, offset, data_size)
+        }
+    };
+
+    output.truncate(offset + data_size);
+    Ok((output, header, offset, data_size))
+}
+
+/// Run `f` with the decompressed contents of a gzipped NIfTI file, optionally
+/// serving from and populating the global decompression cache.
+fn with_cached_decompressed<T>(
+    path: &Path,
+    use_cache: bool,
+    f: impl FnOnce(NiftiHeader, Arc<Vec<u8>>, usize, usize) -> Result<T>,
+) -> Result<T> {
+    if use_cache {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        {
+            let mut cache = cache_write();
+            if let Some((data, header)) = cache.get(&canonical) {
+                let offset = header.vox_offset as usize;
+                let data_size = header.data_size();
+                return f(header, data, offset, data_size);
+            }
+        }
+
+        let compressed = read_file_with_readahead(path)?;
+        let (output, header, offset, data_size) = decompress_verified(&compressed, false)?;
+        let data = Arc::new(output);
+        cache_write().insert(canonical, data.clone(), header.clone());
+        f(header, data, offset, data_size)
+    } else {
+        let compressed = read_file_with_readahead(path)?;
+        let (output, header, offset, data_size) = decompress_verified(&compressed, false)?;
+        f(header, Arc::new(output), offset, data_size)
+    }
+}
+
+/// Load gzipped file with decompression caching.
 fn load_gzipped_cached(path: &Path) -> Result<NiftiImage> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-
-    // Check cache first
-    {
-        let mut cache = DECOMPRESSION_CACHE
-            .write()
-            .map_err(|_| Error::Io(std::io::Error::other("cache lock poisoned")))?;
-
-        if let Some((data, header)) = cache.get(&canonical) {
-            let offset = header.vox_offset as usize;
-            let data_size = header.data_size();
-            return Ok(NiftiImage::from_shared_bytes(
-                header, data, offset, data_size,
-            ));
-        }
-    }
-
-    // Cache miss - decompress and store
-    let compressed = read_file_with_readahead(path)?;
-    let (mut output, used_streaming) = decompress_gzip_with_fallback(&compressed)?;
-    let mut written = output.len();
-
-    let (mut header, mut offset, mut data_size) = parse_decompressed_nifti(&output)?;
-    let mut expected_size = offset + data_size;
-
-    if written != expected_size {
-        if used_streaming {
-            return Err(Error::Decompression(format!(
-                "decompressed size {} did not match expected {} (header offset {} + data size {})",
-                written, expected_size, offset, data_size
-            )));
-        }
-
-        output = decompress_gzip_streaming(&compressed)?;
-        written = output.len();
-        let parsed = parse_decompressed_nifti(&output)?;
-        header = parsed.0;
-        offset = parsed.1;
-        data_size = parsed.2;
-        expected_size = offset + data_size;
-
-        if written != expected_size {
-            return Err(Error::Decompression(format!(
-                "decompressed size {} did not match expected {} (header offset {} + data size {})",
-                written, expected_size, offset, data_size
-            )));
-        }
-    }
-
-    let data = Arc::new(output);
-
-    // Store in cache
-    {
-        let mut cache = DECOMPRESSION_CACHE
-            .write()
-            .map_err(|_| Error::Io(std::io::Error::other("cache lock poisoned")))?;
-        cache.insert(canonical, data.clone(), header.clone());
-    }
-
-    Ok(NiftiImage::from_shared_bytes(
-        header, data, offset, data_size,
-    ))
+    with_cached_decompressed(path, true, |header, data, offset, data_size| {
+        Ok(NiftiImage::from_shared_bytes(
+            header, data, offset, data_size,
+        ))
+    })
 }
 
 /// Load uncompressed .nii file using memory mapping for speed.
@@ -431,12 +499,21 @@ fn load_uncompressed(path: &Path) -> Result<NiftiImage> {
     // 3. If the file is modified externally, data may become inconsistent but no UB
     let mmap = unsafe { Mmap::map(&file)? };
 
+    // Hint the kernel that the volume will be read sequentially, matching the
+    // readahead the gzip path already requests. Best-effort: a failed hint does
+    // not affect correctness.
+    #[cfg(unix)]
+    let _ = mmap.advise(memmap2::Advice::Sequential);
+
     let header = NiftiHeader::from_bytes(&mmap)?;
     ensure_no_extensions(&mmap[..], &header)?;
     let offset = header.vox_offset as usize;
     let data_size = header.data_size();
 
-    if mmap.len() < offset + data_size {
+    let required = offset
+        .checked_add(data_size)
+        .ok_or_else(|| Error::InvalidDimensions("vox_offset + data size overflow".to_string()))?;
+    if mmap.len() < required {
         return Err(Error::Io(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
             "file truncated",
@@ -456,41 +533,11 @@ fn load_uncompressed(path: &Path) -> Result<NiftiImage> {
 /// Falls back to streaming decode if ISIZE is insufficient (multi-member gzip
 /// or payloads > 4GB).
 fn load_gzipped(path: &Path) -> Result<NiftiImage> {
-    let compressed = read_file_with_readahead(path)?;
-    let (mut output, used_streaming) = decompress_gzip_with_fallback(&compressed)?;
-    let mut written = output.len();
-
-    let (mut header, mut offset, mut data_size) = parse_decompressed_nifti(&output)?;
-    let mut expected_size = offset + data_size;
-
-    if written != expected_size {
-        if used_streaming {
-            return Err(Error::Decompression(format!(
-                "decompressed size {} did not match expected {} (header offset {} + data size {})",
-                written, expected_size, offset, data_size
-            )));
-        }
-
-        output = decompress_gzip_streaming(&compressed)?;
-        written = output.len();
-        let parsed = parse_decompressed_nifti(&output)?;
-        header = parsed.0;
-        offset = parsed.1;
-        data_size = parsed.2;
-        expected_size = offset + data_size;
-
-        if written != expected_size {
-            return Err(Error::Decompression(format!(
-                "decompressed size {} did not match expected {} (header offset {} + data size {})",
-                written, expected_size, offset, data_size
-            )));
-        }
-    }
-
-    let bytes = Arc::new(output);
-    Ok(NiftiImage::from_shared_bytes(
-        header, bytes, offset, data_size,
-    ))
+    with_cached_decompressed(path, false, |header, data, offset, data_size| {
+        Ok(NiftiImage::from_shared_bytes(
+            header, data, offset, data_size,
+        ))
+    })
 }
 
 // ============================================================================
@@ -877,6 +924,20 @@ pub fn save<P: AsRef<Path>>(image: &NiftiImage, path: P) -> Result<()> {
     image.header().validate()?;
 
     let path = path.as_ref();
+
+    if path.extension().is_some_and(|e| e == "jvol") {
+        #[cfg(feature = "jvol")]
+        {
+            return crate::jvol::save(image, path, crate::jvol::JvolOptions::default());
+        }
+        #[cfg(not(feature = "jvol"))]
+        {
+            return Err(Error::InvalidFileFormat(
+                "saving .jvol files requires the `jvol` cargo feature".to_string(),
+            ));
+        }
+    }
+
     let is_gzipped = path.extension().is_some_and(|e| e == "gz");
 
     if is_gzipped {
@@ -890,12 +951,13 @@ fn save_uncompressed(image: &NiftiImage, path: &Path) -> Result<()> {
     let file = File::create(path)?;
     let mut writer = BufWriter::with_capacity(1024 * 1024, file);
 
-    // Write header
-    let header_bytes = image.header().to_bytes();
+    // Write header, promoting to NIfTI-2 if the dimensions require it.
+    let header = image.header().promoted_for_write();
+    let header_bytes = header.to_bytes()?;
     writer.write_all(&header_bytes)?;
 
-    // Padding to vox_offset (typically 352)
-    let padding = image.header().vox_offset as usize - NiftiHeader::SIZE;
+    // Padding between the header and the data at vox_offset.
+    let padding = (header.vox_offset as usize).saturating_sub(header_bytes.len());
     if padding > 0 {
         writer.write_all(&vec![0u8; padding])?;
     }
@@ -911,8 +973,9 @@ fn save_uncompressed(image: &NiftiImage, path: &Path) -> Result<()> {
 const PARALLEL_THRESHOLD: usize = 1024 * 1024;
 
 fn save_gzipped(image: &NiftiImage, path: &Path) -> Result<()> {
-    let header_bytes = image.header().to_bytes();
-    let padding = image.header().vox_offset as usize - NiftiHeader::SIZE;
+    let header = image.header().promoted_for_write();
+    let header_bytes = header.to_bytes()?;
+    let padding = (header.vox_offset as usize).saturating_sub(header_bytes.len());
     let data = image.data_to_bytes()?;
 
     let total_size = header_bytes.len() + padding + data.len();
@@ -1001,8 +1064,9 @@ pub fn save_mgzip_with_threads<P: AsRef<Path>>(
 ) -> Result<()> {
     image.header().validate()?;
 
-    let header_bytes = image.header().to_bytes();
-    let padding = image.header().vox_offset as usize - NiftiHeader::SIZE;
+    let header = image.header().promoted_for_write();
+    let header_bytes = header.to_bytes()?;
+    let padding = (header.vox_offset as usize).saturating_sub(header_bytes.len());
     let data = image.data_to_bytes()?;
 
     let total_size = header_bytes.len() + padding + data.len();
@@ -1103,7 +1167,7 @@ pub fn load_mgzip_with_threads<P: AsRef<Path>>(path: P, num_threads: usize) -> R
         .read_to_end(&mut decompressed)
         .map_err(|e| Error::Decompression(format!("mgzip decompression failed: {e}")))?;
 
-    let (header, offset, data_size) = parse_decompressed_nifti(&decompressed)?;
+    let (header, offset, data_size) = verify_nifti_bytes(&decompressed)?;
     let bytes = Arc::new(decompressed);
     Ok(NiftiImage::from_shared_bytes(
         header, bytes, offset, data_size,
@@ -1133,7 +1197,9 @@ pub fn load_mgzip_with_threads<P: AsRef<Path>>(path: P, num_threads: usize) -> R
 /// ```
 pub fn convert_to_mgzip<P: AsRef<Path>>(input_path: P, output_path: Option<P>) -> Result<PathBuf> {
     let input = input_path.as_ref();
-    let output = if let Some(p) = output_path { p.as_ref().to_path_buf() } else {
+    let output = if let Some(p) = output_path {
+        p.as_ref().to_path_buf()
+    } else {
         let stem = input.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
             Error::InvalidFileFormat(format!("invalid path: {}", input.display()))
         })?;
@@ -1149,13 +1215,15 @@ pub fn convert_to_mgzip<P: AsRef<Path>>(input_path: P, output_path: Option<P>) -
 
 /// Check if a file appears to be in Mgzip (multi-member gzip) format.
 ///
-/// This performs a quick heuristic check by looking for multiple gzip
-/// member signatures. Not 100% reliable but useful for format detection.
+/// This is a heuristic: it scans the first 32 KiB for a second gzip member
+/// header (`1f 8b 08` followed by a well-formed flag byte). Compressed payload
+/// bytes can coincidentally match this signature, so a false positive is
+/// possible; it is only meant for best-effort format detection, not validation.
 pub fn is_mgzip<P: AsRef<Path>>(path: P) -> Result<bool> {
     let file = File::open(path.as_ref())?;
     let mut reader = BufReader::new(file);
 
-    let mut buf = [0u8; 32768];
+    let mut buf = vec![0u8; 32768].into_boxed_slice();
     let bytes_read = reader.read(&mut buf)?;
 
     if bytes_read < 10 {
@@ -1166,9 +1234,13 @@ pub fn is_mgzip<P: AsRef<Path>>(path: P) -> Result<bool> {
         return Ok(false);
     }
 
+    // A gzip member header is: 1f 8b, CM=08 (deflate), FLG, then MTIME/XFL/OS.
+    // The FLG byte only defines bits 0..=4; bits 5..=7 are reserved and must be
+    // zero. Requiring those reserved bits to be clear (and a valid header to
+    // follow) cuts down on false matches against random compressed bytes.
     let mut member_count = 1;
-    for i in 10..bytes_read.saturating_sub(2) {
-        if buf[i] == 0x1f && buf[i + 1] == 0x8b && buf[i + 2] == 0x08 {
+    for i in 10..bytes_read.saturating_sub(3) {
+        if buf[i] == 0x1f && buf[i + 1] == 0x8b && buf[i + 2] == 0x08 && (buf[i + 3] & 0xE0) == 0 {
             member_count += 1;
             if member_count >= 2 {
                 return Ok(true);
@@ -1188,9 +1260,20 @@ pub fn load_header<P: AsRef<Path>>(path: P) -> Result<NiftiHeader> {
     if is_gzipped {
         let file = File::open(path)?;
         let buf_reader = BufReader::new(file);
-        let mut decoder = GzDecoder::new(buf_reader);
-        let mut header_buf = vec![0u8; NiftiHeader::SIZE];
-        decoder.read_exact(&mut header_buf)?;
+        let mut decoder = MultiGzDecoder::new(buf_reader);
+        // Read up to a full NIfTI-2 header (540 bytes). A plain read loop is
+        // used rather than read_exact so that a NIfTI-1 file (348-byte header
+        // plus data) shorter than 540 bytes still yields its full prefix.
+        let mut header_buf = vec![0u8; NiftiHeader::SIZE_V2];
+        let mut filled = 0;
+        while filled < header_buf.len() {
+            let n = decoder.read(&mut header_buf[filled..])?;
+            if n == 0 {
+                break;
+            }
+            filled += n;
+        }
+        header_buf.truncate(filled);
         NiftiHeader::from_bytes(&header_buf)
     } else {
         let file = File::open(path)?;
@@ -1211,6 +1294,10 @@ pub struct CropConfig {
     pub spacing: Option<[f32; 3]>,
     /// Target orientation (None = keep original)
     pub orientation: Option<crate::transforms::Orientation>,
+    /// Whether to cache the decompressed volume for gzipped inputs (default true).
+    /// Set to false for one-shot crops of large volumes to avoid retaining the
+    /// full decompressed buffer in the global cache.
+    pub use_cache: bool,
 }
 
 impl Default for CropConfig {
@@ -1220,6 +1307,7 @@ impl Default for CropConfig {
             offset: None,
             spacing: None,
             orientation: None,
+            use_cache: true,
         }
     }
 }
@@ -1248,6 +1336,12 @@ impl CropConfig {
     /// Set target orientation for reorientation.
     pub fn orientation(mut self, orientation: crate::transforms::Orientation) -> Self {
         self.orientation = Some(orientation);
+        self
+    }
+
+    /// Disable caching of the decompressed volume for gzipped inputs.
+    pub fn no_cache(mut self) -> Self {
+        self.use_cache = false;
         self
     }
 }
@@ -1282,6 +1376,7 @@ pub fn load_with_crop<P: AsRef<Path>>(path: P, config: CropConfig) -> Result<Nif
         // SAFETY: Memory mapping is safe - file just opened, read-only access
         let mmap = unsafe { Mmap::map(&file)? };
         let header = NiftiHeader::from_bytes(&mmap)?;
+        ensure_no_extensions(&mmap[..], &header)?;
         let data_offset = header.vox_offset as usize;
         let full_shape = header.shape();
         let crop_offset = config
@@ -1306,78 +1401,13 @@ pub fn load_with_crop<P: AsRef<Path>>(path: P, config: CropConfig) -> Result<Nif
 }
 
 fn load_with_crop_gzipped(path: &Path, config: &CropConfig) -> Result<NiftiImage> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-
-    // Check cache first
-    {
-        let mut cache = DECOMPRESSION_CACHE
-            .write()
-            .map_err(|_| Error::Io(std::io::Error::other("cache lock poisoned")))?;
-
-        if let Some((data, header)) = cache.get(&canonical) {
-            let full_shape = header.shape();
-            let crop_offset = config
-                .offset
-                .unwrap_or(compute_center_offset(&full_shape, &config.shape)?);
-            let data_offset = header.vox_offset as usize;
-            return copy_cropped_region_from_bytes(
-                &header,
-                &data,
-                data_offset,
-                crop_offset,
-                config.shape,
-            );
-        }
-    }
-
-    // Cache miss - decompress and store
-    let compressed = read_file_with_readahead(path)?;
-    let (mut output, used_streaming) = decompress_gzip_with_fallback(&compressed)?;
-    let mut written = output.len();
-
-    let (mut header, mut offset, mut data_size) = parse_decompressed_nifti(&output)?;
-    let mut expected_size = offset + data_size;
-
-    if written != expected_size {
-        if used_streaming {
-            return Err(Error::Decompression(format!(
-                "decompressed size {} did not match expected {} (header offset {} + data size {})",
-                written, expected_size, offset, data_size
-            )));
-        }
-
-        output = decompress_gzip_streaming(&compressed)?;
-        written = output.len();
-        let parsed = parse_decompressed_nifti(&output)?;
-        header = parsed.0;
-        offset = parsed.1;
-        data_size = parsed.2;
-        expected_size = offset + data_size;
-
-        if written != expected_size {
-            return Err(Error::Decompression(format!(
-                "decompressed size {} did not match expected {} (header offset {} + data size {})",
-                written, expected_size, offset, data_size
-            )));
-        }
-    }
-
-    let full_shape = header.shape();
-    let crop_offset = config
-        .offset
-        .unwrap_or(compute_center_offset(&full_shape, &config.shape)?);
-
-    let data = Arc::new(output);
-
-    // Store in cache for subsequent crops
-    {
-        let mut cache = DECOMPRESSION_CACHE
-            .write()
-            .map_err(|_| Error::Io(std::io::Error::other("cache lock poisoned")))?;
-        cache.insert(canonical, data.clone(), header.clone());
-    }
-
-    copy_cropped_region_from_bytes(&header, &data, offset, crop_offset, config.shape)
+    with_cached_decompressed(path, config.use_cache, |header, data, offset, _size| {
+        let full_shape = header.shape();
+        let crop_offset = config
+            .offset
+            .unwrap_or(compute_center_offset(&full_shape, &config.shape)?);
+        copy_cropped_region_from_bytes(&header, &data, offset, crop_offset, config.shape)
+    })
 }
 
 /// Simple version of load_cropped. Supports both .nii and .nii.gz files.
@@ -1400,6 +1430,7 @@ pub fn load_cropped<P: AsRef<Path>>(
         // SAFETY: Memory mapping is safe - file just opened, read-only access
         let mmap = unsafe { Mmap::map(&file)? };
         let header = NiftiHeader::from_bytes(&mmap)?;
+        ensure_no_extensions(&mmap[..], &header)?;
         let data_offset = header.vox_offset as usize;
 
         copy_cropped_region(&header, &mmap, data_offset, crop_offset, crop_shape)
@@ -1411,69 +1442,9 @@ fn load_cropped_gzipped(
     crop_offset: [usize; 3],
     crop_shape: [usize; 3],
 ) -> Result<NiftiImage> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-
-    // Check cache first
-    {
-        let mut cache = DECOMPRESSION_CACHE
-            .write()
-            .map_err(|_| Error::Io(std::io::Error::other("cache lock poisoned")))?;
-
-        if let Some((data, header)) = cache.get(&canonical) {
-            let data_offset = header.vox_offset as usize;
-            return copy_cropped_region_from_bytes(
-                &header,
-                &data,
-                data_offset,
-                crop_offset,
-                crop_shape,
-            );
-        }
-    }
-
-    // Cache miss - decompress and store
-    let compressed = read_file_with_readahead(path)?;
-    let (mut output, used_streaming) = decompress_gzip_with_fallback(&compressed)?;
-    let mut written = output.len();
-
-    let (mut header, mut offset, mut data_size) = parse_decompressed_nifti(&output)?;
-    let mut expected_size = offset + data_size;
-
-    if written != expected_size {
-        if used_streaming {
-            return Err(Error::Decompression(format!(
-                "decompressed size {} did not match expected {} (header offset {} + data size {})",
-                written, expected_size, offset, data_size
-            )));
-        }
-
-        output = decompress_gzip_streaming(&compressed)?;
-        written = output.len();
-        let parsed = parse_decompressed_nifti(&output)?;
-        header = parsed.0;
-        offset = parsed.1;
-        data_size = parsed.2;
-        expected_size = offset + data_size;
-
-        if written != expected_size {
-            return Err(Error::Decompression(format!(
-                "decompressed size {} did not match expected {} (header offset {} + data size {})",
-                written, expected_size, offset, data_size
-            )));
-        }
-    }
-
-    let data = Arc::new(output);
-
-    // Store in cache for subsequent crops
-    {
-        let mut cache = DECOMPRESSION_CACHE
-            .write()
-            .map_err(|_| Error::Io(std::io::Error::other("cache lock poisoned")))?;
-        cache.insert(canonical, data.clone(), header.clone());
-    }
-
-    copy_cropped_region_from_bytes(&header, &data, offset, crop_offset, crop_shape)
+    with_cached_decompressed(path, true, |header, data, offset, _size| {
+        copy_cropped_region_from_bytes(&header, &data, offset, crop_offset, crop_shape)
+    })
 }
 
 fn is_gzipped(path: &Path) -> bool {
@@ -1683,14 +1654,19 @@ fn copy_cropped_region_from_bytes(
     }
     new_header.vox_offset = NiftiHeader::default().vox_offset;
 
-    // Translate affine by crop offset
-    let mut affine = new_header.affine();
+    // Translate affine by crop offset in full f64 precision, preserving the
+    // sform code rather than round-tripping through f32 and forcing it to 1.
+    let orig_sform = new_header.sform_code;
+    let mut affine = new_header.affine_f64();
     for row in affine.iter_mut().take(3) {
-        row[3] += row[0] * crop_offset[0] as f32
-            + row[1] * crop_offset[1] as f32
-            + row[2] * crop_offset[2] as f32;
+        row[3] += row[0] * crop_offset[0] as f64
+            + row[1] * crop_offset[1] as f64
+            + row[2] * crop_offset[2] as f64;
     }
-    new_header.set_affine(affine);
+    new_header.set_affine_f64(affine);
+    if orig_sform > 0 {
+        new_header.sform_code = orig_sform;
+    }
 
     let data_len = buffer.len();
     Ok(NiftiImage::from_shared_bytes(
@@ -1918,14 +1894,19 @@ fn copy_cropped_region(
     }
     new_header.vox_offset = NiftiHeader::default().vox_offset;
 
-    // Translate affine by crop offset
-    let mut affine = new_header.affine();
+    // Translate affine by crop offset in full f64 precision, preserving the
+    // sform code rather than round-tripping through f32 and forcing it to 1.
+    let orig_sform = new_header.sform_code;
+    let mut affine = new_header.affine_f64();
     for row in affine.iter_mut().take(3) {
-        row[3] += row[0] * crop_offset[0] as f32
-            + row[1] * crop_offset[1] as f32
-            + row[2] * crop_offset[2] as f32;
+        row[3] += row[0] * crop_offset[0] as f64
+            + row[1] * crop_offset[1] as f64
+            + row[2] * crop_offset[2] as f64;
     }
-    new_header.set_affine(affine);
+    new_header.set_affine_f64(affine);
+    if orig_sform > 0 {
+        new_header.sform_code = orig_sform;
+    }
 
     let data_len = buffer.len();
     Ok(NiftiImage::from_shared_bytes(
@@ -1947,6 +1928,8 @@ pub struct PatchConfig {
     pub overlap: [usize; 3],
     /// Whether to randomize patch positions (false = grid sampling)
     pub randomize: bool,
+    /// Seed for random patch positions (None = entropy)
+    pub seed: Option<u64>,
 }
 
 impl Default for PatchConfig {
@@ -1956,6 +1939,7 @@ impl Default for PatchConfig {
             patches_per_volume: 4,
             overlap: [0, 0, 0],
             randomize: false,
+            seed: None,
         }
     }
 }
@@ -1997,16 +1981,26 @@ pub struct CropLoader {
     current_volume: usize,
     patches_extracted: usize,
     config: PatchConfig,
+    rng: rand::rngs::StdRng,
+    /// Patch positions for the current volume, computed once when the volume is
+    /// first reached and reused for its remaining patches.
+    current_positions: Vec<[usize; 3]>,
 }
 
 impl CropLoader {
     /// Create a new crop loader for the given volumes.
     pub fn new<P: AsRef<Path>>(volumes: Vec<P>, config: PatchConfig) -> Self {
+        let rng = config.seed.map_or_else(
+            rand::rngs::StdRng::from_entropy,
+            rand::rngs::StdRng::seed_from_u64,
+        );
         Self {
             volumes: volumes.iter().map(|p| p.as_ref().to_path_buf()).collect(),
             current_volume: 0,
             patches_extracted: 0,
             config,
+            rng,
+            current_positions: Vec::new(),
         }
     }
 
@@ -2024,8 +2018,8 @@ impl CropLoader {
         }
 
         // Load current volume header to get dimensions
-        let path = &self.volumes[self.current_volume];
-        let file = File::open(path)?;
+        let path = self.volumes[self.current_volume].clone();
+        let file = File::open(&path)?;
         // SAFETY: Memory mapping is safe - file just opened, read-only access
         let mmap = unsafe { Mmap::map(&file)? };
         let header = NiftiHeader::from_bytes(&mmap)?;
@@ -2065,22 +2059,24 @@ impl CropLoader {
             }
         }
 
-        // Calculate patch positions
-        let patch_positions = if self.config.randomize {
-            self.random_patch_positions(&volume_shape)
-        } else {
-            self.grid_patch_positions(&volume_shape)?
-        };
+        // Compute patch positions once per volume, then reuse for its patches.
+        if self.patches_extracted == 0 {
+            self.current_positions = if self.config.randomize {
+                self.random_patch_positions(&volume_shape)
+            } else {
+                self.grid_patch_positions(&volume_shape)?
+            };
+        }
 
         // Get the next patch position
-        if self.patches_extracted >= patch_positions.len() {
+        if self.patches_extracted >= self.current_positions.len() {
             // Move to next volume
             self.current_volume += 1;
             self.patches_extracted = 0;
             return self.next_patch(); // Recursive call for next volume
         }
 
-        let patch_offset = patch_positions[self.patches_extracted];
+        let patch_offset = self.current_positions[self.patches_extracted];
         self.patches_extracted += 1;
 
         // Use the efficient load_cropped function
@@ -2120,9 +2116,7 @@ impl CropLoader {
     }
 
     /// Calculate random patch positions.
-    fn random_patch_positions(&self, shape: &[usize]) -> Vec<[usize; 3]> {
-        use rand::thread_rng;
-
+    fn random_patch_positions(&mut self, shape: &[usize]) -> Vec<[usize; 3]> {
         // Use saturating_sub to prevent underflow when patch is larger than volume
         let max_d = shape
             .first()
@@ -2140,7 +2134,7 @@ impl CropLoader {
             .unwrap_or(1)
             .saturating_sub(self.config.shape[2]);
 
-        let mut rng = thread_rng();
+        let rng = &mut self.rng;
         let mut positions = Vec::new();
 
         for _ in 0..self.config.patches_per_volume {
@@ -2221,6 +2215,8 @@ pub struct TrainingDataLoader {
     prefetch_queue: Vec<(usize, Vec<[usize; 3]>)>,
     /// Total patches processed
     patches_processed: usize,
+    /// RNG for random patch positions (seeded from `PatchConfig::seed`)
+    rng: rand::rngs::StdRng,
 }
 
 impl TrainingDataLoader {
@@ -2240,6 +2236,7 @@ impl TrainingDataLoader {
     ///             patches_per_volume: 4,
     ///             overlap: [0, 0, 0],
     ///             randomize: true,
+    ///             seed: None,
     ///         },
     ///         1000, // Cache 1000 patches
     ///     );
@@ -2281,6 +2278,10 @@ impl TrainingDataLoader {
             }
         }
 
+        let rng = config.seed.map_or_else(
+            rand::rngs::StdRng::from_entropy,
+            rand::rngs::StdRng::seed_from_u64,
+        );
         let mut loader = Self {
             cache: HashMap::new(),
             max_cache_size: cache_size,
@@ -2290,6 +2291,7 @@ impl TrainingDataLoader {
             patches_processed: 0,
             volumes,
             config,
+            rng,
         };
 
         // Initialize prefetch queue for first few volumes
@@ -2303,7 +2305,8 @@ impl TrainingDataLoader {
         let prefetch_count = (self.max_cache_size / self.config.patches_per_volume).min(3);
 
         for i in 0..prefetch_count.min(self.volumes.len()) {
-            let patch_positions = self.compute_patch_positions(&self.volumes[i])?;
+            let path = self.volumes[i].clone();
+            let patch_positions = self.compute_patch_positions(&path)?;
             self.prefetch_queue.push((i, patch_positions));
         }
 
@@ -2352,13 +2355,13 @@ impl TrainingDataLoader {
 
     /// Load all patches for a volume into cache.
     fn load_volume_patches(&mut self, volume_idx: usize) -> Result<()> {
-        let volume_path = &self.volumes[volume_idx];
-        let patch_positions = self.compute_patch_positions(volume_path)?;
+        let volume_path = self.volumes[volume_idx].clone();
+        let patch_positions = self.compute_patch_positions(&volume_path)?;
 
         let mut patches = Vec::with_capacity(patch_positions.len());
 
         for position in patch_positions {
-            let patch = load_cropped(volume_path, position, self.config.shape)?;
+            let patch = load_cropped(&volume_path, position, self.config.shape)?;
             patches.push(patch);
         }
 
@@ -2367,7 +2370,7 @@ impl TrainingDataLoader {
     }
 
     /// Compute patch positions for a volume.
-    fn compute_patch_positions(&self, volume_path: &Path) -> Result<Vec<[usize; 3]>> {
+    fn compute_patch_positions(&mut self, volume_path: &Path) -> Result<Vec<[usize; 3]>> {
         let header = load_header(volume_path)?;
         let shape = header.shape();
 
@@ -2399,7 +2402,7 @@ impl TrainingDataLoader {
     }
 
     /// Generate grid-based patch positions.
-    fn grid_patch_positions(&self, shape: &[usize]) -> Result<Vec<[usize; 3]>> {
+    fn grid_patch_positions(&mut self, shape: &[usize]) -> Result<Vec<[usize; 3]>> {
         let [pd, ph, pw] = self.config.shape;
         let [od, oh, ow] = self.config.overlap;
 
@@ -2432,7 +2435,7 @@ impl TrainingDataLoader {
             positions.truncate(self.config.patches_per_volume);
         } else if positions.len() < self.config.patches_per_volume {
             // Add random positions if needed
-            let mut rng = rand::thread_rng();
+            let rng = &mut self.rng;
             while positions.len() < self.config.patches_per_volume {
                 let d = rng.gen_range(0..=max_d);
                 let h = rng.gen_range(0..=max_h);
@@ -2445,7 +2448,7 @@ impl TrainingDataLoader {
     }
 
     /// Generate random patch positions.
-    fn random_patch_positions(&self, shape: &[usize]) -> Vec<[usize; 3]> {
+    fn random_patch_positions(&mut self, shape: &[usize]) -> Vec<[usize; 3]> {
         let [pd, ph, pw] = self.config.shape;
 
         // Use saturating_sub to prevent underflow when patch is larger than volume
@@ -2453,7 +2456,7 @@ impl TrainingDataLoader {
         let max_h = shape.get(1).copied().unwrap_or(1).saturating_sub(ph);
         let max_w = shape.get(2).copied().unwrap_or(1).saturating_sub(pw);
 
-        let mut rng = rand::thread_rng();
+        let rng = &mut self.rng;
         let mut positions = Vec::with_capacity(self.config.patches_per_volume);
 
         for _ in 0..self.config.patches_per_volume {
@@ -2473,7 +2476,8 @@ impl TrainingDataLoader {
             return Ok(());
         }
 
-        let patch_positions = self.compute_patch_positions(&self.volumes[volume_idx])?;
+        let path = self.volumes[volume_idx].clone();
+        let patch_positions = self.compute_patch_positions(&path)?;
         self.prefetch_queue.push((volume_idx, patch_positions));
 
         Ok(())
@@ -2622,6 +2626,12 @@ impl FastLoaderBuilder {
     }
 
     /// Set random seed for reproducibility.
+    ///
+    /// The seed controls both the file shuffle and each worker's crop offsets
+    /// (workers derive independent deterministic RNGs from it). With a single
+    /// worker the full patch sequence is reproducible across runs; with multiple
+    /// workers each worker is individually deterministic, but the interleaving of
+    /// samples across workers is not.
     pub fn seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
@@ -2683,6 +2693,7 @@ impl FastLoaderBuilder {
         }));
 
         let mgzip_threads = self.mgzip_threads;
+        let seed = self.seed;
 
         for _ in 0..self.num_workers {
             let sender = sender.clone();
@@ -2691,8 +2702,6 @@ impl FastLoaderBuilder {
             let queue = work_queue.clone();
 
             let handle = thread::spawn(move || {
-                let mut rng = rand::thread_rng();
-
                 loop {
                     if stop.load(std::sync::atomic::Ordering::Relaxed) {
                         break;
@@ -2706,6 +2715,19 @@ impl FastLoaderBuilder {
                     let Some(idx) = idx else { break };
 
                     let path = &paths[idx];
+
+                    // Seed the crop RNG from (builder seed, file index) rather
+                    // than the worker so a given volume's crop offset is
+                    // identical regardless of which worker processes it or how
+                    // many workers run. Entropy seeding is used when no seed is
+                    // set. Emission order across workers is still
+                    // nondeterministic.
+                    let mut rng: rand::rngs::StdRng =
+                        seed.map_or_else(rand::rngs::StdRng::from_entropy, |s| {
+                            rand::rngs::StdRng::seed_from_u64(
+                                s.wrapping_add((idx as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+                            )
+                        });
 
                     let result = load_random_crop(path, patch_shape, mgzip_threads, &mut rng);
 
@@ -2827,15 +2849,17 @@ fn load_random_crop<R: Rng>(
     mgzip_threads: usize,
     rng: &mut R,
 ) -> Result<NiftiImage> {
-    let decompressed = if mgzip_threads > 0 {
-        load_random_crop_mgzip(path, mgzip_threads)?
+    // Route through the shared verified decompression helper so multi-member
+    // gzip and size mismatches are handled the same way as the other loaders.
+    let (decompressed, header, data_offset, _data_size) = if mgzip_threads > 0 {
+        let output = load_random_crop_mgzip(path, mgzip_threads)?;
+        let (header, offset, data_size) = verify_nifti_bytes(&output)?;
+        (output, header, offset, data_size)
     } else {
         let compressed = read_file_with_readahead(path)?;
-        let (output, _) = decompress_gzip_pooled(&compressed)?;
-        output
+        decompress_verified(&compressed, true)?
     };
 
-    let header = NiftiHeader::from_bytes(&decompressed)?;
     let full_shape = header.shape();
 
     if full_shape.len() < 3 {
@@ -2859,7 +2883,6 @@ fn load_random_crop<R: Rng>(
         rng.gen_range(0..=max_offset.get(2).copied().unwrap_or(0)),
     ];
 
-    let data_offset = header.vox_offset as usize;
     let result = copy_cropped_region_from_bytes(&header, &decompressed, data_offset, offset, shape);
     if mgzip_threads == 0 {
         release_decompress_buffer(decompressed);
@@ -2997,6 +3020,43 @@ mod tests {
     }
 
     #[test]
+    fn test_trailing_padding_after_data_loads() {
+        // A gzip stream whose decompressed output has extra bytes beyond
+        // vox_offset + data_size must still load: the trailing padding is
+        // trimmed rather than treated as a size mismatch.
+        let dir = tempdir().unwrap();
+        let base_path = dir.path().join("base.nii");
+        let path = dir.path().join("padded.nii.gz");
+
+        let data = create_f_order_array((0..1000).map(|i| i as f32).collect(), vec![10, 10, 10]);
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let img = NiftiImage::from_array(data.clone(), affine);
+        save(&img, &base_path).unwrap();
+
+        let mut bytes = std::fs::read(&base_path).unwrap();
+        // Append trailing padding beyond the declared data.
+        bytes.extend_from_slice(&[0u8; 137]);
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
+        encoder.write_all(&bytes).unwrap();
+        let compressed = encoder.finish().unwrap();
+        std::fs::write(&path, compressed).unwrap();
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.shape(), &[10, 10, 10]);
+        let loaded_data = loaded.to_f32().unwrap();
+        assert_eq!(
+            loaded_data.as_slice_memory_order().unwrap(),
+            data.as_slice_memory_order().unwrap()
+        );
+    }
+
+    #[test]
     fn test_load_cropped_byte_exact() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.nii");
@@ -3056,7 +3116,7 @@ mod tests {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        let img = NiftiImage::from_array(data.clone(), affine);
+        let img = NiftiImage::from_array(data, affine);
         save(&img, &path).unwrap();
 
         let crop_offset = [8, 8, 4];
@@ -3087,7 +3147,7 @@ mod tests {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        let mut img = NiftiImage::from_array(data.clone(), affine);
+        let mut img = NiftiImage::from_array(data, affine);
         img.header_mut().pixdim = [0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0];
         save(&img, &path).unwrap();
 
@@ -3123,6 +3183,7 @@ mod tests {
             patches_per_volume: 2,
             overlap: [0, 0, 0],
             randomize: false,
+            seed: None,
         };
 
         let mut loader = TrainingDataLoader::new(paths, config, 100).unwrap();
@@ -3171,6 +3232,7 @@ mod tests {
             patches_per_volume: 4,
             overlap: [0, 0, 0],
             randomize: true,
+            seed: None,
         };
 
         let mut loader = TrainingDataLoader::new(vec![&path], config, 50).unwrap();
@@ -3178,19 +3240,19 @@ mod tests {
         // Extract patches and ensure they're different
         let patch1 = loader.next_patch().unwrap();
         let patch2 = loader.next_patch().unwrap();
-        let _patch3 = loader.next_patch().unwrap();
-        let _patch4 = loader.next_patch().unwrap();
+        let patch3 = loader.next_patch().unwrap();
+        let patch4 = loader.next_patch().unwrap();
 
         assert_eq!(patch1.shape(), &[16, 16, 8]);
         assert_eq!(patch2.shape(), &[16, 16, 8]);
-        assert_eq!(_patch3.shape(), &[16, 16, 8]);
-        assert_eq!(_patch4.shape(), &[16, 16, 8]);
+        assert_eq!(patch3.shape(), &[16, 16, 8]);
+        assert_eq!(patch4.shape(), &[16, 16, 8]);
 
         // With randomization, patches should be different
         let data1 = patch1.to_f32().unwrap();
         let data2 = patch2.to_f32().unwrap();
-        let _data3 = _patch3.to_f32().unwrap();
-        let _data4 = _patch4.to_f32().unwrap();
+        let _data3 = patch3.to_f32().unwrap();
+        let _data4 = patch4.to_f32().unwrap();
 
         // At least some patches should be different
         assert_ne!(data1, data2);
@@ -3225,6 +3287,7 @@ mod tests {
             patches_per_volume: 2,
             overlap: [0, 0, 0],
             randomize: false,
+            seed: None,
         };
 
         let mut loader = CropLoader::new(paths, config);
@@ -3260,6 +3323,7 @@ mod tests {
             patches_per_volume: 1,
             overlap: [8, 4, 4],
             randomize: false,
+            seed: None,
         };
 
         let result = TrainingDataLoader::new(vec![path], cfg, 10);
@@ -3285,6 +3349,7 @@ mod tests {
             patches_per_volume: 1,
             overlap: [0, 0, 0],
             randomize: false,
+            seed: None,
         };
 
         let result = TrainingDataLoader::new(vec![&path], cfg, 10);
@@ -3310,6 +3375,7 @@ mod tests {
             patches_per_volume: 0,
             overlap: [0, 0, 0],
             randomize: false,
+            seed: None,
         };
 
         let result = TrainingDataLoader::new(vec![&path], cfg, 10);
@@ -3436,6 +3502,7 @@ mod tests {
             patches_per_volume: 2,
             overlap: [0, 0, 0],
             randomize: false, // Use grid mode
+            seed: None,
         };
 
         // This should NOT panic - grid_patch_positions uses saturating_sub
@@ -3452,6 +3519,7 @@ mod tests {
             patches_per_volume: 2,
             overlap: [0, 0, 0],
             randomize: true,
+            seed: None,
         };
         let mut loader_random = CropLoader::new(vec![&path], config_random);
         let result_random = loader_random.next_patch();
@@ -3586,7 +3654,7 @@ mod tests {
             [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        let img = NiftiImage::from_array(data.clone(), affine);
+        let img = NiftiImage::from_array(data, affine);
         save(&img, &path).unwrap();
 
         // Clear cache first

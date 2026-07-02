@@ -2,7 +2,7 @@
 
 use pyo3::prelude::*;
 
-use super::{augmentation, crops, image, loader, multi_file, python_io, transforms};
+use super::{augmentation, crops, image, jvol, loader, multi_file, python_io, transforms};
 #[pymodule]
 fn _medrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<image::PyNiftiImage>()?;
@@ -29,6 +29,17 @@ fn _medrs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(python_io::load_mgzip, m)?)?;
     m.add_function(wrap_pyfunction!(python_io::convert_to_mgzip, m)?)?;
     m.add_function(wrap_pyfunction!(python_io::is_mgzip, m)?)?;
+
+    // jvol volumetric compression functions
+    m.add_function(wrap_pyfunction!(jvol::save_jvol, m)?)?;
+    m.add_function(wrap_pyfunction!(jvol::convert_to_jvol, m)?)?;
+    m.add_function(wrap_pyfunction!(jvol::load_jvol_downsampled, m)?)?;
+    m.add_function(wrap_pyfunction!(jvol::load_jvol, m)?)?;
+    m.add_function(wrap_pyfunction!(jvol::load_jvol_cached, m)?)?;
+    m.add_function(wrap_pyfunction!(jvol::clear_jvol_cache, m)?)?;
+    m.add_function(wrap_pyfunction!(jvol::set_jvol_cache_size, m)?)?;
+    m.add_function(wrap_pyfunction!(jvol::convert_jvol_to_nii, m)?)?;
+    m.add_function(wrap_pyfunction!(jvol::load_jvol_via_mmap_cache, m)?)?;
 
     // Multi-file loading functions
     m.add_function(wrap_pyfunction!(multi_file::load_multi, m)?)?;

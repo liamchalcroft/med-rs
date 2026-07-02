@@ -28,6 +28,7 @@
 //! - [`random_gaussian_noise`] - Additive Gaussian noise
 //! - [`random_intensity_scale`] - Random intensity scaling
 //! - [`random_intensity_shift`] - Random intensity offset
+//! - [`rotate_90`] - Deterministic k*90-degree rotation
 //! - [`random_rotate_90`] - Random 90-degree rotations
 //! - [`random_gamma`] - Random gamma correction
 //! - [`random_augment`] - Combined augmentation pipeline
@@ -60,7 +61,7 @@ mod spatial;
 
 pub use augment::{
     random_augment, random_flip, random_gamma, random_gaussian_noise, random_intensity_scale,
-    random_intensity_shift, random_rotate_90, RandomAugmentBuilder,
+    random_intensity_shift, random_rotate_90, rotate_90, RandomAugmentBuilder,
 };
 pub use intensity::{clamp, rescale_intensity, z_normalization};
 pub use orientation::{orientation_from_affine, reorient, AxisCode, Orientation};

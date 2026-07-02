@@ -1,38 +1,54 @@
+
 Error Handling
 ===============
 
 This guide covers comprehensive error handling strategies and debugging techniques for medrs applications.
 
+
 Exception Hierarchy
 -------------------
 
-medrs uses a structured exception hierarchy that provides actionable error messages and recovery suggestions.
+medrs's Python API (``medrs.exceptions``) provides a structured exception hierarchy, all deriving from ``MedrsError``, that carries structured ``details`` and actionable ``suggestions`` alongside the message.
 
-Core Exception Classes
-~~~~~~~~~~~~~~~~~~~~~~
+Exception Classes
+~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
    class MedrsError(Exception):
-       """Base exception for all medrs errors"""
-       def __init__(self, message: str, suggestions: List[str] = None):
-           super().__init__(message)
+       """Base exception for all medrs operations."""
+       def __init__(self, message, details=None, suggestions=None):
+           ...
+           self.details = details or {}
            self.suggestions = suggestions or []
 
-   class FileOperationError(MedrsError):
-       """Base class for file-related errors"""
+   class LoadError(MedrsError):
+       """Raised when file loading fails (missing file, invalid format,
+       corrupted data, etc.). Carries `.path` and `.reason`."""
 
-   class FileNotFoundError(FileOperationError):
-       """Raised when a file cannot be found"""
+   class ValidationError(MedrsError):
+       """Raised when an input parameter fails validation. Carries
+       `.parameter`, `.value`, `.expected`."""
 
-   class CorruptedFileError(FileOperationError):
-       """Raised when a file is corrupted or invalid"""
+   class DeviceError(MedrsError):
+       """Raised when a device (e.g. CUDA) operation fails. Carries
+       `.device`, `.operation`, `.reason`."""
 
-   class OutOfMemoryError(MedrsError):
-       """Raised when memory allocation fails"""
+   class TransformError(MedrsError):
+       """Raised when a transform operation fails. Carries `.operation`,
+       `.reason`, `.input_shape`."""
 
-   class UnsupportedFormatError(MedrsError):
-       """Raised when file format is not supported"""
+   class MemoryError(MedrsError):
+       """Raised when memory allocation fails. Carries `.operation`,
+       `.requested_mb`, `.available_mb`. Shadows the Python builtin
+       intentionally; import it from `medrs.exceptions` explicitly if you
+       need to disambiguate."""
+
+   class ConfigurationError(MedrsError):
+       """Raised when configuration is invalid. Carries `.component`,
+       `.setting`, `.value`, `.reason`."""
+
+See ``src/python/medrs/exceptions.py`` for the full implementation, including the ``validate_path``, ``validate_device``, and ``validate_shape`` helpers.
 
 Common Error Scenarios
 ----------------------
@@ -43,83 +59,45 @@ File Loading Errors
 .. code-block:: python
 
    import medrs
-   from medrs.exceptions import FileNotFoundError, CorruptedFileError
+   from medrs.exceptions import LoadError
 
    def safe_load_volume(path: str) -> medrs.MedicalImage:
        try:
            return medrs.load(path)
-       except FileNotFoundError as e:
-           print(f"File not found: {e}")
-           print("Suggestions:")
+       except LoadError as e:
+           print(f"Failed to load '{e.path}': {e.reason}")
            for suggestion in e.suggestions:
                print(f"  - {suggestion}")
            raise
-       except CorruptedFileError as e:
-           print(f"Corrupted file detected: {e}")
-           print("Attempting recovery...")
-           # Try alternative loading strategies
-           return try_recovery_loading(path)
 
-Memory Management Errors
-~~~~~~~~~~~~~~~~~~~~~~~
+Device Errors
+~~~~~~~~~~~~~
 
 .. code-block:: python
 
-   from medrs.exceptions import OutOfMemoryError
+   from medrs.exceptions import DeviceError, validate_device
 
-   def load_with_memory_management(path: str,
-                                  max_memory_mb: int = 1024) -> medrs.MedicalImage:
-       """Load with automatic memory management"""
+   def load_to_device(path: str, device: str) -> "torch.Tensor":
+       """Validate the device string before touching CUDA."""
+       device = validate_device(device)  # raises ValidationError/DeviceError early
+       return medrs.load_to_torch(path, device=device)
 
-       try:
-           # Try loading full volume first
-           return medrs.load(path)
-       except OutOfMemoryError as e:
-           print(f"Memory limit exceeded: {e}")
-           print("Falling back to crop-first loading...")
-
-           # Calculate appropriate patch size based on memory limit
-           patch_size = calculate_patch_size(max_memory_mb)
-           return medrs.load_cropped(path, patch_size=patch_size)
-
-   def calculate_patch_size(max_memory_mb: int) -> tuple[int, int, int]:
-       """Calculate patch size based on memory limit"""
-       # Assuming float32 (4 bytes per voxel)
-       max_voxels = (max_memory_mb * 1024 * 1024) // 4
-       patch_dim = int((max_voxels ** (1/3)) // 2)  # Conservative estimate
-       return (patch_dim, patch_dim, patch_dim)
-
-Format Compatibility Errors
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+Memory-Constrained Loading
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 .. code-block:: python
 
-   from medrs.exceptions import UnsupportedFormatError
+   from medrs.exceptions import MemoryError as MedrsMemoryError
 
-   def convert_and_load(path: str) -> medrs.MedicalImage:
+   def load_with_fallback(path: str, patch_size=(64, 64, 64)) -> medrs.MedicalImage:
+       """Fall back to crop-first loading if the full volume doesn't fit."""
        try:
            return medrs.load(path)
-       except UnsupportedFormatError as e:
-           print(f"Unsupported format: {e}")
-           print("Attempting format conversion...")
-
-           # Try to convert using nibabel
-           import nibabel as nib
-           try:
-               img = nib.load(path)
-               converted_path = path.replace('.img', '.nii')
-               nib.save(img, converted_path)
-               print(f"Converted to: {converted_path}")
-               return medrs.load(converted_path)
-           except Exception as conversion_error:
-               raise UnsupportedFormatError(
-                   f"Failed to convert {path}: {conversion_error}",
-                   suggestions=[
-                       "Check if file is a valid medical image format",
-                       "Try converting with specialized tools",
-                       "Verify file integrity and permissions"
-                   ]
-               )
+       except MedrsMemoryError as e:
+           print(f"Full-volume load failed ({e.requested_mb:.0f}MB requested, "
+                 f"{e.available_mb:.0f}MB available); falling back to a "
+                 f"{patch_size} crop.")
+           return medrs.load_cropped(path, [0, 0, 0], list(patch_size))
 
 Advanced Error Recovery
 -----------------------
@@ -149,8 +127,7 @@ Implement intelligent retry logic for transient errors:
                for attempt in range(max_attempts):
                    try:
                        return func(*args, **kwargs)
-                   except (medrs.FileOperationError,
-                          medrs.OutOfMemoryError) as e:
+                   except (medrs.LoadError, medrs.MemoryError) as e:
                        last_exception = e
 
                        if attempt == max_attempts - 1:
@@ -183,7 +160,7 @@ Debugging Techniques
 --------------------
 
 Error Context Collection
-~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Collect detailed context for debugging:
 
@@ -392,7 +369,7 @@ Use property-based testing for robust error handling:
            validate_load_params(path)
 
 Error Logging and Monitoring
----------------------------
+------------------------------
 
 Structured Error Logging
 ~~~~~~~~~~~~~~~~~~~~~~~~

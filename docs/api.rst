@@ -14,7 +14,7 @@ Core Functions
    Core medical image class representing volumetric data with metadata.
 
    .. py:attribute:: shape
-      :type: tuple
+      :type: list[int]
 
       Image dimensions (D, H, W) or (C, D, H, W).
 
@@ -170,16 +170,47 @@ Training Pipeline
 
       Reset loader to beginning.
 
+Compression Functions
+~~~~~~~~~~~~~~~~~~~~~~
+
+See :doc:`guides/compression` for the full format writeup (lossy/lossless tradeoffs, label safety, attribution).
+
+.. py:function:: medrs.save_mgzip(image, path, num_threads=0)
+
+   Save a NIfTI image in Mgzip (multi-member gzip) format for parallel decompression.
+
+.. py:function:: medrs.load_mgzip(path, num_threads=0)
+
+   Load a NIfTI image from Mgzip format with parallel decompression.
+
+.. py:function:: medrs.convert_to_mgzip(input_path, output_path=None, num_threads=0)
+
+   Convert a standard gzip NIfTI file to Mgzip format.
+
+.. py:function:: medrs.is_mgzip(path)
+
+   Check whether a file appears to be in Mgzip format.
+
+.. py:function:: medrs.save_jvol(image, output, quality=60, lossless=False)
+
+   Save a NIfTI image in ``.jvol`` format (wavelet + Rice-coded volumetric compression). Requires the ``jvol`` feature (enabled automatically by the ``python`` feature). Lossy encoding (``lossless=False``) is rejected for integer/label dtypes.
+
+.. py:function:: medrs.convert_to_jvol(input_path, output_path, quality=60, lossless=False)
+
+   Load a NIfTI file and save it as ``.jvol``.
+
 Rust API
 --------
 
 For Rust API documentation, see the generated docs at `docs.rs/medrs <https://docs.rs/medrs>`_.
+
 
 Core modules:
 
 - ``medrs::nifti`` - NIfTI I/O operations
 - ``medrs::transforms`` - Image transformations
 - ``medrs::pipeline`` - Transform pipelines
+- ``medrs::jvol`` - ``.jvol`` volumetric compression (behind the ``jvol`` feature; see :doc:`guides/compression`)
 
 Example usage:
 

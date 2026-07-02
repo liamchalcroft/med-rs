@@ -13,53 +13,67 @@ use crate::transforms::{self, Interpolation};
 
 /// Z-score normalize an image (zero mean, unit variance).
 #[pyfunction]
-pub fn z_normalization(image: &PyNiftiImage) -> PyResult<PyNiftiImage> {
-    Ok(PyNiftiImage {
-        inner: transforms::z_normalization(&image.inner)
-            .map_err(|e| to_py_err(e, "z_normalization"))?,
-    })
+pub fn z_normalization(py: Python<'_>, image: &PyNiftiImage) -> PyResult<PyNiftiImage> {
+    let inner = py
+        .allow_threads(|| transforms::z_normalization(&image.inner))
+        .map_err(|e| to_py_err(e, "z_normalization"))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Rescale intensity to the provided range.
 #[pyfunction]
 #[pyo3(signature = (image, output_range=(0.0, 1.0)))]
-pub fn rescale_intensity(image: &PyNiftiImage, output_range: (f64, f64)) -> PyResult<PyNiftiImage> {
+pub fn rescale_intensity(
+    py: Python<'_>,
+    image: &PyNiftiImage,
+    output_range: (f64, f64),
+) -> PyResult<PyNiftiImage> {
     let (out_min, out_max) = output_range;
-    Ok(PyNiftiImage {
-        inner: transforms::rescale_intensity(&image.inner, out_min, out_max)
-            .map_err(|e| to_py_err(e, "rescale_intensity"))?,
-    })
+    let inner = py
+        .allow_threads(|| transforms::rescale_intensity(&image.inner, out_min, out_max))
+        .map_err(|e| to_py_err(e, "rescale_intensity"))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Clamp intensity values into a fixed range.
 #[pyfunction]
-pub fn clamp(image: &PyNiftiImage, min_value: f64, max_value: f64) -> PyResult<PyNiftiImage> {
+pub fn clamp(
+    py: Python<'_>,
+    image: &PyNiftiImage,
+    min_value: f64,
+    max_value: f64,
+) -> PyResult<PyNiftiImage> {
     super::validation::validate_intensity_range(min_value, max_value, "clamp")?;
-    Ok(PyNiftiImage {
-        inner: transforms::clamp(&image.inner, min_value, max_value)
-            .map_err(|e| to_py_err(e, "clamp"))?,
-    })
+    let inner = py
+        .allow_threads(|| transforms::clamp(&image.inner, min_value, max_value))
+        .map_err(|e| to_py_err(e, "clamp"))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Crop or pad an image to the target shape.
 #[pyfunction]
-pub fn crop_or_pad(image: &PyNiftiImage, target_shape: Vec<usize>) -> PyResult<PyNiftiImage> {
+pub fn crop_or_pad(
+    py: Python<'_>,
+    image: &PyNiftiImage,
+    target_shape: Vec<usize>,
+) -> PyResult<PyNiftiImage> {
     if target_shape.len() != 3 {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "target_shape must be a 3-element sequence",
         ));
     }
 
-    Ok(PyNiftiImage {
-        inner: transforms::crop_or_pad(&image.inner, &target_shape)
-            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
-    })
+    let inner = py
+        .allow_threads(|| transforms::crop_or_pad(&image.inner, &target_shape))
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Resample to target voxel spacing.
 #[pyfunction]
 #[pyo3(signature = (image, target_spacing, method=None))]
 pub fn resample(
+    py: Python<'_>,
     image: &PyNiftiImage,
     target_spacing: (f32, f32, f32),
     method: Option<&str>,
@@ -77,8 +91,9 @@ pub fn resample(
 
     let spacing = [target_spacing.0, target_spacing.1, target_spacing.2];
 
-    let resampled =
-        transforms::resample_to_spacing(&image.inner, spacing, interp).map_err(|e| {
+    let resampled = py
+        .allow_threads(|| transforms::resample_to_spacing(&image.inner, spacing, interp))
+        .map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Resampling failed: {}", e))
         })?;
     Ok(PyNiftiImage { inner: resampled })
@@ -86,16 +101,17 @@ pub fn resample(
 
 /// Reorient an image to the target orientation code (e.g., RAS or LPS).
 #[pyfunction]
-pub fn reorient(image: &PyNiftiImage, orientation: &str) -> PyResult<PyNiftiImage> {
+pub fn reorient(py: Python<'_>, image: &PyNiftiImage, orientation: &str) -> PyResult<PyNiftiImage> {
     let target: crate::transforms::Orientation = orientation
         .parse()
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("{}", e)))?;
 
-    Ok(PyNiftiImage {
-        inner: transforms::reorient(&image.inner, target).map_err(|e| {
+    let inner = py
+        .allow_threads(|| transforms::reorient(&image.inner, target))
+        .map_err(|e| {
             pyo3::exceptions::PyValueError::new_err(format!("Reorientation failed: {}", e))
-        })?,
-    })
+        })?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Composable transform pipeline with lazy evaluation.
@@ -225,10 +241,9 @@ impl PyTransformPipeline {
     ///
     /// Raises:
     ///     ValueError: If pipeline fails to apply
-    fn apply(&self, image: &PyNiftiImage) -> PyResult<PyNiftiImage> {
-        let result = self
-            .inner
-            .apply(&image.inner)
+    fn apply(&self, py: Python<'_>, image: &PyNiftiImage) -> PyResult<PyNiftiImage> {
+        let result = py
+            .allow_threads(|| self.inner.apply(&image.inner))
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(PyNiftiImage { inner: result })
     }

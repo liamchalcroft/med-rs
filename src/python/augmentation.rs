@@ -26,6 +26,7 @@ use crate::transforms::{self as transforms};
 #[pyfunction]
 #[pyo3(signature = (image, axes, prob=None, seed=None))]
 pub fn random_flip(
+    py: Python<'_>,
     image: &PyNiftiImage,
     axes: Vec<usize>,
     prob: Option<f32>,
@@ -46,10 +47,10 @@ pub fn random_flip(
         }
     }
 
-    Ok(PyNiftiImage {
-        inner: transforms::random_flip(&image.inner, &axes, prob, seed)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-    })
+    let inner = py
+        .allow_threads(|| transforms::random_flip(&image.inner, &axes, prob, seed))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Add random Gaussian noise to image.
@@ -64,14 +65,15 @@ pub fn random_flip(
 #[pyfunction]
 #[pyo3(signature = (image, std=None, seed=None))]
 pub fn random_gaussian_noise(
+    py: Python<'_>,
     image: &PyNiftiImage,
     std: Option<f32>,
     seed: Option<u64>,
 ) -> PyResult<PyNiftiImage> {
-    Ok(PyNiftiImage {
-        inner: transforms::random_gaussian_noise(&image.inner, std, seed)
-            .map_err(|e| super::validation::to_py_err(e, "random_gaussian_noise"))?,
-    })
+    let inner = py
+        .allow_threads(|| transforms::random_gaussian_noise(&image.inner, std, seed))
+        .map_err(|e| super::validation::to_py_err(e, "random_gaussian_noise"))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Randomly scale image intensity.
@@ -88,14 +90,15 @@ pub fn random_gaussian_noise(
 #[pyfunction]
 #[pyo3(signature = (image, scale_range=None, seed=None))]
 pub fn random_intensity_scale(
+    py: Python<'_>,
     image: &PyNiftiImage,
     scale_range: Option<f32>,
     seed: Option<u64>,
 ) -> PyResult<PyNiftiImage> {
-    Ok(PyNiftiImage {
-        inner: transforms::random_intensity_scale(&image.inner, scale_range, seed)
-            .map_err(|e| super::validation::to_py_err(e, "random_intensity_scale"))?,
-    })
+    let inner = py
+        .allow_threads(|| transforms::random_intensity_scale(&image.inner, scale_range, seed))
+        .map_err(|e| super::validation::to_py_err(e, "random_intensity_scale"))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Randomly shift image intensity.
@@ -112,14 +115,15 @@ pub fn random_intensity_scale(
 #[pyfunction]
 #[pyo3(signature = (image, shift_range=None, seed=None))]
 pub fn random_intensity_shift(
+    py: Python<'_>,
     image: &PyNiftiImage,
     shift_range: Option<f32>,
     seed: Option<u64>,
 ) -> PyResult<PyNiftiImage> {
-    Ok(PyNiftiImage {
-        inner: transforms::random_intensity_shift(&image.inner, shift_range, seed)
-            .map_err(|e| super::validation::to_py_err(e, "random_intensity_shift"))?,
-    })
+    let inner = py
+        .allow_threads(|| transforms::random_intensity_shift(&image.inner, shift_range, seed))
+        .map_err(|e| super::validation::to_py_err(e, "random_intensity_shift"))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Randomly rotate image by 90-degree increments.
@@ -136,14 +140,15 @@ pub fn random_intensity_shift(
 #[pyfunction]
 #[pyo3(signature = (image, axes, seed=None))]
 pub fn random_rotate_90(
+    py: Python<'_>,
     image: &PyNiftiImage,
     axes: (usize, usize),
     seed: Option<u64>,
 ) -> PyResult<PyNiftiImage> {
-    Ok(PyNiftiImage {
-        inner: transforms::random_rotate_90(&image.inner, axes, seed)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-    })
+    let inner = py
+        .allow_threads(|| transforms::random_rotate_90(&image.inner, axes, seed))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Apply random gamma correction to image intensity.
@@ -160,14 +165,15 @@ pub fn random_rotate_90(
 #[pyfunction]
 #[pyo3(signature = (image, gamma_range=None, seed=None))]
 pub fn random_gamma(
+    py: Python<'_>,
     image: &PyNiftiImage,
     gamma_range: Option<(f32, f32)>,
     seed: Option<u64>,
 ) -> PyResult<PyNiftiImage> {
-    Ok(PyNiftiImage {
-        inner: transforms::random_gamma(&image.inner, gamma_range, seed)
-            .map_err(|e| super::validation::to_py_err(e, "random_gamma"))?,
-    })
+    let inner = py
+        .allow_threads(|| transforms::random_gamma(&image.inner, gamma_range, seed))
+        .map_err(|e| super::validation::to_py_err(e, "random_gamma"))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Apply a random combination of common augmentations.
@@ -186,9 +192,13 @@ pub fn random_gamma(
 ///     Augmented image
 #[pyfunction]
 #[pyo3(signature = (image, seed=None))]
-pub fn random_augment(image: &PyNiftiImage, seed: Option<u64>) -> PyResult<PyNiftiImage> {
-    Ok(PyNiftiImage {
-        inner: transforms::random_augment(&image.inner, seed)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?,
-    })
+pub fn random_augment(
+    py: Python<'_>,
+    image: &PyNiftiImage,
+    seed: Option<u64>,
+) -> PyResult<PyNiftiImage> {
+    let inner = py
+        .allow_threads(|| transforms::random_augment(&image.inner, seed))
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    Ok(PyNiftiImage { inner })
 }

@@ -194,7 +194,8 @@ pub fn orientation_from_affine(affine: &[[f32; 4]; 4]) -> Orientation {
 /// Reorient an image to target orientation.
 ///
 /// # Errors
-/// Returns `Error::InvalidDimensions` if the image has fewer than 3 spatial dimensions.
+/// Returns `Error::InvalidDimensions` if the image is not exactly 3-dimensional.
+/// Returns `Error::InvalidAffine` if the affine does not define three distinct spatial axes.
 /// Returns `Error::ShapeMismatch` if axis mapping fails (should not happen with valid NIfTI).
 ///
 /// # Example
@@ -206,7 +207,31 @@ pub fn orientation_from_affine(affine: &[[f32; 4]; 4]) -> Orientation {
 /// ```
 #[allow(clippy::needless_range_loop)]
 pub fn reorient(image: &NiftiImage, target: Orientation) -> Result<NiftiImage, Error> {
+    let shape = image.shape();
+
+    // permute_axes computes 3D strides; 4D+ would scramble the data silently.
+    if shape.len() != 3 {
+        return Err(Error::InvalidDimensions(format!(
+            "reorient requires a 3D image, got {} dimensions",
+            shape.len()
+        )));
+    }
+
     let current = orientation_from_affine(&image.affine());
+
+    // A degenerate affine can map two axes to the same anatomical direction,
+    // which is not a valid permutation and would scramble data.
+    let mut seen = [false; 3];
+    for code in current.codes() {
+        let ax = code.axis_index();
+        if seen[ax] {
+            return Err(Error::InvalidAffine(format!(
+                "cannot reorient: affine does not define three distinct spatial axes (detected {})",
+                current
+            )));
+        }
+        seen[ax] = true;
+    }
 
     if current == target {
         return Ok(image.clone());
@@ -214,15 +239,6 @@ pub fn reorient(image: &NiftiImage, target: Orientation) -> Result<NiftiImage, E
 
     let data = image.to_f32()?;
     let affine = image.affine();
-    let shape = image.shape();
-
-    // Validate shape has at least 3 dimensions
-    if shape.len() < 3 {
-        return Err(Error::InvalidDimensions(format!(
-            "Image must have at least 3 dimensions, got {}",
-            shape.len()
-        )));
-    }
 
     // Compute axis permutation and flips
     let current_codes = current.codes();
@@ -273,11 +289,12 @@ pub fn reorient(image: &NiftiImage, target: Orientation) -> Result<NiftiImage, E
             new_affine[j][i] = affine[j][src_axis] * flip_sign;
         }
 
-        // Adjust origin if flipping
+        // Adjust origin if flipping. new_affine[j][i] is the already-negated
+        // column, so the pre-flip column times the extent is subtracted.
         if flip[i] {
             let extent = (new_shape[i] - 1) as f32;
             for j in 0..3 {
-                new_affine[j][3] += new_affine[j][i] * extent;
+                new_affine[j][3] -= new_affine[j][i] * extent;
             }
         }
     }

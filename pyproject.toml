@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "medrs"
-version = "0.1.2"
+version = "0.2.0"
 description = "Ultra-high-performance medical imaging I/O for deep learning"
 readme = "README.md"
 license = { text = "MIT OR Apache-2.0" }

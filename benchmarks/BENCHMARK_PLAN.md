@@ -10,7 +10,7 @@ Comprehensive benchmarking matrix to validate medrs performance claims across di
 
 | Library | Version | Purpose | Installation |
 |---------|---------|---------|--------------|
-| **medrs** | 0.1.2 | Our library | `pip install -e .` |
+| **medrs** | 0.2.0 | Our library | `pip install -e .` |
 | **nibabel** | 5.x | Reference baseline (pure Python) | `pip install nibabel` |
 | **MONAI** | 1.3+ | Production medical imaging framework | `pip install monai` |
 | **TorchIO** | 0.19+ | Medical imaging augmentation library | `pip install torchio` |
@@ -248,7 +248,7 @@ Comprehensive benchmarking matrix to validate medrs performance claims across di
     "memory_gb": 16,
     "python_version": "3.10.0",
     "library_versions": {
-      "medrs": "0.1.2",
+      "medrs": "0.2.0",
       "nibabel": "5.2.0",
       "monai": "1.3.0",
       "torchio": "0.19.0"
@@ -310,16 +310,16 @@ python benchmarks/bench_mgzip.py --threads 1,2,4,8,16
 
 ---
 
-## 12. TODO: New Benchmark Scripts Needed
+## 12. Benchmark Script Status
 
-| Script | Purpose | Priority |
-|--------|---------|----------|
-| `bench_nibabel.py` | Baseline comparison | HIGH |
-| `bench_simpleitk.py` | C++ backend comparison | MEDIUM |
-| `bench_mgzip.py` | Thread scaling analysis | HIGH |
-| `bench_memory.py` | Memory profiling | MEDIUM |
-| `bench_training.py` | End-to-end training sim | HIGH |
-| `bench_fastloader.py` | FastLoader throughput | HIGH |
+| Script | Purpose | Status |
+|--------|---------|--------|
+| `bench_nibabel.py` | Baseline comparison | Done |
+| `bench_simpleitk.py` | C++ backend comparison | Done |
+| `bench_mgzip.py` | Thread scaling analysis | Done |
+| `bench_memory.py` | Memory profiling | Done |
+| `bench_fastloader.py` | FastLoader throughput | Done |
+| `bench_training.py` | End-to-end training simulation | Not yet written; `bench_fastloader.py` covers the training-loader throughput comparison in the meantime |
 
 ---
 

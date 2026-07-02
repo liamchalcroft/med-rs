@@ -4,8 +4,15 @@
 //! ensuring safe and predictable error messages at the Python interface.
 
 use crate::error::Error as MedrsError;
-use ndarray::{ArrayD, IxDyn, ShapeBuilder};
+use ndarray::{ArrayD, ArrayViewD, IxDyn, ShapeBuilder};
 use pyo3::exceptions::{PyFileNotFoundError, PyValueError};
+
+/// Copy a view logically into a fresh F-order (column-major) array.
+fn assign_into_f_order(arr: &ArrayViewD<'_, f32>, shape: &[usize]) -> ArrayD<f32> {
+    let mut f_order = ArrayD::zeros(IxDyn(shape).f());
+    f_order.assign(arr);
+    f_order
+}
 
 /// Convert a medrs Error to the appropriate Python exception.
 ///
@@ -221,29 +228,23 @@ pub fn create_nifti_from_numpy_array(
         }
     }
 
-    // Create F-order array to match NIfTI convention
-    // Use as_slice_memory_order to get data in physical layout
-    let data_vec: Vec<f32> = if let Some(slice) = arr.as_slice_memory_order() {
-        slice.to_vec()
-    } else {
-        // Fallback: iterate in logical order
-        arr.iter().copied().collect()
-    };
+    // NIfTI stores voxels in F-order (column-major). Branch on the input's
+    // physical layout so exotic contiguous layouts are not silently reused as
+    // if they were column-major.
+    // An array is F-contiguous iff its axis-reversed view is C-contiguous.
+    let is_f_contiguous = arr.view().reversed_axes().is_standard_layout();
 
-    // Determine if input is F-order
-    let is_f_order = !arr.is_standard_layout() && arr.as_slice_memory_order().is_some();
-
-    let array = if is_f_order {
-        // Input was F-order, data_vec is in F-order
-        ArrayD::from_shape_vec(IxDyn(shape).f(), data_vec)
-            .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?
+    let array = if is_f_contiguous {
+        // Physical buffer is already column-major: reuse it directly.
+        match arr.as_slice_memory_order() {
+            Some(slice) => ArrayD::from_shape_vec(IxDyn(shape).f(), slice.to_vec())
+                .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?,
+            None => assign_into_f_order(&arr, shape),
+        }
     } else {
-        // Input was C-order, convert to F-order
-        let c_order = ArrayD::from_shape_vec(shape.to_vec(), data_vec)
-            .map_err(|e| PyValueError::new_err(format!("Invalid array shape: {}", e)))?;
-        let mut f_order = ArrayD::zeros(IxDyn(shape).f());
-        f_order.assign(&c_order);
-        f_order
+        // C-contiguous or an exotic strided layout: copy logically into a fresh
+        // F-order array. `assign` respects logical indices regardless of strides.
+        assign_into_f_order(&arr, shape)
     };
 
     let affine = affine.unwrap_or([

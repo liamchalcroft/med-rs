@@ -14,8 +14,8 @@ Load a Volume
    import medrs
 
    img = medrs.load("brain.nii.gz")
-   print("shape:", img.shape())
-   print("spacing:", img.spacing())
+   print("shape:", img.shape)
+   print("spacing:", img.spacing)
 
    # Get a numpy array (copy by default)
    array = img.to_numpy(copy=True)
@@ -80,8 +80,9 @@ PyTorch DataLoader Example
        # Training step using tensors already on the right device
        pass
 
+
 Next Steps
 ----------
 - See the examples in ``examples/basic`` for more end-to-end scripts.
-- The :doc:`../guides/advanced_features` guide covers asynchronous pipelines and memory reuse.
+- The :doc:`../guides/advanced_features` guide covers ``TrainingDataLoader`` patch sampling, the dictionary transform helpers, and performance profiling.
 - The :doc:`../api` page documents all available functions and classes.

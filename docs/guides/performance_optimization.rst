@@ -3,41 +3,13 @@ Performance Optimization
 
 This guide covers advanced performance optimization techniques for medrs applications to achieve maximum throughput and minimal memory usage.
 
+
 Quick Reference: Performance vs MONAI
 -------------------------------------
 
-medrs delivers substantial speedups over MONAI for I/O-bound operations:
+For uncompressed ``.nii`` volumes medrs memory-maps the file, so load plus materialize is comparable to nibabel and roughly 10-25x faster than MONAI and TorchIO, whose default loaders materialize eagerly. Its FastLoader prefetches patches across parallel workers with the GIL released, roughly 4x a naive sequential load-and-crop loop. See :doc:`benchmarks` for the full numbers and methodology, and ``benchmarks/BENCHMARK_PLAN.md`` for how to regenerate them on your own hardware.
 
-.. list-table::
-   :header-rows: 1
-   :widths: 30 20 20 20
-
-   * - Operation
-     - medrs
-     - MONAI
-     - Speedup
-   * - Load (128³)
-     - 0.2ms
-     - 7.5ms
-     - **41x**
-   * - Load Cropped (64³ from 128³)
-     - 0.8ms
-     - 30ms
-     - **39x**
-   * - To PyTorch
-     - 1.0ms
-     - 16ms
-     - **16x**
-   * - Save (128³)
-     - 110ms
-     - 37ms
-     - 3x slower
-   * - Z-Normalize
-     - 30ms
-     - 20ms
-     - 1.5x slower
-
-*Note: medrs excels at I/O operations. MONAI is faster for compute-heavy transforms like resampling and normalization due to PyTorch's optimized kernels.*
+medrs is strongest at I/O: memory-mapped loading, byte-exact crop-first reads, and parallel decompression. For compute-heavy transforms such as resampling and normalization on data already resident in memory, PyTorch's own kernels (as used by MONAI) can be competitive or faster, particularly on GPU; medrs's advantage there comes from avoiding materializing data you don't need in the first place, not from out-computing PyTorch on data already loaded.
 
 Mixed-Precision Storage
 -----------------------
@@ -101,6 +73,7 @@ MONAI Integration for Maximum Performance
 
 medrs provides drop-in replacements for MONAI transforms that can dramatically improve I/O performance in existing pipelines.
 
+
 Drop-in Replacement Usage
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -109,7 +82,7 @@ Drop-in Replacement Usage
    # Before (MONAI - slower)
    from monai.transforms import LoadImaged, RandCropByPosNegLabeld
 
-   # After (medrs - up to 40x faster)
+   # After (medrs - see the Quick Reference above for measured numbers)
    from medrs.monai_compat import MedrsLoadImaged, MedrsRandCropByPosNegLabeld
 
    # Same API, just change the imports
@@ -125,6 +98,7 @@ Drop-in Replacement Usage
        ),
    ])
 
+
 Mixing medrs and MONAI Transforms
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -135,10 +109,10 @@ Mixing medrs and MONAI Transforms
 
    # Use medrs for I/O-heavy operations, MONAI for augmentations
    train_transforms = Compose([
-       # medrs: Fast loading (up to 40x faster)
+       # medrs: fast loading (see the Quick Reference above)
        MedrsLoadImaged(keys=["image", "label"], ensure_channel_first=True),
 
-       # medrs: Fast cropping (up to 40x faster)
+       # medrs: fast cropping
        MedrsRandCropByPosNegLabeld(
            keys=["image", "label"],
            label_key="label",
@@ -146,7 +120,8 @@ Mixing medrs and MONAI Transforms
            pos=1, neg=1, num_samples=4,
        ),
 
-       # MONAI: Standard augmentations (work seamlessly with medrs outputs)
+       # MONAI: standard augmentations, which take medrs's output directly
+       # since MedrsLoadImaged returns a standard MetaTensor
        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
        RandGaussianNoised(keys=["image"], prob=0.2, std=0.1),
        EnsureTyped(keys=["image", "label"]),
@@ -157,13 +132,13 @@ Available Drop-in Transforms
 
 - ``MedrsLoadImage`` / ``MedrsLoadImaged`` - Fast NIfTI loading
 - ``MedrsSaveImage`` / ``MedrsSaveImaged`` - Fast NIfTI saving
-- ``MedrsRandCropByPosNegLabeld`` - Label-aware cropping (up to 40x faster)
+- ``MedrsRandCropByPosNegLabeld`` - Label-aware, byte-exact cropping (see the Quick Reference above for measured numbers)
 - ``MedrsRandSpatialCropd`` / ``MedrsCenterSpatialCropd`` - Spatial cropping
 - ``MedrsOrientation`` / ``MedrsOrientationd`` - Reorientation
 - ``MedrsResample`` / ``MedrsResampled`` - Resampling
 
 Memory Optimization
-------------------
+--------------------
 
 Crop-First Loading Strategy
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -262,7 +237,7 @@ Implement intelligent memory pooling to avoid repeated allocations:
        return batch
 
 Precision Optimization
-~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~
 
 Use appropriate precision to reduce memory usage and improve speed:
 
@@ -425,7 +400,7 @@ Implement async I/O for non-blocking operations:
        await prefetch_task
 
 GPU Optimization
----------------
+------------------
 
 Memory-Efficient GPU Operations
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -644,7 +619,7 @@ Build a production-grade data loading pipeline:
        )
 
 Profiling and Monitoring
------------------------
+--------------------------
 
 Performance Profiler
 ~~~~~~~~~~~~~~~~~~~~~

@@ -4,10 +4,12 @@
 //! efficiently. Key features:
 //!
 //! - **Lazy Evaluation**: Operations are recorded and optimized before execution
-//! - **Affine Fusion**: Multiple spatial transforms compose into a single resample
-//! - **Intensity Fusion**: Sequential intensity operations merge into single passes
-//! - **SIMD Acceleration**: Critical paths use AVX2/SSE for 8-way parallelism
-//! - **Memory Pooling**: Reusable buffers reduce allocation overhead
+//! - **Affine Fusion**: Consecutive axis-aligned resamples compose into one pass
+//! - **Intensity Fusion**: z-normalize, linear scaling, and clamping stats are
+//!   resolved once at materialization and applied in a single pass
+//! - **Portable SIMD**: Hot loops use `wide::f32x8`, which lowers to whatever the
+//!   compile target supports (SSE2 on baseline x86-64, AVX2 only when built with
+//!   `-C target-feature=+avx2` / `-C target-cpu=native`)
 //!
 //! # Transform Pipeline
 //!
@@ -48,28 +50,10 @@
 //! lazy.push_op(PendingOp::Clamp { min: 0.0, max: 1.0 });
 //! let result = lazy.materialize()?;
 //! ```
-//!
-//! # Memory Pool
-//!
-//! Buffer pooling for reduced allocations in hot paths:
-//!
-//! ```ignore
-//! use medrs::pipeline::{acquire_buffer, release_buffer};
-//!
-//! let buffer: Vec<f32> = acquire_buffer(1024 * 1024);
-//! // Use buffer...
-//! release_buffer(buffer);
-//! ```
 
 mod compose;
 mod lazy;
-mod memory_pool;
-mod ops;
 pub mod simd_kernels;
 
 pub use compose::{Compose, TransformPipeline};
 pub use lazy::{LazyImage, LazyTransform, PendingOp};
-pub use memory_pool::{
-    acquire_buffer, clear_pool, pool_usage, release_buffer, MemoryPool, PooledBuffer,
-};
-pub use ops::{AffineOp, FusedIntensityOp};

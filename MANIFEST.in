@@ -1,5 +1,6 @@
 include README.md
 include LICENSE
+include LICENSE-jvol
 include CHANGELOG.md
 include CONTRIBUTING.md
 include pyproject.toml

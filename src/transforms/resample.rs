@@ -14,7 +14,6 @@
 use crate::error::{Error, Result};
 use crate::nifti::image::ArrayData;
 use crate::nifti::{DataType, NiftiImage};
-use crate::pipeline::acquire_buffer;
 use crate::pipeline::simd_kernels::trilinear_resample_forder_adaptive;
 use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 use rayon::prelude::*;
@@ -55,6 +54,12 @@ impl std::str::FromStr for Interpolation {
 
 /// Resample image to new voxel spacing.
 ///
+/// The output shape is `round(old_shape * current_spacing / target_spacing)`.
+/// `target_spacing` is matched exactly only when that shape is integral;
+/// otherwise the nearest achievable spacing (`current_spacing * old_shape /
+/// new_shape`) is used and recorded in the header so world coordinates remain
+/// consistent.
+///
 /// # Arguments
 /// * `image` - Input image
 /// * `target_spacing` - Target voxel spacing in mm (x, y, z)
@@ -85,6 +90,12 @@ pub fn resample_to_spacing(
     }
 
     let data = image.to_f32()?;
+    if data.ndim() != 3 {
+        return Err(Error::InvalidDimensions(format!(
+            "resampling requires a 3D image, got {} dimensions",
+            data.ndim()
+        )));
+    }
     let current_spacing = image.spacing();
 
     // Calculate new dimensions
@@ -102,13 +113,22 @@ pub fn resample_to_spacing(
         Interpolation::Trilinear => resample_trilinear_optimized(&data, &new_shape),
     };
 
-    // Update affine matrix with new spacing
+    // Update affine matrix with the achieved spacing. Voxel axis i corresponds
+    // to column i of the 3x3 direction/scale block, so the column is scaled by
+    // the actual shape ratio old/new (what the half-pixel kernel samples), which
+    // may differ from the requested spacing ratio when the shape had to round.
+    // The origin is shifted first, using the pre-scaling column, so voxel
+    // centers keep their world position: origin += 0.5 * col_old * (old/new - 1).
     let mut affine = image.affine();
     let spatial_dims = current_spacing.len().min(3);
     for i in 0..spatial_dims {
-        let scale_factor = target_spacing[i] / current_spacing[i].abs();
+        let col_old = [affine[0][i], affine[1][i], affine[2][i]];
+        let ratio = old_shape[i] as f32 / new_shape[i] as f32;
         for j in 0..3 {
-            affine[i][j] *= scale_factor;
+            affine[j][3] += 0.5 * col_old[j] * (ratio - 1.0);
+        }
+        for j in 0..3 {
+            affine[j][i] *= ratio;
         }
     }
 
@@ -122,10 +142,9 @@ pub fn resample_to_spacing(
     for (i, &d) in new_shape.iter().enumerate() {
         header.dim[i] = d as i64;
     }
+    // set_affine rewrites pixdim[1..4] from the column norms, recording the
+    // achieved spacing.
     header.pixdim = [1.0f64; 8];
-    for i in 0..spatial_dims {
-        header.pixdim[i + 1] = target_spacing[i] as f64;
-    }
     header.set_affine(affine);
 
     Ok(NiftiImage::from_parts(header, ArrayData::F32(resampled)))
@@ -153,22 +172,36 @@ pub fn resample_to_shape(
     }
 
     let data = image.to_f32()?;
+    if data.ndim() != 3 {
+        return Err(Error::InvalidDimensions(format!(
+            "resampling requires a 3D image, got {} dimensions",
+            data.ndim()
+        )));
+    }
 
     let resampled = match interp {
         Interpolation::Nearest => resample_nearest_3d(&data, &target_shape),
         Interpolation::Trilinear => resample_trilinear_optimized(&data, &target_shape),
     };
 
-    // Compute new spacing from shape ratio
+    // Compute new spacing from shape ratio. The rescale multiplies column i
+    // of the 3x3 direction/scale block, matching voxel axis i. The origin is
+    // shifted first, using the pre-scaling column, so voxel centers keep their
+    // world position under half-pixel-center sampling:
+    // origin += 0.5 * col_old * (old/new - 1).
     let old_shape = data.shape();
     let mut affine = image.affine();
     let mut new_spacing = [1.0f32; 3];
     let spatial_dims = image.spacing().len().min(3);
 
     for i in 0..spatial_dims {
+        let col_old = [affine[0][i], affine[1][i], affine[2][i]];
         let scale = old_shape[i] as f32 / target_shape[i] as f32;
         for j in 0..3 {
-            affine[i][j] *= scale;
+            affine[j][3] += 0.5 * col_old[j] * (scale - 1.0);
+        }
+        for j in 0..3 {
+            affine[j][i] *= scale;
         }
         new_spacing[i] = image.spacing()[i] * scale;
     }
@@ -262,7 +295,7 @@ fn resample_nearest_3d(data: &ArrayD<f32>, new_shape: &[usize]) -> ArrayD<f32> {
     let stride_z = oh * ow;
     let stride_y = ow;
 
-    let mut output: Vec<f32> = acquire_buffer(nd * nh * nw);
+    let mut output: Vec<f32> = vec![0.0f32; nd * nh * nw];
 
     output
         .par_chunks_mut(nh * nw)
@@ -442,7 +475,7 @@ mod tests {
     fn test_resample_same_shape() {
         // Resampling to same shape should be close to identity
         let data: Vec<f32> = (0..64).map(|i| i as f32).collect();
-        let img = create_test_image(data.clone(), [4, 4, 4]);
+        let img = create_test_image(data, [4, 4, 4]);
 
         let resampled = resample_to_shape(&img, [4, 4, 4], Interpolation::Trilinear).unwrap();
         let result = resampled.to_f32().unwrap();

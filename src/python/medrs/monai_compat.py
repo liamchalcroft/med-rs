@@ -1212,7 +1212,7 @@ class MedrsFastLoaderDataset:
     """MONAI-compatible IterableDataset using FastLoader for high-throughput .nii.gz loading.
 
     Wraps medrs FastLoader to work with MONAI Compose pipelines. Returns MetaTensor
-    with proper metadata for seamless integration with MONAI transforms.
+    with metadata for use with MONAI transforms.
 
     This is the recommended approach for training pipelines with 100k+ .nii.gz files
     where parallel prefetching provides significant speedups.

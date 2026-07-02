@@ -1,7 +1,6 @@
 use crate::error::{Error, Result};
 use crate::nifti::image::ArrayData;
 use crate::nifti::{DataType, NiftiImage};
-use crate::pipeline::acquire_buffer;
 use crate::pipeline::simd_kernels::{parallel_linear_transform_f32, parallel_sum_and_sum_sq_f32};
 use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 use rayon::prelude::*;
@@ -30,20 +29,42 @@ pub fn z_normalization(image: &NiftiImage) -> Result<NiftiImage> {
         })?;
         let len = slice.len();
 
-        // SIMD-accelerated statistics computation
-        let (sum, sum_sq, _) = parallel_sum_and_sum_sq_f32(slice);
+        // Pass one: mean (reuses the SIMD sum kernel).
+        let (sum, _, _) = parallel_sum_and_sum_sq_f32(slice);
+        let mean = sum / len as f64;
 
-        let mean = (sum / len as f64) as f32;
-        let variance = (sum_sq / len as f64) - (mean as f64 * mean as f64);
+        // Pass two: sum of squared deviations about the mean, which avoids the
+        // catastrophic cancellation of the E[x^2] - E[x]^2 form.
+        let sum_sq_dev: f64 = slice
+            .par_chunks(NORMALIZE_CHUNK_SIZE)
+            .map(|chunk| {
+                chunk
+                    .iter()
+                    .map(|&v| {
+                        let d = v as f64 - mean;
+                        d * d
+                    })
+                    .sum::<f64>()
+            })
+            .sum();
+        let variance = sum_sq_dev / len as f64;
+
+        if !mean.is_finite() || !variance.is_finite() {
+            return Err(Error::Configuration(
+                "z-normalization statistics are not finite (input contains NaN or infinity)"
+                    .to_string(),
+            ));
+        }
+
+        let mean = mean as f32;
         let inv_std = if variance <= 0.0 {
             1.0f32
         } else {
             1.0 / (variance.sqrt() as f32)
         };
 
-        // SIMD-accelerated transformation: output = (input - mean) * inv_std = input * inv_std - mean * inv_std
-        // Use memory pool for buffer reuse in pipelines
-        let mut output = acquire_buffer(len);
+        // output = (input - mean) * inv_std = input * inv_std - mean * inv_std
+        let mut output = vec![0.0f32; len];
         let offset = -mean * inv_std;
         parallel_linear_transform_f32(slice, &mut output, inv_std, offset);
 
@@ -67,29 +88,42 @@ pub fn z_normalization(image: &NiftiImage) -> Result<NiftiImage> {
             })?;
             let len = slice.len();
 
-            let (sum, sum_sq) = slice
+            // Pass one: mean.
+            let sum: f64 = slice
+                .par_chunks(NORMALIZE_CHUNK_SIZE)
+                .map(|chunk| chunk.iter().map(|&v| $to_f64(v)).sum::<f64>())
+                .sum();
+            let mean = sum / len as f64;
+
+            // Pass two: sum of squared deviations (numerically stable).
+            let sum_sq_dev: f64 = slice
                 .par_chunks(NORMALIZE_CHUNK_SIZE)
                 .map(|chunk| {
-                    let mut local_sum = 0.0f64;
-                    let mut local_sq = 0.0f64;
-                    for &v in chunk {
-                        let val = $to_f64(v);
-                        local_sum += val;
-                        local_sq += val * val;
-                    }
-                    (local_sum, local_sq)
+                    chunk
+                        .iter()
+                        .map(|&v| {
+                            let d = $to_f64(v) - mean;
+                            d * d
+                        })
+                        .sum::<f64>()
                 })
-                .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
+                .sum();
+            let variance = sum_sq_dev / len as f64;
 
-            let mean = sum / len as f64;
-            let variance = (sum_sq / len as f64) - (mean * mean);
+            if !mean.is_finite() || !variance.is_finite() {
+                return Err(Error::Configuration(
+                    "z-normalization statistics are not finite (input contains NaN or infinity)"
+                        .to_string(),
+                ));
+            }
+
             let inv_std = if variance <= 0.0 {
                 1.0
             } else {
                 1.0 / variance.sqrt()
             };
 
-            let mut output = acquire_buffer(len);
+            let mut output = vec![0.0f32; len];
             output
                 .par_chunks_mut(NORMALIZE_CHUNK_SIZE)
                 .zip(slice.par_chunks(NORMALIZE_CHUNK_SIZE))
@@ -129,13 +163,27 @@ pub fn z_normalization(image: &NiftiImage) -> Result<NiftiImage> {
             })?;
             let len = slice.len();
 
-            let (sum, sum_sq) = slice
-                .par_iter()
-                .map(|&v| (v, v * v))
-                .reduce(|| (0.0, 0.0), |a, b| (a.0 + b.0, a.1 + b.1));
-
+            // Pass one: mean.
+            let sum: f64 = slice.par_iter().sum();
             let mean = sum / len as f64;
-            let variance = (sum_sq / len as f64) - (mean * mean);
+
+            // Pass two: sum of squared deviations (numerically stable).
+            let sum_sq_dev: f64 = slice
+                .par_iter()
+                .map(|&v| {
+                    let d = v - mean;
+                    d * d
+                })
+                .sum();
+            let variance = sum_sq_dev / len as f64;
+
+            if !mean.is_finite() || !variance.is_finite() {
+                return Err(Error::Configuration(
+                    "z-normalization statistics are not finite (input contains NaN or infinity)"
+                        .to_string(),
+                ));
+            }
+
             let inv_std = if variance <= 0.0 {
                 1.0
             } else {
@@ -197,8 +245,7 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Resu
         let scale = ((out_max - out_min) / range as f64) as f32;
         let offset = out_min as f32 - min * scale;
 
-        // SIMD-accelerated rescaling (use memory pool)
-        let mut output = acquire_buffer(slice.len());
+        let mut output = vec![0.0f32; slice.len()];
         parallel_linear_transform_f32(slice, &mut output, scale, offset);
 
         // F-order to match NIfTI convention
@@ -236,8 +283,7 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Resu
             let scale = ((out_max - out_min) / range) as f32;
             let offset = (out_min - min * (out_max - out_min) / range) as f32;
 
-            // Parallel transformation (use memory pool)
-            let mut output = acquire_buffer(len);
+            let mut output = vec![0.0f32; len];
             output
                 .par_iter_mut()
                 .zip(slice.par_iter())
@@ -309,13 +355,24 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Resu
 
 /// Clamp image intensity to a specific range.
 ///
+/// For non-float storage types the bounds are cast to the storage type with
+/// saturating float-to-int conversion (Rust `as` semantics).
+///
 /// # Errors
 ///
+/// Returns `Error::Configuration` if `min > max` or either bound is NaN.
 /// Returns an error if the underlying array is not contiguous in memory or
 /// if the image data cannot be materialized.
 #[must_use = "this function returns a Result and does not modify the original"]
 pub fn clamp(image: &NiftiImage, min: f64, max: f64) -> Result<NiftiImage> {
     use crate::pipeline::simd_kernels::parallel_linear_transform_clamp_f32;
+
+    if min.is_nan() || max.is_nan() || min > max {
+        return Err(Error::Configuration(format!(
+            "clamp requires min <= max, got min = {}, max = {}",
+            min, max
+        )));
+    }
 
     let header = image.header().clone();
 
@@ -329,8 +386,7 @@ pub fn clamp(image: &NiftiImage, min: f64, max: f64) -> Result<NiftiImage> {
         })?;
         let (min_f, max_f) = (min as f32, max as f32);
 
-        // SIMD-accelerated clamping (identity transform with clamp, use memory pool)
-        let mut output = acquire_buffer(slice.len());
+        let mut output = vec![0.0f32; slice.len()];
         parallel_linear_transform_clamp_f32(slice, &mut output, 1.0, 0.0, min_f, max_f);
 
         // F-order to match NIfTI convention
@@ -455,10 +511,10 @@ mod tests {
         let result_slice = result.as_slice_memory_order().unwrap();
 
         // After rescaling to [0, 1], min should be 0 and max should be 1
-        let min = result_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+        let min = result_slice.iter().copied().fold(f32::INFINITY, f32::min);
         let max = result_slice
             .iter()
-            .cloned()
+            .copied()
             .fold(f32::NEG_INFINITY, f32::max);
 
         assert!((min - 0.0).abs() < 1e-5, "Min should be 0, got {}", min);
@@ -474,10 +530,10 @@ mod tests {
         let result = rescaled.to_f32().unwrap();
         let result_slice = result.as_slice_memory_order().unwrap();
 
-        let min = result_slice.iter().cloned().fold(f32::INFINITY, f32::min);
+        let min = result_slice.iter().copied().fold(f32::INFINITY, f32::min);
         let max = result_slice
             .iter()
-            .cloned()
+            .copied()
             .fold(f32::NEG_INFINITY, f32::max);
 
         assert!((min - (-1.0)).abs() < 1e-5, "Min should be -1, got {}", min);
@@ -519,7 +575,7 @@ mod tests {
         let orig = img.to_f32().unwrap();
         let orig_slice = orig.as_slice_memory_order().unwrap();
         for i in 0..result_slice.len() {
-            let expected = orig_slice[i].max(0.0).min(20.0);
+            let expected = orig_slice[i].clamp(0.0, 20.0);
             assert!(
                 (result_slice[i] - expected).abs() < 1e-5,
                 "Value at {} should be clamped: expected {}, got {}",

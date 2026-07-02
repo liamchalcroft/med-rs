@@ -23,8 +23,8 @@ Development Install
 -------------------
 .. code-block:: bash
 
-   git clone https://github.com/medrs/medrs.git
-   cd medrs
+   git clone https://github.com/liamchalcroft/med-rs.git
+   cd med-rs
    pip install -e ".[dev]"
    maturin develop --features python
 

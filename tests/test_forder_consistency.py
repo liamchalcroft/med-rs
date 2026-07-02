@@ -11,6 +11,8 @@ import numpy as np
 import pytest
 import medrs
 
+from tests.test_utils import mprage_fixture_path
+
 # Try importing optional dependencies
 try:
     import torch
@@ -37,7 +39,7 @@ except ImportError:
 @pytest.fixture
 def brain_image():
     """Load the brain test image fixture."""
-    brain_path = Path(__file__).parent / "fixtures" / "mprage_img.nii"
+    brain_path = mprage_fixture_path()
     if not brain_path.exists():
         pytest.skip(f"Test image not found at {brain_path}")
     return medrs.load(str(brain_path)), brain_path

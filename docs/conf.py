@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.abspath("../src"))
 project = "medrs"
 copyright = f"{datetime.now().year}, Liam Chalcroft"
 author = "Liam Chalcroft"
-version = "0.1.2"
-release = "0.1.2"
+version = "0.2.0"
+release = "0.2.0"
 
 # -- General configuration ---------------------------------------------------
 
@@ -104,10 +104,10 @@ napoleon_type_aliases = None
 intersphinx_mapping = {
     "python": ("https://docs.python.org/3/", None),
     "numpy": ("https://numpy.org/doc/stable/", None),
-    "torch": ("https://pytorch.org/docs/stable/", None),
-    "jax": ("https://jax.readthedocs.io/en/latest/", None),
+    "torch": ("https://docs.pytorch.org/docs/stable/", None),
+    "jax": ("https://docs.jax.dev/en/latest/", None),
     "nibabel": ("https://nipy.org/nibabel/", None),
-    "monai": ("https://docs.monai.io/en/latest/", None),
+    "monai": ("https://monai.readthedocs.io/en/stable/", None),
 }
 
 # -- Options for todo extension ----------------------------------------------
@@ -212,6 +212,11 @@ myst_enable_extensions = [
     "substitution",
     "tasklist",
 ]
+
+# Auto-generate heading anchors so in-page markdown links like
+# [Core Functions](#core-functions) resolve (used by python_api_reference.md's
+# table of contents).
+myst_heading_anchors = 3
 
 # Register source parser for markdown files
 source_suffix = {

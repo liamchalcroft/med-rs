@@ -11,108 +11,79 @@ High-performance medical imaging I/O and processing library for Rust and Python.
 medrs is designed for throughput-critical medical imaging workflows, particularly deep learning pipelines that process large 3D volumes. It provides:
 
 - **Fast NIfTI I/O**: Memory-mapped reading, crop-first loading (read sub-volumes without loading entire files)
-- **Transform Pipeline**: Lazy evaluation with automatic operation fusion and SIMD acceleration
+- **Transform Pipeline**: Lazy evaluation that fuses consecutive axis-aligned resamples and trailing intensity operations (z-normalize, scaling, clamping) into a single pass, with portable SIMD acceleration
 - **Mixed Precision**: Native f16/bf16 support for 50% storage savings
+- **Volumetric Compression**: Optional `.jvol` codec (vendored from [jvol-rust](https://github.com/fepegar/jvol-rust)) for lossy wavelet compression of floating-point volumes
 - **Random Augmentation**: Reproducible, GPU-friendly augmentations for ML training
-- **Python Bindings**: Zero-copy numpy views, direct PyTorch/JAX tensor creation
+- **Python Bindings**: Zero-copy numpy views, direct PyTorch/JAX tensor creation, GIL released around heavy operations
 - **MONAI Integration**: Drop-in replacements for MONAI transforms
 
 ## Why medrs?
 
-### Performance vs MONAI & TorchIO (128³ volume)
+medrs memory-maps uncompressed `.nii` files, so opening a volume and materializing it to a numpy array is comparable to nibabel (which also memory-maps) and roughly 10-25x faster than MONAI and TorchIO, whose default loaders eagerly read the data and build a tensor. For gzipped `.nii.gz`, load time is bounded by the decompressor; medrs is competitive with nibabel and MONAI, and the parallel Mgzip format is the fast path for compressed data. All numbers below are reproducible with the scripts in `benchmarks/` (see "Reproducing benchmarks").
 
-| Operation | medrs | MONAI | TorchIO | vs MONAI |
-|-----------|-------|-------|---------|----------|
-| Load | 0.13ms | 4.55ms | 4.71ms | **35x** |
-| Load Cropped (64³) | 0.41ms | 4.68ms | 9.86ms | **11x** |
-| Load Resampled | 0.40ms | 6.88ms | 27.65ms | **17x** |
-| To PyTorch | 0.49ms | 5.14ms | 10.22ms | **10x** |
-| Load + Normalize | 0.60ms | 5.36ms | 12.26ms | **9x** |
+### Single File Loading
 
-*At larger volumes (512³), speedups increase dramatically: up to **38,000x** vs MONAI and **6,600x** vs TorchIO.*
+Load plus full materialization to a numpy array (median of repeated runs, so every library does the same work). Multiples are relative to medrs.
 
-### Storage Efficiency (128³ volume, compressed)
+| Volume | Format | medrs | nibabel | MONAI | TorchIO | SimpleITK |
+|--------|--------|-------|---------|-------|---------|-----------|
+| 128³ | .nii | 1.3 ms | 1.4x | 14x | 9x | 4x |
+| 256³ | .nii | 17 ms | 1.4x | 23x | 13x | 4x |
+| 128³ | .nii.gz | 82 ms | 0.6x | 1.2x | 0.2x | 0.3x |
+| 256³ | .nii.gz | 370 ms | 1.8x | 2.5x | 0.5x | 0.1x |
 
-| Format | Size | vs f32 |
-|--------|------|--------|
-| float32 | 8.3 MB | 100% |
-| **bfloat16** | **3.4 MB** | **41%** |
-| **float16** | **4.1 MB** | **50%** |
-| int16 | 1.2 MB | 15% |
+*Measured on Apple Silicon with `benchmarks/bench_load_comparison.py` (float32, structured data). For uncompressed volumes medrs and nibabel both memory-map, so they are close; the large multiples are against loaders that materialize eagerly. For gzipped volumes SimpleITK and TorchIO decompress faster than medrs's single-threaded path, which is why medrs also offers the parallel Mgzip format.*
 
-### Training Throughput (FastLoader vs DataLoaders)
+### Compressed Storage
 
-| Loader | Workers | Samples/sec | vs medrs |
-|--------|---------|-------------|----------|
-| **medrs FastLoader** | 4 | **1,279** | 1x |
-| TorchIO Queue | 4 | 8.7 | 147x slower |
-| MONAI DataLoader | 4 | 0.8 | **1,560x slower** |
+Optional lossy `.jvol` (wavelet codec, see the Compression Formats section) gives large storage and bandwidth savings on floating-point volumes. Measured on a 256³ float32 volume:
 
-*Tested on 20 gzipped 64³ volumes with random cropping. FastLoader uses parallel prefetching and Mgzip support.*
+| Format | Size | vs raw | Decode |
+|--------|------|--------|--------|
+| raw .nii | 67 MB | 1x | fastest (mmap) |
+| .nii.gz | 61 MB | 1.1x | baseline |
+| jvol q80 | 3.1 MB | 22x smaller | about gzip speed |
+| jvol q60 | 0.1-3 MB | 20-600x smaller | about gzip speed |
+
+jvol decode is roughly gzip speed, so its benefit is storage and bandwidth, not decode CPU. Mixed-precision bf16/f16 saves a fixed 50% of f32 with no codec.
+
+### Training Throughput (FastLoader)
+
+The FastLoader prefetches patches across parallel worker threads with the GIL released. On 64³ random crops from gzipped volumes it delivers roughly 4x the throughput of a naive sequential load-and-crop loop (measured: 191 vs 49 patches/sec, 4 workers). Run your own with `python benchmarks/bench_fastloader.py`.
 
 ### Key Advantages
 
-1. **Crop-First Loading**: Load 64³ patch from 512³ volume without reading entire file - **6,600x faster** than MONAI
-2. **FastLoader**: Purpose-built training loader achieves **1,560x** higher throughput than MONAI DataLoader
-3. **Mixed Precision**: Save in bf16/f16 for 40-50% smaller files with minimal precision loss
+1. **Crop-First Loading**: Read only the cropped region from disk instead of loading the full volume, which matters most as volume size grows relative to patch size
+2. **FastLoader**: Parallel patch prefetching with the GIL released, roughly 4x a naive sequential loader
+3. **Mixed Precision**: Save in bf16/f16 for 50% smaller files, or lossy `.jvol` for 20-600x smaller
 4. **MONAI Drop-in**: Replace MONAI I/O transforms with one import change
 5. **Zero-Copy**: Direct tensor creation without intermediate numpy allocations
 
-<details>
-<summary>📊 Detailed Benchmarks (click to expand)</summary>
+### Reproducing benchmarks
 
-### Comprehensive Benchmark Results
+The numbers above are illustrative snapshots; `benchmarks/results/` is not checked into the repo (it's regenerated, not reproducible from git history alone). Regenerate them on your own hardware with:
 
-Benchmark results comparing medrs, MONAI, and TorchIO across multiple volume sizes and operations.
+```bash
+pip install -e ".[examples]"
 
-#### Load Performance (Basic I/O)
+# Individual suites
+python benchmarks/bench_medrs.py
+python benchmarks/bench_nibabel.py
+python benchmarks/bench_monai.py
+python benchmarks/bench_torchio.py
+python benchmarks/bench_mgzip.py
+python benchmarks/bench_fastloader.py
 
-| Size | medrs | MONAI | TorchIO | vs MONAI | vs TorchIO |
-|------|-------|-------|---------|----------|------------|
-| 64³ | 0.13ms | 1.34ms | 2.35ms | **10x** | **18x** |
-| 128³ | 0.13ms | 4.55ms | 4.71ms | **35x** | **36x** |
-| 256³ | 0.14ms | 159.11ms | 95.18ms | **1,136x** | **680x** |
-| 512³ | 0.13ms | 5,006.76ms | 866.54ms | **38,513x** | **6,665x** |
+# Or via cargo for the Rust-side microbenchmarks
+cargo bench
 
-#### Crop-First Loading (64³ patch)
+# Plots and a combined comparison report
+python benchmarks/compare_all.py
+python benchmarks/plot_results.py
+```
 
-| Source | medrs | MONAI | TorchIO | vs MONAI | vs TorchIO |
-|--------|-------|-------|---------|----------|------------|
-| 64³ | 0.27ms | 1.75ms | 6.00ms | **6x** | **22x** |
-| 128³ | 0.41ms | 4.68ms | 9.86ms | **11x** | **24x** |
-| 256³ | 0.55ms | 154.86ms | 104.48ms | **282x** | **190x** |
-| 512³ | 0.76ms | 5,041.42ms | 1,076.89ms | **6,633x** | **1,417x** |
-
-#### Load Resampled (Half resolution)
-
-| Source | medrs | MONAI | TorchIO | vs MONAI | vs TorchIO |
-|--------|-------|-------|---------|----------|------------|
-| 64³ → 32³ | 0.18ms | 1.93ms | 5.45ms | **11x** | **30x** |
-| 128³ → 64³ | 0.40ms | 6.88ms | 27.65ms | **17x** | **69x** |
-| 256³ → 128³ | 2.02ms | 178.87ms | 363.85ms | **89x** | **180x** |
-| 512³ → 256³ | 6.67ms | 5,960.93ms | 4,039.05ms | **894x** | **605x** |
-
-#### Direct PyTorch Loading
-
-| Source | medrs | MONAI | TorchIO | vs MONAI | vs TorchIO |
-|--------|-------|-------|---------|----------|------------|
-| 64³ | 0.34ms | 1.58ms | 5.37ms | **5x** | **16x** |
-| 128³ | 0.49ms | 5.14ms | 10.22ms | **10x** | **21x** |
-| 256³ | 0.60ms | 162.78ms | 53.70ms | **271x** | **90x** |
-| 512³ | 0.84ms | 5,864.85ms | 1,223.24ms | **6,982x** | **1,456x** |
-
-#### Load with Z-Normalization
-
-| Source | medrs | MONAI | TorchIO | vs MONAI | vs TorchIO |
-|--------|-------|-------|---------|----------|------------|
-| 64³ | 0.49ms | 2.15ms | 7.04ms | **4x** | **14x** |
-| 128³ | 0.60ms | 5.36ms | 12.26ms | **9x** | **20x** |
-| 256³ | 0.73ms | 163.38ms | 53.59ms | **224x** | **73x** |
-| 512³ | 1.01ms | 3,735.31ms | 1,092.25ms | **3,698x** | **1,081x** |
-
-*Benchmarks run on Apple M1 Pro, 20 iterations, 3 warmup. Run your own: `python benchmarks/bench_medrs.py`*
-
-</details>
+See `benchmarks/BENCHMARK_PLAN.md` for the full benchmark matrix (libraries, volume sizes, dtypes, formats).
 
 ## Installation
 
@@ -249,7 +220,7 @@ let augmented = random_augment(&img, Some(42))?;
 
 ## Mgzip: Parallel Compressed Loading
 
-For `.nii.gz` files, medrs supports the **Mgzip** (multi-member gzip) format for parallel decompression. Mgzip files are backwards-compatible with standard gzip but can be decompressed 3-5× faster using multiple threads.
+For `.nii.gz` files, medrs supports the **Mgzip** (multi-member gzip) format for parallel decompression. Mgzip files are backwards-compatible with standard gzip; at 8 threads, decompression is 2-3x faster than medrs's own single-threaded libdeflate baseline. Single-threaded Mgzip is slightly slower than that baseline (channel and buffer overhead dominate below 2-3 threads), so it only pays off once you have a few cores to spare.
 
 ### Performance (256³ volume)
 
@@ -381,7 +352,7 @@ for patch in loader:
 - `clamp()` - Clamp values to range
 
 ### Spatial Transforms
-- `resample()` / `resample_to_spacing()` - Resample to target spacing
+- `resample()` - Resample to target spacing (also `TransformPipeline.resample_to_spacing()`; the Rust API exposes the same function as `resample_to_spacing`)
 - `resample_to_shape()` - Resample to target shape
 - `reorient()` - Reorient to standard orientation (RAS, LPS, etc.)
 - `crop_or_pad()` - Crop or pad to target shape
@@ -400,12 +371,54 @@ for patch in loader:
 
 medrs uses several optimization strategies:
 
-- **SIMD**: Trilinear interpolation uses AVX2/SSE for 8-way parallel processing
+- **SIMD**: Hot loops use portable SIMD (`wide::f32x8`), which lowers to two SSE registers on the x86-64 baseline and a single AVX2 register only when built with `-C target-feature=+avx2` or `-C target-cpu=native` (see `make build-native`; the distributed wheels use the SSE2 baseline)
 - **Parallel Processing**: Rayon-based parallelism for large volumes
-- **Lazy Evaluation**: Transform pipelines compose operations before execution
+- **Lazy Evaluation**: Transform pipelines fuse consecutive axis-aligned resamples and trailing intensity operations into a single pass before execution
 - **Memory Mapping**: Large files are memory-mapped to avoid full loads
-- **Buffer Pooling**: Reusable buffers reduce allocation overhead
 - **Parallel Decompression**: Mgzip format enables multi-threaded gzip decompression
+
+## Compression Formats
+
+| Format | Type | Best for |
+|--------|------|----------|
+| `.nii` | Uncompressed | Fastest load (memory-mapped), byte-exact crop-first reads |
+| `.nii.gz` | gzip | Standard interchange; use `load_mgzip`/Mgzip for parallel decode |
+| `.jvol` | Wavelet + Rice coding (optional `jvol` feature) | Storage- and bandwidth-bound workflows on floating-point volumes |
+
+`.jvol` is an optional volumetric codec, vendored from [jvol-rust](https://github.com/fepegar/jvol-rust) by Fernando Pérez-García (MIT licensed; see [Credits](#credits)). It supports two modes:
+
+- **Lossy** (`quality=1..100`): wavelet compression tuned for floating-point intensity volumes, typically 10x to 500x smaller than the source depending on quality. This is the mode `.jvol` is designed for.
+- **Lossless**: exact round-trip, but only roughly gzip-parity in file size, and decode is more CPU-intensive than gzip or Mgzip. Prefer `.nii.gz` / `.nii.mgz` when load speed matters more than storage.
+
+Lossy encoding is rejected outright for integer/label data (medrs returns an error) since wavelet quantization would silently corrupt segmentation values; use lossless mode for labels.
+
+```python
+import medrs
+
+img = medrs.load("brain.nii.gz")
+
+# Lossy, tuned for floating-point intensity volumes
+medrs.save_jvol(img, "brain.jvol", quality=60)
+
+# Lossless (required for label/segmentation volumes)
+medrs.save_jvol(seg, "seg.jvol", lossless=True)
+
+# .jvol loads transparently through the normal load() entry point
+restored = medrs.load("brain.jvol")
+
+# Convert an existing file directly
+medrs.convert_to_jvol("brain.nii.gz", "brain.jvol", quality=60)
+```
+
+```rust
+use medrs::jvol::{self, JvolOptions};
+
+let img = medrs::nifti::load("brain.nii.gz")?;
+jvol::save(&img, "brain.jvol", JvolOptions::lossy(60))?;
+let restored = jvol::load("brain.jvol")?;
+```
+
+Build with the `jvol` cargo feature (`cargo build --features jvol`); the `python` feature enables it automatically, so the published Python wheel includes `.jvol` support. See `docs/guides/compression.rst` for the full format writeup.
 
 ## Examples
 
@@ -419,11 +432,12 @@ See the `examples/` directory for:
 ```bash
 # Rust tests
 cargo test
+cargo test --features jvol
 
 # Python tests
 pytest tests/
 
-# Benchmarks (requires torch, monai, torchio)
+# Benchmarks (see "Reproducing benchmarks" above)
 python benchmarks/bench_medrs.py --quick
 python benchmarks/bench_monai.py --quick
 python benchmarks/bench_torchio.py --quick
@@ -434,7 +448,11 @@ python benchmarks/plot_results.py
 
 ## License
 
-medrs is dual-licensed under MIT and Apache-2.0. See [LICENSE](LICENSE) for details.
+medrs is dual-licensed under MIT and Apache-2.0. See [LICENSE](LICENSE) for details. The vendored `.jvol` codec (`src/jvol/codec/`) is MIT-licensed separately; see [LICENSE-jvol](LICENSE-jvol) and [Credits](#credits).
+
+## Credits
+
+The `.jvol` volumetric compression codec (`src/jvol/codec/`) is vendored from [jvol-rust](https://github.com/fepegar/jvol-rust) by [Fernando Pérez-García](https://github.com/fepegar), MIT licensed. Only the codec modules (wavelet lifting, entropy coding, subband management, type definitions) are vendored; medrs's own NIfTI I/O front-end and Python bindings wrap it. Full license text: [LICENSE-jvol](LICENSE-jvol).
 
 ## Contributing
 

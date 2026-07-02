@@ -6,7 +6,7 @@ use ndarray::{ArrayD, Axis, Slice};
 /// Crop or pad the image to a target shape, centered.
 ///
 /// If the target dimension is smaller, it crops the center.
-/// If the target dimension is larger, it pads with zeros (or min value).
+/// If the target dimension is larger, it pads with zeros.
 ///
 /// # Errors
 ///
@@ -133,12 +133,16 @@ pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiIm
         let curr = current_shape[i];
         let target = target_shape[i];
 
+        // Use the same integer start/before offsets the data path uses, so an
+        // odd size difference shifts the origin by whole voxels, not a half.
         let shift = if target < curr {
-            // Cropped: shift origin "inwards" (positive direction)
-            (curr - target) as f32 / 2.0
+            // Cropped: origin moves to the first retained voxel.
+            ((curr - target) / 2) as f32
+        } else if target > curr {
+            // Padded: origin moves back by the leading pad width.
+            -(((target - curr) / 2) as f32)
         } else {
-            // Padded: shift origin "outwards" (negative direction)
-            -((target - curr) as f32 / 2.0)
+            0.0
         };
 
         if shift != 0.0 {
@@ -163,20 +167,29 @@ pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiIm
 ///
 /// # Errors
 ///
-/// Returns an error if the crop region is out of bounds or data cannot be accessed.
+/// Returns `Error::InvalidDimensions` if the image is not 3D, or an error if the
+/// data cannot be accessed.
 pub fn crop(image: &NiftiImage, start: [usize; 3], end: [usize; 3]) -> Result<NiftiImage> {
     let shape = image.shape();
+
+    // The 3-axis slice below indexes shape[0..3] directly.
+    if shape.len() != 3 {
+        return Err(Error::InvalidDimensions(format!(
+            "crop requires a 3D image, got {} dimensions",
+            shape.len()
+        )));
+    }
 
     // Clamp to valid bounds
     let start = [
         start[0].min(shape[0]),
-        start[1].min(shape.get(1).copied().unwrap_or(1)),
-        start[2].min(shape.get(2).copied().unwrap_or(1)),
+        start[1].min(shape[1]),
+        start[2].min(shape[2]),
     ];
     let end = [
         end[0].min(shape[0]).max(start[0]),
-        end[1].min(shape.get(1).copied().unwrap_or(1)).max(start[1]),
-        end[2].min(shape.get(2).copied().unwrap_or(1)).max(start[2]),
+        end[1].min(shape[1]).max(start[1]),
+        end[2].min(shape[2]).max(start[2]),
     ];
 
     let crop_size = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
@@ -348,7 +361,7 @@ mod tests {
     #[test]
     fn test_crop_or_pad_same_size() {
         let data: Vec<f32> = (1..=8).map(|i| i as f32).collect();
-        let img = create_test_image(data.clone(), [2, 2, 2]);
+        let img = create_test_image(data, [2, 2, 2]);
 
         // Same size - should be identity
         let result = crop_or_pad(&img, &[2, 2, 2]).unwrap();
@@ -440,7 +453,7 @@ mod tests {
     #[test]
     fn test_flip_empty_axes() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let img = create_test_image(data.clone(), [2, 2, 2]);
+        let img = create_test_image(data, [2, 2, 2]);
 
         // No flip - should be identity
         let flipped = flip(&img, &[]).unwrap();
@@ -487,7 +500,7 @@ mod tests {
     #[test]
     fn test_flip_double_flip_identity() {
         let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let img = create_test_image(data.clone(), [2, 2, 2]);
+        let img = create_test_image(data, [2, 2, 2]);
 
         // Flip twice along same axis should be identity
         let flipped1 = flip(&img, &[0]).unwrap();
