@@ -197,27 +197,6 @@ pub fn set_cache_size(max_entries: usize) {
     drop(cache);
 }
 
-#[cfg(target_os = "linux")]
-fn read_file_with_readahead(path: &Path) -> Result<Vec<u8>> {
-    use std::os::unix::io::AsRawFd;
-
-    let file = File::open(path)?;
-    let fd = file.as_raw_fd();
-    let metadata = file.metadata()?;
-    let len = metadata.len() as usize;
-
-    // POSIX_FADV_SEQUENTIAL = 2, hint that we'll read sequentially
-    unsafe {
-        libc::posix_fadvise(fd, 0, len as libc::off_t, libc::POSIX_FADV_SEQUENTIAL);
-    }
-
-    let mut buffer = Vec::with_capacity(len);
-    let mut reader = BufReader::with_capacity(GZIP_BUFFER_SIZE, file);
-    reader.read_to_end(&mut buffer)?;
-    Ok(buffer)
-}
-
-#[cfg(not(target_os = "linux"))]
 fn read_file_with_readahead(path: &Path) -> Result<Vec<u8>> {
     Ok(std::fs::read(path)?)
 }
