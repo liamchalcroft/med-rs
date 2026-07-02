@@ -8,7 +8,7 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
 use super::conversion::{
-    self, to_numpy_array, to_numpy_view, to_numpy_view_native, to_numpy_zero_copy, torch_dtype,
+    self, to_numpy_array, to_numpy_converted, to_numpy_view_native, to_numpy_zero_copy, torch_dtype,
 };
 use super::validation::to_py_err;
 
@@ -105,7 +105,7 @@ impl PyNiftiImage {
     /// Voxel spacing in mm.
     #[getter]
     fn spacing(&self) -> Vec<f32> {
-        self.inner.spacing().clone()
+        self.inner.spacing()
     }
 
     /// 4x4 affine transformation matrix.
@@ -145,12 +145,11 @@ impl PyNiftiImage {
     ///           If False, attempts zero-copy access and raises ValueError
     ///           if zero-copy is not possible.
     ///
-    /// Zero-copy is possible when:
-    /// - Data is from an uncompressed .nii file (mmap-backed)
-    /// - Data type is float32
-    /// - Native endianness (little-endian on x86/ARM)
-    /// - No scaling required (slope=1 or 0, intercept=0)
-    /// - Memory is properly aligned
+    /// Zero-copy (copy=False) is possible only for an uncompressed .nii file
+    /// that is float32, native-endian, unscaled (slope 1 or 0, intercept 0),
+    /// and properly aligned. The returned array is READ-ONLY: it shares the
+    /// memory-mapped file buffer, so writing to it raises. Call .copy() first
+    /// if you need to mutate the data.
     ///
     /// Returns:
     ///     numpy.ndarray: Image data as float32 array
@@ -161,7 +160,7 @@ impl PyNiftiImage {
     fn to_numpy<'py>(&self, py: Python<'py>, copy: bool) -> PyResult<Bound<'py, PyArrayDyn<f32>>> {
         if copy {
             // Standard copy path
-            if let Some(arr) = to_numpy_view(py, &self.inner) {
+            if let Some(arr) = to_numpy_converted(py, &self.inner) {
                 return Ok(arr);
             }
             to_numpy_array(py, &self.inner)
@@ -178,10 +177,12 @@ impl PyNiftiImage {
         self.inner.can_zero_copy_f32()
     }
 
-    /// Get image data as a torch tensor (shares memory when possible).
+    /// Get image data as a torch tensor.
     ///
-    /// Applies NIfTI scaling when present; zero-copy only applies when
-    /// scaling is not needed and the data is mmap-backed float32.
+    /// Shares the memory-mapped buffer only for an uncompressed .nii file that
+    /// is float32, native-endian, and unscaled; otherwise the data is copied.
+    /// When the buffer is shared the tensor is backed by a READ-ONLY numpy
+    /// array, so in-place ops will fail. Call .clone() before mutating.
     fn to_torch(&self, py: Python<'_>) -> PyResult<PyObject> {
         let torch = py.import("torch")?;
         let scaling = scaling_required(&self.inner);
@@ -200,7 +201,10 @@ impl PyNiftiImage {
         }
     }
 
-    /// Get image data as a JAX array (shares memory via numpy when possible).
+    /// Get image data as a JAX array.
+    ///
+    /// jax.numpy.array always copies, so this never shares memory with the
+    /// source image.
     fn to_jax(&self, py: Python<'_>) -> PyResult<PyObject> {
         let jnp = py.import("jax.numpy")?;
         let np_obj = to_numpy_array(py, &self.inner)?;
@@ -208,10 +212,7 @@ impl PyNiftiImage {
         Ok(arr.unbind())
     }
 
-    /// Convert to PyTorch tensor with custom dtype and device.
-    ///
-    /// This is the most efficient way to load medical imaging data directly
-    /// into PyTorch with the target precision and device placement.
+    /// Convert to PyTorch tensor with the given dtype and device placement.
     #[pyo3(signature = (dtype=None, device=None))]
     pub(crate) fn to_torch_with_dtype_and_device(
         &self,
@@ -239,10 +240,7 @@ impl PyNiftiImage {
         }
     }
 
-    /// Convert to JAX array with custom dtype and device.
-    ///
-    /// This is the most efficient way to load medical imaging data directly
-    /// into JAX with the target precision and device placement.
+    /// Convert to JAX array with the given dtype and device placement.
     #[allow(clippy::useless_let_if_seq)]
     #[pyo3(signature = (dtype=None, device=None))]
     pub(crate) fn to_jax_with_dtype_and_device(
@@ -253,7 +251,7 @@ impl PyNiftiImage {
     ) -> PyResult<PyObject> {
         let device_str = device.unwrap_or("cpu");
         let jax = py.import("jax")?;
-        let _jnp = py.import("jax.numpy")?;
+        let jnp = py.import("jax.numpy")?;
 
         // Get device object using correct JAX API
         let device_obj = if device_str == "cpu" {
@@ -276,16 +274,12 @@ impl PyNiftiImage {
             )));
         };
 
-        // Use optimized on-device array creation
-        let jax = py.import("jax")?;
-        let jnp = py.import("jax.numpy")?;
-
         let np_obj = numpy_for_jax(py, &self.inner)?;
         let mut arr = jnp.getattr("array")?.call1((np_obj,))?;
 
         // Apply dtype if specified
         if let Some(dt) = dtype {
-            arr = jnp.getattr("astype")?.call1((dt,))?;
+            arr = arr.call_method1("astype", (dt,))?;
         }
 
         // Use jax.device_put for efficient async device placement
@@ -299,14 +293,10 @@ impl PyNiftiImage {
     ///
     /// Half/bfloat16 are returned as float32 for compatibility.
     fn to_numpy_native(&self, py: Python<'_>) -> PyResult<PyObject> {
-        conversion::arraydata_to_numpy(
-            py,
-            &self
-                .inner
-                .owned_data()
-                .map_err(|e| to_py_err(e, "to_numpy_native"))?,
-            self.inner.shape(),
-        )
+        let data = py
+            .allow_threads(|| self.inner.owned_data())
+            .map_err(|e| to_py_err(e, "to_numpy_native"))?;
+        conversion::arraydata_to_numpy(py, &data, self.inner.shape())
     }
 
     /// Save image to file.
@@ -348,7 +338,7 @@ impl PyNiftiImage {
     ///     >>> img = medrs.load("volume.nii.gz")
     ///     >>> img_bf16 = img.with_dtype("bfloat16")
     ///     >>> img_bf16.save("volume_bf16.nii.gz")  # 50% smaller file
-    fn with_dtype(&self, dtype: &str) -> PyResult<Self> {
+    fn with_dtype(&self, py: Python<'_>, dtype: &str) -> PyResult<Self> {
         let target_dtype = match dtype.to_lowercase().as_str() {
             "float32" | "f32" => nifti::DataType::Float32,
             "float64" | "f64" => nifti::DataType::Float64,
@@ -370,12 +360,10 @@ impl PyNiftiImage {
             }
         };
 
-        Ok(Self {
-            inner: self
-                .inner
-                .with_dtype(target_dtype)
-                .map_err(|e| to_py_err(e, "with_dtype"))?,
-        })
+        let inner = py
+            .allow_threads(|| self.inner.with_dtype(target_dtype))
+            .map_err(|e| to_py_err(e, "with_dtype"))?;
+        Ok(Self { inner })
     }
 
     /// Resample to target voxel spacing.
@@ -387,7 +375,7 @@ impl PyNiftiImage {
     /// Returns:
     ///     New NiftiImage (supports method chaining)
     #[pyo3(signature = (spacing, method=None))]
-    fn resample(&self, spacing: [f32; 3], method: Option<&str>) -> PyResult<Self> {
+    fn resample(&self, py: Python<'_>, spacing: [f32; 3], method: Option<&str>) -> PyResult<Self> {
         let method_str = method.unwrap_or("trilinear");
         let interp = match method_str {
             "trilinear" | "linear" => Interpolation::Trilinear,
@@ -399,7 +387,8 @@ impl PyNiftiImage {
             }
         };
 
-        let resampled = transforms::resample_to_spacing(&self.inner, spacing, interp)
+        let resampled = py
+            .allow_threads(|| transforms::resample_to_spacing(&self.inner, spacing, interp))
             .map_err(|e| PyValueError::new_err(format!("Resampling failed: {}", e)))?;
         Ok(Self { inner: resampled })
     }
@@ -413,7 +402,12 @@ impl PyNiftiImage {
     /// Returns:
     ///     New NiftiImage (supports method chaining)
     #[pyo3(signature = (shape, method=None))]
-    fn resample_to_shape(&self, shape: [usize; 3], method: Option<&str>) -> PyResult<Self> {
+    fn resample_to_shape(
+        &self,
+        py: Python<'_>,
+        shape: [usize; 3],
+        method: Option<&str>,
+    ) -> PyResult<Self> {
         let method_str = method.unwrap_or("trilinear");
         let interp = match method_str {
             "trilinear" | "linear" => Interpolation::Trilinear,
@@ -425,7 +419,8 @@ impl PyNiftiImage {
             }
         };
 
-        let resampled = transforms::resample_to_shape(&self.inner, shape, interp)
+        let resampled = py
+            .allow_threads(|| transforms::resample_to_shape(&self.inner, shape, interp))
             .map_err(|e| PyValueError::new_err(format!("Resampling failed: {}", e)))?;
         Ok(Self { inner: resampled })
     }
@@ -437,26 +432,26 @@ impl PyNiftiImage {
     ///
     /// Returns:
     ///     New NiftiImage (supports method chaining)
-    fn reorient(&self, orientation: &str) -> PyResult<Self> {
+    fn reorient(&self, py: Python<'_>, orientation: &str) -> PyResult<Self> {
         let target: Orientation = orientation
             .parse()
             .map_err(|e| PyValueError::new_err(format!("{}", e)))?;
 
-        Ok(Self {
-            inner: transforms::reorient(&self.inner, target)
-                .map_err(|e| PyValueError::new_err(format!("Reorientation failed: {}", e)))?,
-        })
+        let inner = py
+            .allow_threads(|| transforms::reorient(&self.inner, target))
+            .map_err(|e| PyValueError::new_err(format!("Reorientation failed: {}", e)))?;
+        Ok(Self { inner })
     }
 
     /// Z-score normalization (zero mean, unit variance).
     ///
     /// Returns:
     ///     New NiftiImage (supports method chaining)
-    fn z_normalize(&self) -> PyResult<Self> {
-        Ok(Self {
-            inner: transforms::z_normalization(&self.inner)
-                .map_err(|e| to_py_err(e, "z_normalize"))?,
-        })
+    fn z_normalize(&self, py: Python<'_>) -> PyResult<Self> {
+        let inner = py
+            .allow_threads(|| transforms::z_normalization(&self.inner))
+            .map_err(|e| to_py_err(e, "z_normalize"))?;
+        Ok(Self { inner })
     }
 
     /// Rescale intensity to range [min, max].
@@ -467,11 +462,11 @@ impl PyNiftiImage {
     ///
     /// Returns:
     ///     New NiftiImage (supports method chaining)
-    fn rescale(&self, out_min: f64, out_max: f64) -> PyResult<Self> {
-        Ok(Self {
-            inner: transforms::rescale_intensity(&self.inner, out_min, out_max)
-                .map_err(|e| to_py_err(e, "rescale"))?,
-        })
+    fn rescale(&self, py: Python<'_>, out_min: f64, out_max: f64) -> PyResult<Self> {
+        let inner = py
+            .allow_threads(|| transforms::rescale_intensity(&self.inner, out_min, out_max))
+            .map_err(|e| to_py_err(e, "rescale"))?;
+        Ok(Self { inner })
     }
 
     /// Clamp intensity values to range [min, max].
@@ -482,10 +477,11 @@ impl PyNiftiImage {
     ///
     /// Returns:
     ///     New NiftiImage (supports method chaining)
-    fn clamp(&self, min: f64, max: f64) -> PyResult<Self> {
-        Ok(Self {
-            inner: transforms::clamp(&self.inner, min, max).map_err(|e| to_py_err(e, "clamp"))?,
-        })
+    fn clamp(&self, py: Python<'_>, min: f64, max: f64) -> PyResult<Self> {
+        let inner = py
+            .allow_threads(|| transforms::clamp(&self.inner, min, max))
+            .map_err(|e| to_py_err(e, "clamp"))?;
+        Ok(Self { inner })
     }
 
     /// Crop or pad to target shape.
@@ -495,11 +491,11 @@ impl PyNiftiImage {
     ///
     /// Returns:
     ///     New NiftiImage (supports method chaining)
-    fn crop_or_pad(&self, target_shape: Vec<usize>) -> PyResult<Self> {
-        Ok(Self {
-            inner: transforms::crop_or_pad(&self.inner, &target_shape)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
+    fn crop_or_pad(&self, py: Python<'_>, target_shape: Vec<usize>) -> PyResult<Self> {
+        let inner = py
+            .allow_threads(|| transforms::crop_or_pad(&self.inner, &target_shape))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self { inner })
     }
 
     /// Flip along specified axes.
@@ -509,11 +505,11 @@ impl PyNiftiImage {
     ///
     /// Returns:
     ///     New NiftiImage (supports method chaining)
-    fn flip(&self, axes: Vec<usize>) -> PyResult<Self> {
-        Ok(Self {
-            inner: transforms::flip(&self.inner, &axes)
-                .map_err(|e| PyValueError::new_err(e.to_string()))?,
-        })
+    fn flip(&self, py: Python<'_>, axes: Vec<usize>) -> PyResult<Self> {
+        let inner = py
+            .allow_threads(|| transforms::flip(&self.inner, &axes))
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(Self { inner })
     }
 
     /// Check if the image data is already materialized in memory.
@@ -536,13 +532,11 @@ impl PyNiftiImage {
     ///     >>> img = medrs.load("brain.nii.gz").materialize()
     ///     >>> # Now transforms are fast as data is in memory
     ///     >>> processed = img.z_normalize().rescale(0, 1).flip([0])
-    fn materialize(&self) -> PyResult<Self> {
-        Ok(Self {
-            inner: self
-                .inner
-                .materialize()
-                .map_err(|e| to_py_err(e, "materialize"))?,
-        })
+    fn materialize(&self, py: Python<'_>) -> PyResult<Self> {
+        let inner = py
+            .allow_threads(|| self.inner.materialize())
+            .map_err(|e| to_py_err(e, "materialize"))?;
+        Ok(Self { inner })
     }
 
     fn __repr__(&self) -> String {

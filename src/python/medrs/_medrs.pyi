@@ -15,7 +15,7 @@ Example:
     >>> processed.save("output.nii.gz")
 """
 
-from typing import Any, Iterator, Literal, Optional, Sequence, TypeVar, overload
+from typing import Any, Iterator, Literal, Optional, Sequence
 
 import numpy as np
 import numpy.typing as npt
@@ -192,12 +192,11 @@ class NiftiImage:
                   If False, attempts zero-copy access and raises ValueError
                   if zero-copy is not possible.
 
-        Zero-copy is possible when:
-        - Data is from an uncompressed .nii file (mmap-backed)
-        - Data type is float32
-        - Native endianness (little-endian on x86/ARM)
-        - No scaling required (slope=1 or 0, intercept=0)
-        - Memory is properly aligned
+        Zero-copy (copy=False) is possible only for an uncompressed .nii file
+        that is float32, native-endian, unscaled (slope 1 or 0, intercept 0),
+        and properly aligned. The returned array is READ-ONLY: it shares the
+        memory-mapped file buffer, so writing to it raises. Call .copy() first
+        if you need to mutate the data.
 
         Returns:
             Numpy array with shape matching self.shape
@@ -206,12 +205,12 @@ class NiftiImage:
             ValueError: If copy=False and zero-copy is not possible
 
         Example:
-            >>> # Standard copy (always works)
+            >>> # Standard copy (always works, writable)
             >>> arr = img.to_numpy()
             >>>
-            >>> # Zero-copy (fails if not possible)
+            >>> # Zero-copy, read-only (fails if not possible)
             >>> if img.can_zero_copy():
-            ...     arr = img.to_numpy(copy=False)  # True zero-copy!
+            ...     arr = img.to_numpy(copy=False)
         """
         ...
 
@@ -250,7 +249,10 @@ class NiftiImage:
     def to_torch(self) -> Any:
         """Convert to PyTorch tensor.
 
-        Shares memory when possible (contiguous data).
+        Shares the memory-mapped buffer only for an uncompressed .nii file that
+        is float32, native-endian, and unscaled; otherwise the data is copied.
+        When shared, the tensor is backed by a READ-ONLY numpy array, so in-place
+        ops fail. Call .clone() before mutating.
 
         Returns:
             torch.Tensor with shape matching self.shape
@@ -491,6 +493,7 @@ class TrainingDataLoader:
         patch_overlap: Shape3D,
         randomize: bool,
         cache_size: Optional[int] = None,
+        seed: Optional[int] = None,
     ) -> None:
         """Create a training data loader.
 
@@ -528,10 +531,14 @@ class TrainingDataLoader:
     def __next__(self) -> NiftiImage: ...
 
 class FastLoader:
-    """Ultra-fast parallel prefetching loader for training on large .nii.gz datasets.
+    """Parallel prefetching loader for training on large .nii.gz datasets.
 
-    Uses a worker pool to decompress and extract random crops in parallel.
-    Designed for maximum throughput when training on 100k+ gzipped files.
+    Uses a worker pool to decompress and extract random crops in parallel,
+    for high throughput when training on 100k+ gzipped files.
+
+    This loader is one-shot: it drains its worker channel exactly once. After it
+    is exhausted, iterating again raises RuntimeError. Create a new FastLoader
+    for each epoch.
 
     Example:
         >>> loader = medrs.FastLoader(
@@ -1253,5 +1260,197 @@ def is_mgzip(path: str) -> bool:
     Example:
         >>> if medrs.is_mgzip("brain.nii.gz"):
         ...     img = medrs.load_mgzip("brain.nii.gz")
+    """
+    ...
+
+# jvol volumetric compression functions
+
+def save_jvol(
+    image: NiftiImage,
+    output: str,
+    quality: int = 60,
+    lossless: bool = False,
+) -> None:
+    """Save a NIfTI image in jvol format (wavelet + Rice-coded volumetric compression).
+
+    jvol typically compresses far smaller than gzip for medical volumes.
+    Loading is transparent through `medrs.load()` for paths ending in `.jvol`.
+
+    Args:
+        image: NiftiImage to save
+        output: Output file path (typically .jvol)
+        quality: Lossy quality level (1-100, higher is better). Ignored when lossless=True.
+        lossless: Use lossless encoding (default: False). Required for integer/label data.
+
+    Example:
+        >>> img = medrs.load("brain.nii.gz")
+        >>> medrs.save_jvol(img, "brain.jvol", quality=60)
+        >>> medrs.save_jvol(seg, "seg.jvol", lossless=True)
+    """
+    ...
+
+def convert_to_jvol(
+    input_path: str,
+    output_path: str,
+    quality: int = 60,
+    lossless: bool = False,
+) -> None:
+    """Convert a NIfTI file to jvol format.
+
+    Loads the input file and saves it as jvol (wavelet + Rice-coded compression).
+
+    Args:
+        input_path: Path to input NIfTI file (.nii or .nii.gz)
+        output_path: Path for output .jvol file
+        quality: Lossy quality level (1-100, higher is better). Ignored when lossless=True.
+        lossless: Use lossless encoding (default: False). Required for integer/label data.
+
+    Example:
+        >>> medrs.convert_to_jvol("brain.nii.gz", "brain.jvol", quality=60)
+        >>> medrs.convert_to_jvol("segmentation.nii.gz", "segmentation.jvol", lossless=True)
+    """
+    ...
+
+def load_jvol_downsampled(
+    path: str, factor: int, dtype: Optional[DType] = None
+) -> NiftiImage:
+    """Decode a lossy jvol file at reduced resolution for a fast preview.
+
+    Reconstructs only the coarse wavelet levels, skipping the finest detail
+    subbands, so a downsampled volume is produced for a fraction of the decode
+    cost and memory. The output grid is the full shape divided by ``factor`` on
+    each axis, with the voxel spacing scaled up by ``factor``.
+
+    Args:
+        path: Path to a lossy .jvol file.
+        factor: Downsampling factor per axis; a power of two (2, 4, ...).
+        dtype: Output dtype override (e.g. "bfloat16"). None keeps the file's
+            stored dtype.
+
+    Raises:
+        RuntimeError: If the file is lossless, or the factor is not a valid
+            power of two for the stored decomposition.
+
+    Example:
+        >>> preview = medrs.load_jvol_downsampled("scan.jvol", 4)
+        >>> preview.shape  # one eighth the voxels of the full volume
+    """
+    ...
+
+def load_jvol(path: str, dtype: Optional[DType] = None) -> NiftiImage:
+    """Load a .jvol file, optionally materializing it as a different dtype.
+
+    Useful for mixed-precision pipelines: store a volume once as a compact
+    lossy .jvol file and decode it directly to bfloat16/float16 at train time,
+    skipping the full-precision intermediate array.
+
+    Args:
+        path: Path to a .jvol file.
+        dtype: Output dtype override (e.g. "bfloat16", "float32"). None
+            reproduces the file's stored dtype. An integer override rounds
+            the decoded value to the nearest representable integer.
+
+    Returns:
+        NiftiImage materialized as ``dtype`` (or the stored dtype if None)
+
+    Example:
+        >>> img = medrs.load_jvol("brain.jvol", dtype="bfloat16")
+    """
+    ...
+
+def load_jvol_cached(path: str, dtype: Optional[DType] = None) -> NiftiImage:
+    """Load a .jvol file, decoding once per (path, dtype) and reusing it.
+
+    Particularly useful in training pipelines that revisit the same volume
+    across epochs: the first call pays the wavelet/entropy decode cost, later
+    calls only pay an array copy out of the cache. A changed file on disk
+    (size or modification time) invalidates its cache entry.
+
+    Args:
+        path: Path to a .jvol file.
+        dtype: Output dtype override (e.g. "bfloat16"). Part of the cache key,
+            so the same file cached at two dtypes decodes and caches each
+            independently.
+
+    Returns:
+        NiftiImage materialized as ``dtype`` (or the stored dtype if None)
+
+    Example:
+        >>> img1 = medrs.load_jvol_cached("brain.jvol", dtype="bfloat16")
+        >>> img2 = medrs.load_jvol_cached("brain.jvol", dtype="bfloat16")  # cache hit
+        >>> medrs.clear_jvol_cache()
+    """
+    ...
+
+def clear_jvol_cache() -> None:
+    """Clear the global jvol decoded-image cache.
+
+    Call this to free memory held by images cached via `load_jvol_cached()`.
+
+    Example:
+        >>> medrs.clear_jvol_cache()
+    """
+    ...
+
+def set_jvol_cache_size(max_entries: int) -> None:
+    """Set the maximum size of the jvol decoded-image cache.
+
+    Default is 10 entries. Set to 0 to disable caching.
+
+    Args:
+        max_entries: Maximum number of decoded images to cache.
+
+    Example:
+        >>> medrs.set_jvol_cache_size(20)
+        >>> medrs.set_jvol_cache_size(0)  # disable
+    """
+    ...
+
+def convert_jvol_to_nii(
+    jvol_path: str,
+    output_path: str,
+    dtype: Optional[DType] = None,
+) -> None:
+    """Decode a .jvol file and write it out as an uncompressed .nii file.
+
+    A later `medrs.load()` of ``output_path`` memory-maps it with zero-copy
+    access instead of paying the wavelet/entropy decode cost on every load.
+    ``output_path`` must not end in ``.gz`` or ``.jvol``.
+
+    Args:
+        jvol_path: Path to the input .jvol file.
+        output_path: Path for the output uncompressed .nii file.
+        dtype: Output dtype override (e.g. "float32"). None keeps the stored dtype.
+
+    Example:
+        >>> medrs.convert_jvol_to_nii("brain.jvol", "brain_cache.nii", dtype="float32")
+        >>> img = medrs.load("brain_cache.nii")  # zero-copy mmap
+    """
+    ...
+
+def load_jvol_via_mmap_cache(
+    jvol_path: str,
+    cache_dir: str,
+    dtype: Optional[DType] = None,
+) -> NiftiImage:
+    """Load a .jvol file via a decode-once mmap cache.
+
+    Transcodes to an uncompressed .nii under ``cache_dir`` on first use, then
+    memory-maps that file on this and subsequent calls, skipping the
+    transcode step when a cached .nii already exists and is newer than the
+    source .jvol file. Trades one wavelet/entropy decode (on the first call)
+    plus disk space in ``cache_dir`` for zero-copy mmap access on every
+    subsequent call, which repeated-epoch training loops can amortize.
+
+    Args:
+        jvol_path: Path to the input .jvol file.
+        cache_dir: Directory to store the transcoded .nii cache file in.
+        dtype: Output dtype override (e.g. "float32"). None keeps the stored dtype.
+
+    Returns:
+        NiftiImage, mmap-backed after the first call.
+
+    Example:
+        >>> img = medrs.load_jvol_via_mmap_cache("brain.jvol", "/tmp/jvol_cache")
     """
     ...

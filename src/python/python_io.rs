@@ -21,14 +21,15 @@ use crate::nifti;
 /// Example:
 ///     >>> img = medrs.load("brain.nii.gz")
 #[pyfunction]
-pub fn load(path: &str) -> PyResult<super::image::PyNiftiImage> {
+pub fn load(py: Python<'_>, path: &str) -> PyResult<super::image::PyNiftiImage> {
     let validated_path = validate_file_path(path, "load")?;
     let path_str = validated_path
         .to_str()
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("path contains invalid UTF-8"))?;
-    nifti::load(path_str)
-        .map(|inner| super::image::PyNiftiImage { inner })
-        .map_err(|e| super::validation::to_py_err(e, &format!("Failed to load {}", path)))
+    let inner = py
+        .allow_threads(|| nifti::load(path_str))
+        .map_err(|e| super::validation::to_py_err(e, &format!("Failed to load {}", path)))?;
+    Ok(super::image::PyNiftiImage { inner })
 }
 
 /// Load a NIfTI image with caching for repeated access.
@@ -54,14 +55,15 @@ pub fn load(path: &str) -> PyResult<super::image::PyNiftiImage> {
 ///     >>> # Clear cache when done to free memory
 ///     >>> medrs.clear_decompression_cache()
 #[pyfunction]
-pub fn load_cached(path: &str) -> PyResult<super::image::PyNiftiImage> {
+pub fn load_cached(py: Python<'_>, path: &str) -> PyResult<super::image::PyNiftiImage> {
     let validated_path = validate_file_path(path, "load_cached")?;
     let path_str = validated_path
         .to_str()
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("path contains invalid UTF-8"))?;
-    nifti::load_cached(path_str)
-        .map(|inner| super::image::PyNiftiImage { inner })
-        .map_err(|e| super::validation::to_py_err(e, &format!("Failed to load_cached {}", path)))
+    let inner = py
+        .allow_threads(|| nifti::load_cached(path_str))
+        .map_err(|e| super::validation::to_py_err(e, &format!("Failed to load_cached {}", path)))?;
+    Ok(super::image::PyNiftiImage { inner })
 }
 
 /// Clear the global decompression cache.
@@ -93,8 +95,7 @@ pub fn set_cache_size(max_entries: usize) {
 
 /// Load a NIfTI image directly to a PyTorch tensor.
 ///
-/// This is the most efficient way to load medical imaging data into PyTorch.
-/// Eliminates memory copies and supports half-precision tensors directly.
+/// Avoids a numpy intermediate and supports half-precision tensors directly.
 ///
 /// Args:
 ///     path: Path to the NIfTI file
@@ -115,12 +116,15 @@ pub fn load_to_torch(
     dtype: Option<PyObject>,
     device: &str,
 ) -> PyResult<PyObject> {
-    // Load image using medrs
-    let img = nifti::load(path).map_err(|e| {
-        pyo3::exceptions::PyIOError::new_err(format!("Failed to load {}: {}", path, e))
-    })?;
+    let validated_path = validate_file_path(path, "load_to_torch")?;
+    let path_str = validated_path
+        .to_str()
+        .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("path contains invalid UTF-8"))?;
 
-    // Convert to PyTorch tensor directly
+    let img = py
+        .allow_threads(|| nifti::load(path_str))
+        .map_err(|e| super::validation::to_py_err(e, &format!("Failed to load {}", path)))?;
+
     let py_img = super::image::PyNiftiImage { inner: img };
     py_img.to_torch_with_dtype_and_device(py, dtype, Some(device))
 }
@@ -141,11 +145,13 @@ pub fn load_to_torch(
 #[pyfunction]
 #[pyo3(signature = (image, path, num_threads=0))]
 pub fn save_mgzip(
+    py: Python<'_>,
     image: &super::image::PyNiftiImage,
     path: &str,
     num_threads: usize,
 ) -> PyResult<()> {
-    nifti::save_mgzip_with_threads(&image.inner, path, num_threads)
+    let inner = &image.inner;
+    py.allow_threads(|| nifti::save_mgzip_with_threads(inner, path, num_threads))
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("save_mgzip failed: {}", e)))
 }
 
@@ -165,14 +171,19 @@ pub fn save_mgzip(
 ///     >>> img = medrs.load_mgzip("brain.nii.mgz")
 #[pyfunction]
 #[pyo3(signature = (path, num_threads=0))]
-pub fn load_mgzip(path: &str, num_threads: usize) -> PyResult<super::image::PyNiftiImage> {
+pub fn load_mgzip(
+    py: Python<'_>,
+    path: &str,
+    num_threads: usize,
+) -> PyResult<super::image::PyNiftiImage> {
     let validated_path = validate_file_path(path, "load_mgzip")?;
     let path_str = validated_path
         .to_str()
         .ok_or_else(|| pyo3::exceptions::PyValueError::new_err("path contains invalid UTF-8"))?;
-    nifti::load_mgzip_with_threads(path_str, num_threads)
-        .map(|inner| super::image::PyNiftiImage { inner })
-        .map_err(|e| super::validation::to_py_err(e, &format!("Failed to load_mgzip {}", path)))
+    let inner = py
+        .allow_threads(|| nifti::load_mgzip_with_threads(path_str, num_threads))
+        .map_err(|e| super::validation::to_py_err(e, &format!("Failed to load_mgzip {}", path)))?;
+    Ok(super::image::PyNiftiImage { inner })
 }
 
 /// Convert a standard gzip NIfTI file to Mgzip format.
@@ -194,15 +205,14 @@ pub fn load_mgzip(path: &str, num_threads: usize) -> PyResult<super::image::PyNi
 #[pyfunction]
 #[pyo3(signature = (input_path, output_path=None, num_threads=0))]
 pub fn convert_to_mgzip(
+    py: Python<'_>,
     input_path: &str,
     output_path: Option<&str>,
     num_threads: usize,
 ) -> PyResult<String> {
-    let image = nifti::load(input_path).map_err(|e| {
-        pyo3::exceptions::PyIOError::new_err(format!("Failed to load {}: {}", input_path, e))
-    })?;
-
-    let output = if let Some(p) = output_path { std::path::PathBuf::from(p) } else {
+    let output = if let Some(p) = output_path {
+        std::path::PathBuf::from(p)
+    } else {
         let input = std::path::Path::new(input_path);
         let stem = input
             .file_stem()
@@ -212,9 +222,11 @@ pub fn convert_to_mgzip(
         input.with_file_name(format!("{stem}.nii.mgz"))
     };
 
-    nifti::save_mgzip_with_threads(&image, &output, num_threads).map_err(|e| {
-        pyo3::exceptions::PyIOError::new_err(format!("convert_to_mgzip failed: {}", e))
-    })?;
+    py.allow_threads(|| {
+        let image = nifti::load(input_path)?;
+        nifti::save_mgzip_with_threads(&image, &output, num_threads)
+    })
+    .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("convert_to_mgzip failed: {}", e)))?;
 
     Ok(output.display().to_string())
 }
@@ -233,7 +245,7 @@ pub fn convert_to_mgzip(
 ///     >>> if medrs.is_mgzip("brain.nii.mgz"):
 ///     ...     img = medrs.load_mgzip("brain.nii.mgz")
 #[pyfunction]
-pub fn is_mgzip(path: &str) -> PyResult<bool> {
-    nifti::is_mgzip(path)
+pub fn is_mgzip(py: Python<'_>, path: &str) -> PyResult<bool> {
+    py.allow_threads(|| nifti::is_mgzip(path))
         .map_err(|e| pyo3::exceptions::PyIOError::new_err(format!("is_mgzip check failed: {}", e)))
 }

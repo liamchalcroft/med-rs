@@ -1,9 +1,9 @@
 """
 MONAI MetaTensor support for medrs.
 
-Provides seamless integration with MONAI's MetaTensor data structure,
-preserving NIfTI-style metadata (affine matrix, spacing, orientation)
-alongside the tensor data for medical imaging workflows.
+Integrates with MONAI's MetaTensor data structure, preserving NIfTI-style
+metadata (affine matrix, spacing, orientation) alongside the tensor data for
+medical imaging workflows.
 """
 
 from __future__ import annotations

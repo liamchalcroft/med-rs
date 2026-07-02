@@ -44,11 +44,12 @@ pub fn arraydata_to_numpy(
     })
 }
 
-/// Try to create a numpy array from a view of f32 data.
-/// This still copies data (PyArrayDyn::from_array copies), but avoids
-/// materializing non-f32 data to f32 in Rust first.
-/// Returns None if image is not already f32 or not viewable.
-pub fn to_numpy_view<'py>(
+/// Copy already-f32 data into a fresh numpy array.
+///
+/// `PyArrayDyn::from_array` copies, so this is not zero-copy; it only avoids the
+/// Rust-side `to_f32()` allocation for data that is already f32 and viewable.
+/// Returns None if the image is not already f32, not viewable, or needs scaling.
+pub fn to_numpy_converted<'py>(
     py: Python<'py>,
     image: &RustNiftiImage,
 ) -> Option<Bound<'py, PyArrayDyn<f32>>> {
@@ -59,13 +60,8 @@ pub fn to_numpy_view<'py>(
         return None;
     }
 
-    // Only use view path if data is already f32 and contiguous
-    // This avoids double conversion (materialize + to_f32) for non-f32 data
     if let Some(view) = image.as_view_f32() {
-        // Note: from_array copies data, but we avoid Rust-side to_f32() conversion
-        // which would allocate a new array. For mmap'd f32 data this is optimal.
-        let arr = PyArrayDyn::from_array(py, &view);
-        return Some(arr);
+        return Some(PyArrayDyn::from_array(py, &view));
     }
     None
 }
@@ -80,14 +76,13 @@ pub fn to_numpy_array<'py>(
         return to_numpy_zero_copy(py, image);
     }
 
-    // Standard path: materialize and convert
-    let data = image
-        .to_f32()
+    // Standard path: materialize and convert with the GIL released
+    let data = py
+        .allow_threads(|| image.to_f32())
         .map_err(|e| super::validation::to_py_err(e, "to_f32"))?;
 
-    // Data is already in F-order (column-major) from NIfTI
-    // Use into_pyarray which moves data without copying for contiguous arrays
-    // The array maintains its F-order layout in memory
+    // Data is already in F-order (column-major) from NIfTI.
+    // into_pyarray moves the owned buffer, preserving F-order layout.
     Ok(data.into_pyarray(py))
 }
 
@@ -126,7 +121,15 @@ pub fn to_numpy_zero_copy<'py>(
     // SAFETY: `view` points into the mmap buffer and `container` keeps the Arc<Mmap>
     // alive for the lifetime of the numpy array. The data is not reallocated.
     let array = unsafe { PyArrayDyn::borrow_from_array(&view, container) };
-    array.readwrite().make_nonwriteable();
+    array
+        .try_readwrite()
+        .map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "Zero-copy failed: could not borrow array to mark it read-only: {}",
+                e
+            ))
+        })?
+        .make_nonwriteable();
     Ok(array)
 }
 

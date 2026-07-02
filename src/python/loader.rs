@@ -1,6 +1,6 @@
 //! Training data loaders for Python bindings.
 
-use pyo3::exceptions::{PyStopIteration, PyValueError};
+use pyo3::exceptions::{PyRuntimeError, PyStopIteration, PyValueError};
 use pyo3::prelude::*;
 
 use super::image::PyNiftiImage;
@@ -10,8 +10,8 @@ use crate::nifti::{
 
 /// High-performance training data loader with prefetching and caching.
 ///
-/// This is the most efficient way to load training patches from multiple volumes.
-/// Maintains an LRU cache and prefetches upcoming data to maximize throughput.
+/// Loads training patches from multiple volumes, maintaining an LRU cache and
+/// prefetching upcoming data to keep throughput high.
 #[pyclass(name = "TrainingDataLoader")]
 pub struct PyTrainingDataLoader {
     loader: RustTrainingDataLoader,
@@ -42,7 +42,7 @@ impl PyTrainingDataLoader {
     ///     patch = loader.next_patch()
     ///     ```
     #[new]
-    #[pyo3(signature = (volumes, patch_size, patches_per_volume, patch_overlap, randomize, cache_size=None))]
+    #[pyo3(signature = (volumes, patch_size, patches_per_volume, patch_overlap, randomize, cache_size=None, seed=None))]
     fn new(
         volumes: Vec<String>,
         patch_size: [usize; 3],
@@ -50,6 +50,7 @@ impl PyTrainingDataLoader {
         patch_overlap: [usize; 3],
         randomize: bool,
         cache_size: Option<usize>,
+        seed: Option<u64>,
     ) -> PyResult<Self> {
         for i in 0..3 {
             if patch_overlap[i] >= patch_size[i] {
@@ -64,6 +65,7 @@ impl PyTrainingDataLoader {
             patches_per_volume,
             overlap: patch_overlap,
             randomize,
+            seed,
         };
 
         let cache_size = cache_size.unwrap_or(1000);
@@ -77,8 +79,9 @@ impl PyTrainingDataLoader {
     ///
     /// Returns next training patch with automatic prefetching.
     /// Raises StopIteration when all patches are processed.
-    fn next_patch(&mut self) -> PyResult<PyNiftiImage> {
-        match self.loader.next_patch() {
+    fn next_patch(&mut self, py: Python<'_>) -> PyResult<PyNiftiImage> {
+        let loader = &mut self.loader;
+        match py.allow_threads(|| loader.next_patch()) {
             Ok(inner) => Ok(PyNiftiImage { inner }),
             Err(crate::error::Error::Exhausted(msg)) => Err(PyStopIteration::new_err(msg)),
             Err(e) => Err(pyo3::exceptions::PyIOError::new_err(format!(
@@ -93,15 +96,17 @@ impl PyTrainingDataLoader {
     }
 
     fn __iter__(mut slf: PyRefMut<'_, Self>) -> PyResult<PyRefMut<'_, Self>> {
-        slf.loader
-            .reset()
+        let py = slf.py();
+        let loader = &mut slf.loader;
+        py.allow_threads(|| loader.reset())
             .map_err(|e| PyValueError::new_err(format!("Failed to reset loader: {}", e)))?;
         Ok(slf)
     }
 
-    fn __next__(mut slf: PyRefMut<'_, Self>) -> PyResult<Option<super::image::PyNiftiImage>> {
-        match slf.loader.next_patch() {
-            Ok(img) => Ok(Some(super::image::PyNiftiImage { inner: img })),
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyNiftiImage>> {
+        let loader = &mut self.loader;
+        match py.allow_threads(|| loader.next_patch()) {
+            Ok(img) => Ok(Some(PyNiftiImage { inner: img })),
             Err(crate::error::Error::Exhausted(_)) => Ok(None),
             Err(e) => Err(pyo3::exceptions::PyIOError::new_err(format!(
                 "iterator: {}",
@@ -116,16 +121,41 @@ impl PyTrainingDataLoader {
     }
 
     /// Reset loader to start from beginning.
-    fn reset(&mut self) -> PyResult<()> {
-        self.loader
-            .reset()
+    fn reset(&mut self, py: Python<'_>) -> PyResult<()> {
+        let loader = &mut self.loader;
+        py.allow_threads(|| loader.reset())
             .map_err(|e| PyValueError::new_err(format!("Failed to reset loader: {}", e)))
     }
 }
 
+/// Same-thread `Send` wrapper for a borrow of the loader.
+///
+/// `FastLoader` holds an `mpsc::Receiver` and is therefore not `Sync`, so a
+/// plain `&FastLoader` cannot satisfy `allow_threads`'s `Send` bound. The
+/// closure runs on the calling thread (the GIL is only released, not moved),
+/// and `PyFastLoader` is `unsendable` and borrowed `&mut self` for the call, so
+/// the receiver is never touched from another thread.
+#[allow(unsafe_code)]
+struct LoaderRef<'a>(&'a RustFastLoader);
+
+#[allow(unsafe_code)]
+unsafe impl Send for LoaderRef<'_> {}
+
+impl LoaderRef<'_> {
+    fn next(&self) -> Option<crate::error::Result<crate::nifti::NiftiImage>> {
+        self.0.next()
+    }
+}
+
+/// One-shot streaming loader over a set of volumes.
+///
+/// The loader drains a background worker channel exactly once. After the
+/// underlying channel closes it is exhausted: iterating again raises
+/// RuntimeError. Create a new FastLoader for each epoch.
 #[pyclass(name = "FastLoader", unsendable)]
 pub struct PyFastLoader {
-    loader: Option<RustFastLoader>,
+    loader: RustFastLoader,
+    consumed: bool,
 }
 
 #[pymethods]
@@ -160,34 +190,42 @@ impl PyFastLoader {
             .map_err(|e| PyValueError::new_err(format!("Failed to create FastLoader: {}", e)))?;
 
         Ok(Self {
-            loader: Some(loader),
+            loader,
+            consumed: false,
         })
     }
 
     fn __len__(&self) -> usize {
-        self.loader.as_ref().map_or(0, |l| l.len())
+        self.loader.len()
     }
 
-    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
+    fn __iter__(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
+        if slf.consumed {
+            return Err(PyRuntimeError::new_err(
+                "FastLoader is one-shot and already exhausted; create a new FastLoader for another epoch",
+            ));
+        }
+        Ok(slf)
     }
 
-    fn __next__(&mut self) -> PyResult<Option<PyNiftiImage>> {
-        let loader = self.loader.as_ref().ok_or_else(|| {
-            PyValueError::new_err("FastLoader exhausted - create a new one for next epoch")
-        })?;
-
-        match loader.next() {
+    fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<PyNiftiImage>> {
+        if self.consumed {
+            return Ok(None);
+        }
+        let loader = LoaderRef(&self.loader);
+        let next = py.allow_threads(move || loader.next());
+        match next {
             Some(Ok(img)) => Ok(Some(PyNiftiImage { inner: img })),
             Some(Err(e)) => Err(pyo3::exceptions::PyIOError::new_err(format!("{}", e))),
-            None => Ok(None),
+            None => {
+                self.consumed = true;
+                Ok(None)
+            }
         }
     }
 
     #[getter]
     fn patch_shape(&self) -> [usize; 3] {
-        self.loader
-            .as_ref()
-            .map_or([0, 0, 0], |l| l.patch_shape())
+        self.loader.patch_shape()
     }
 }

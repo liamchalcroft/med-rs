@@ -5,8 +5,12 @@ particularly deep learning pipelines that process large 3D volumes.
 
 Key Features:
     - **Fast NIfTI I/O**: Memory-mapped reading, crop-first loading
-      (read sub-volumes without loading entire files - up to 40x faster)
+      (read sub-volumes without loading entire files; uncompressed loads
+      are comparable to nibabel and 10-25x faster than MONAI/TorchIO,
+      see the README benchmarks)
     - **Mixed Precision**: Native f16/bf16 support for 50% storage savings
+    - **Volumetric Compression**: Optional .jvol codec for lossy wavelet
+      compression of floating-point volumes (see medrs.save_jvol)
     - **Transform Pipeline**: Lazy evaluation with SIMD acceleration
     - **Direct Tensor Creation**: Zero-copy PyTorch/JAX tensor loading
     - **MONAI Integration**: Drop-in replacements for MONAI transforms
@@ -36,8 +40,9 @@ For MONAI integration, see:
 """
 
 from importlib import import_module
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from importlib.util import find_spec
-from typing import Any, Optional
+from typing import Any
 
 from ._medrs import (
     NiftiImage,
@@ -47,10 +52,15 @@ from ._medrs import (
     clamp,
     crop_or_pad,
     load,
+    load_cached,
+    clear_decompression_cache,
+    set_cache_size,
     load_cropped,
     load_cropped_to_jax,
     load_cropped_to_torch,
     load_label_aware_cropped,
+    load_multi,
+    load_image_label_pair,
     load_resampled,
     load_to_torch,
     reorient,
@@ -71,6 +81,15 @@ from ._medrs import (
     load_mgzip,
     convert_to_mgzip,
     is_mgzip,
+    save_jvol,
+    convert_to_jvol,
+    load_jvol_downsampled,
+    load_jvol,
+    load_jvol_cached,
+    clear_jvol_cache,
+    set_jvol_cache_size,
+    convert_jvol_to_nii,
+    load_jvol_via_mmap_cache,
 )
 
 # Alias for more intuitive naming
@@ -87,7 +106,10 @@ from .exceptions import (
 )
 from .performance_profiler import PerformanceProfiler
 
-__version__ = "0.1.1"
+try:
+    __version__ = _pkg_version("medrs")
+except PackageNotFoundError:
+    __version__ = "0.2.0"
 __author__ = "Liam Chalcroft"
 __email__ = "liam.chalcroft.20@ucl.ac.uk"
 
@@ -96,20 +118,11 @@ __email__ = "liam.chalcroft.20@ucl.ac.uk"
 
 
 def get_info(path: str) -> dict[str, Any]:
-    """Get image metadata without loading the full volume.
-
-    This is useful for quickly inspecting file properties without
-    the memory cost of loading all voxel data.
+    """Return image metadata as a dict with keys: shape, spacing, affine,
+    orientation, dtype.
 
     Args:
         path: Path to NIfTI file
-
-    Returns:
-        Dictionary with keys: shape, spacing, affine, orientation, dtype
-
-    Example:
-        >>> info = medrs.get_info("brain.nii.gz")
-        >>> print(f"Shape: {info['shape']}, Spacing: {info['spacing']}")
     """
     img = load(path)
     return {
@@ -184,10 +197,15 @@ __all__ = [
     "rescale_intensity",
     "z_normalization",
     "load",
+    "load_cached",
+    "clear_decompression_cache",
+    "set_cache_size",
     "load_cropped",
     "load_cropped_to_jax",
     "load_cropped_to_torch",
     "load_label_aware_cropped",
+    "load_multi",
+    "load_image_label_pair",
     "load_resampled",
     "load_to_torch",
     "random_flip",
@@ -204,6 +222,15 @@ __all__ = [
     "load_mgzip",
     "convert_to_mgzip",
     "is_mgzip",
+    "save_jvol",
+    "convert_to_jvol",
+    "load_jvol_downsampled",
+    "load_jvol",
+    "load_jvol_cached",
+    "clear_jvol_cache",
+    "set_jvol_cache_size",
+    "convert_jvol_to_nii",
+    "load_jvol_via_mmap_cache",
     "get_info",
     "supports_monai",
     "supports_torch",

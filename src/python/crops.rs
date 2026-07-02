@@ -36,6 +36,7 @@ use crate::transforms::Orientation;
 ///     >>> img = medrs.load_cropped("volume.nii", [32, 32, 32], [64, 64, 64])
 #[pyfunction]
 pub fn load_cropped(
+    py: Python<'_>,
     path: &str,
     crop_offset: [usize; 3],
     crop_shape: [usize; 3],
@@ -45,9 +46,10 @@ pub fn load_cropped(
         .to_str()
         .ok_or_else(|| PyValueError::new_err("path contains invalid UTF-8"))?;
 
-    nifti::load_cropped(path_str, crop_offset, crop_shape)
-        .map(|inner| PyNiftiImage { inner })
-        .map_err(|e| to_py_err(e, &format!("Failed to load cropped {}", path)))
+    let inner = py
+        .allow_threads(|| nifti::load_cropped(path_str, crop_offset, crop_shape))
+        .map_err(|e| to_py_err(e, &format!("Failed to load cropped {}", path)))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Load a cropped region with optional reorientation and resampling.
@@ -76,6 +78,7 @@ pub fn load_cropped(
 #[pyfunction]
 #[pyo3(signature = (path, output_shape, target_spacing=None, target_orientation=None, output_offset=None))]
 pub fn load_resampled(
+    py: Python<'_>,
     path: &str,
     output_shape: [usize; 3],
     target_spacing: Option<[f32; 3]>,
@@ -100,17 +103,18 @@ pub fn load_resampled(
         offset: output_offset,
         spacing: target_spacing,
         orientation,
+        use_cache: true,
     };
 
-    nifti::load_with_crop(path_str, config)
-        .map(|inner| PyNiftiImage { inner })
-        .map_err(|e| to_py_err(e, &format!("Failed to load cropped {}", path)))
+    let inner = py
+        .allow_threads(|| nifti::load_with_crop(path_str, config))
+        .map_err(|e| to_py_err(e, &format!("Failed to load cropped {}", path)))?;
+    Ok(PyNiftiImage { inner })
 }
 
 /// Load a cropped region directly into a PyTorch tensor without numpy intermediate.
 ///
-/// This is the most efficient way to load medical imaging data into PyTorch.
-/// Eliminates memory copies and supports half-precision tensors directly.
+/// Avoids a numpy intermediate and supports half-precision tensors directly.
 ///
 /// Args:
 ///     path: Path to NIfTI file (must be uncompressed .nii)
@@ -168,6 +172,7 @@ pub fn load_cropped_to_torch(
         offset: output_offset,
         spacing: target_spacing,
         orientation,
+        use_cache: true,
     };
 
     let validated_path = validate_file_path(path, "load_cropped_to_torch")?;
@@ -175,7 +180,8 @@ pub fn load_cropped_to_torch(
         .to_str()
         .ok_or_else(|| PyValueError::new_err("path contains invalid UTF-8"))?;
 
-    let img = nifti::load_with_crop(path_str, config)
+    let img = py
+        .allow_threads(|| nifti::load_with_crop(path_str, config))
         .map_err(|e| to_py_err(e, &format!("Failed to load cropped {}", path)))?;
 
     // Convert to PyTorch tensor directly using our optimized I/O + tensor conversion
@@ -185,8 +191,7 @@ pub fn load_cropped_to_torch(
 
 /// Load a cropped region directly into a JAX array without numpy intermediate.
 ///
-/// This is the most efficient way to load medical imaging data into JAX.
-/// Eliminates memory copies and supports bfloat16/f16 directly.
+/// Avoids a numpy intermediate and supports bfloat16/f16 directly.
 ///
 /// Args:
 ///     path: Path to NIfTI file (must be uncompressed .nii)
@@ -244,6 +249,7 @@ pub fn load_cropped_to_jax(
         offset: output_offset,
         spacing: target_spacing,
         orientation,
+        use_cache: true,
     };
 
     let validated_path = validate_file_path(path, "load_cropped_to_jax")?;
@@ -251,7 +257,8 @@ pub fn load_cropped_to_jax(
         .to_str()
         .ok_or_else(|| PyValueError::new_err("path contains invalid UTF-8"))?;
 
-    let img = nifti::load_with_crop(path_str, config)
+    let img = py
+        .allow_threads(|| nifti::load_with_crop(path_str, config))
         .map_err(|e| to_py_err(e, &format!("Failed to load cropped {}", path)))?;
 
     // Convert to JAX array directly using our optimized I/O + array conversion
@@ -289,7 +296,7 @@ pub fn load_cropped_to_jax(
 #[pyfunction]
 #[pyo3(signature = (image_path, label_path, patch_size, pos_neg_ratio=None, min_pos_samples=None, seed=None))]
 pub fn load_label_aware_cropped(
-    _py: Python<'_>,
+    py: Python<'_>,
     image_path: &str,
     label_path: &str,
     patch_size: Vec<usize>,
@@ -299,13 +306,6 @@ pub fn load_label_aware_cropped(
 ) -> PyResult<(PyNiftiImage, PyNiftiImage)> {
     let patch_size_arr = parse_shape3(&patch_size, "patch_size")?;
 
-    // Load full images first (this could be optimized further)
-    let image = nifti::load(image_path)
-        .map_err(|e| to_py_err(e, &format!("Failed to load {}", image_path)))?;
-    let label = nifti::load(label_path)
-        .map_err(|e| to_py_err(e, &format!("Failed to load {}", label_path)))?;
-
-    // Configure cropping
     let config = RandCropByPosNegLabelConfig {
         patch_size: patch_size_arr,
         pos_neg_ratio: pos_neg_ratio.unwrap_or(1.0) as f32,
@@ -314,21 +314,25 @@ pub fn load_label_aware_cropped(
         background_label: 0.0,
     };
 
-    // Compute crop regions (this is fast, operates on labels only)
-    let crop_regions = compute_label_aware_crop_regions(&config, &image, &label, 1)
-        .map_err(|e| to_py_err(e, "compute_label_aware_crop_regions"))?;
+    let (cropped_image, cropped_label) = py.allow_threads(|| -> PyResult<_> {
+        let image = nifti::load(image_path)
+            .map_err(|e| to_py_err(e, &format!("Failed to load {}", image_path)))?;
+        let label = nifti::load(label_path)
+            .map_err(|e| to_py_err(e, &format!("Failed to load {}", label_path)))?;
 
-    if crop_regions.is_empty() {
-        return Err(PyValueError::new_err("No valid crop regions found"));
-    }
+        let crop_regions = compute_label_aware_crop_regions(&config, &image, &label, 1)
+            .map_err(|e| to_py_err(e, "compute_label_aware_crop_regions"))?;
 
-    let region = &crop_regions[0];
+        let region = crop_regions
+            .first()
+            .ok_or_else(|| PyValueError::new_err("No valid crop regions found"))?;
 
-    // Load cropped regions (this is a fast byte-exact loading)
-    let cropped_image = nifti::load_cropped(image_path, region.start, region.size)
-        .map_err(|e| to_py_err(e, "Failed to load cropped image"))?;
-    let cropped_label = nifti::load_cropped(label_path, region.start, region.size)
-        .map_err(|e| to_py_err(e, "Failed to load cropped label"))?;
+        let cropped_image = nifti::load_cropped(image_path, region.start, region.size)
+            .map_err(|e| to_py_err(e, "Failed to load cropped image"))?;
+        let cropped_label = nifti::load_cropped(label_path, region.start, region.size)
+            .map_err(|e| to_py_err(e, "Failed to load cropped label"))?;
+        Ok((cropped_image, cropped_label))
+    })?;
 
     Ok((
         PyNiftiImage {
@@ -380,13 +384,6 @@ pub fn compute_crop_regions(
 ) -> PyResult<Vec<PyObject>> {
     let patch_size_arr = parse_shape3(&patch_size, "patch_size")?;
 
-    // Load images to get shape information
-    let image = nifti::load(image_path)
-        .map_err(|e| to_py_err(e, &format!("Failed to load {}", image_path)))?;
-    let label = nifti::load(label_path)
-        .map_err(|e| to_py_err(e, &format!("Failed to load {}", label_path)))?;
-
-    // Configure cropping
     let config = RandCropByPosNegLabelConfig {
         patch_size: patch_size_arr,
         pos_neg_ratio: pos_neg_ratio.unwrap_or(1.0) as f32,
@@ -395,9 +392,14 @@ pub fn compute_crop_regions(
         background_label: 0.0,
     };
 
-    // Compute crop regions
-    let crop_regions = compute_label_aware_crop_regions(&config, &image, &label, num_samples)
-        .map_err(|e| to_py_err(e, "compute_label_aware_crop_regions"))?;
+    let crop_regions = py.allow_threads(|| -> PyResult<_> {
+        let image = nifti::load(image_path)
+            .map_err(|e| to_py_err(e, &format!("Failed to load {}", image_path)))?;
+        let label = nifti::load(label_path)
+            .map_err(|e| to_py_err(e, &format!("Failed to load {}", label_path)))?;
+        compute_label_aware_crop_regions(&config, &image, &label, num_samples)
+            .map_err(|e| to_py_err(e, "compute_label_aware_crop_regions"))
+    })?;
 
     // Convert to Python dictionaries
     let mut regions_py = Vec::new();
@@ -446,19 +448,21 @@ pub fn compute_random_spatial_crops(
 ) -> PyResult<Vec<PyObject>> {
     let patch_size_arr = parse_shape3(&patch_size, "patch_size")?;
 
-    // Load image to get shape information
-    let image = nifti::load(image_path)
-        .map_err(|e| to_py_err(e, &format!("Failed to load {}", image_path)))?;
-
-    // Configure cropping
     let config = SpatialCropConfig {
         patch_size: patch_size_arr,
         seed,
         allow_smaller: allow_smaller.unwrap_or(false),
     };
 
-    // Compute crop regions
-    let crop_regions = compute_random_spatial_crop_regions(&config, &image, num_samples);
+    let crop_regions = py.allow_threads(|| -> PyResult<_> {
+        let image = nifti::load(image_path)
+            .map_err(|e| to_py_err(e, &format!("Failed to load {}", image_path)))?;
+        Ok(compute_random_spatial_crop_regions(
+            &config,
+            &image,
+            num_samples,
+        ))
+    })?;
 
     // Convert to Python dictionaries
     let mut regions_py = Vec::new();
@@ -498,12 +502,11 @@ pub fn compute_center_crop(
 ) -> PyResult<PyObject> {
     let patch_size_arr = parse_shape3(&patch_size, "patch_size")?;
 
-    // Load image to get shape information
-    let image = nifti::load(image_path)
-        .map_err(|e| to_py_err(e, &format!("Failed to load {}", image_path)))?;
-
-    // Compute center crop
-    let region = compute_center_crop_regions(patch_size_arr, &image);
+    let region = py.allow_threads(|| -> PyResult<_> {
+        let image = nifti::load(image_path)
+            .map_err(|e| to_py_err(e, &format!("Failed to load {}", image_path)))?;
+        Ok(compute_center_crop_regions(patch_size_arr, &image))
+    })?;
 
     // Convert to Python dictionary
     let region_dict = PyDict::new(py);
