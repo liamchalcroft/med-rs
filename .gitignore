@@ -74,11 +74,9 @@ docs/.doctrees/
 tests/output/
 
 # Benchmark results (regeneratable, keep out of version control)
-benchmarks/results/
+benchmarks/results/*
+!benchmarks/results/load_comparison.json
 benchmarks/test_data/
-
-# Lock files (keep Cargo.lock for reproducibility, ignore uv.lock)
-uv.lock
 
 # Paper (keep separate from library code)
 paper/

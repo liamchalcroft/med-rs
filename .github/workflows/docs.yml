@@ -34,7 +34,7 @@ jobs:
     - name: Build documentation
       run: |
         cd docs
-        make html
+        make html SPHINXOPTS="-W --keep-going"
 
     - name: Upload documentation artifacts
       uses: actions/upload-artifact@v4

@@ -1,5 +1,5 @@
 # medrs Makefile
-.PHONY: install build test clean lint format docs
+.PHONY: install build build-native test clean lint format docs
 
 # Installation
 install:
@@ -13,6 +13,11 @@ install-dev:
 # Building
 build:
 	cargo build --release --features python
+
+# Build tuned for the local CPU (enables AVX2 etc. where available).
+# Do not use for distributed wheels: the default build must stay baseline.
+build-native:
+	RUSTFLAGS="-C target-cpu=native" cargo build --release
 
 # Testing
 test: test-rust test-python

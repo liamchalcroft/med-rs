@@ -33,8 +33,58 @@ jobs:
       - name: Run cargo clippy (no Python)
         run: cargo clippy -- -D warnings
 
+      - name: Run cargo clippy (jvol feature)
+        run: cargo clippy --features jvol -- -D warnings
+
       - name: Run cargo test (no Python)
         run: cargo test
+
+      - name: Run cargo test (jvol feature)
+        run: cargo test --features jvol
+
+  # MSRV check: the minimum Rust version declared in Cargo.toml must build and test.
+  msrv:
+    name: MSRV (Rust 1.81)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.81
+        uses: dtolnay/rust-toolchain@1.81.0
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build at MSRV
+        run: cargo build --features jvol
+
+      - name: Test at MSRV
+        run: cargo test --features jvol
+
+  # Clippy for the Python-feature surface, pinned to a fixed toolchain so
+  # newly-stabilized nursery/pedantic lints on a rolling `stable` don't cause
+  # unrelated CI breaks (see repo history for the churn this caused).
+  clippy-python:
+    name: Clippy (python feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@1.83.0
+        with:
+          components: clippy
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo clippy (python feature)
+        run: cargo clippy --features python -- -D warnings
 
   # Python tests across versions and platforms
   python-test:

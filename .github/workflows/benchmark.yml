@@ -1,10 +1,10 @@
 name: Benchmarks
 
+# Deliberately not run on every push/PR: the 6-way OS/Python matrix is heavy
+# (full medrs + MONAI + nibabel builds per leg) and its numbers are not part
+# of the merge gate. Runs on a weekly schedule, on demand via
+# workflow_dispatch, or on a PR labeled "benchmark".
 on:
-  push:
-    branches: [main, master]
-  pull_request:
-    branches: [main, master]
   schedule:
     # Run weekly on Sunday at 00:00 UTC
     - cron: "0 0 * * 0"
@@ -14,6 +14,9 @@ on:
         description: "Number of benchmark iterations"
         required: false
         default: "30"
+  pull_request:
+    types: [labeled]
+    branches: [main, master]
 
 permissions:
   contents: read
@@ -23,8 +26,16 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  gate:
+    name: Check trigger
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' || github.event.label.name == 'benchmark'
+    steps:
+      - run: echo "Benchmark run triggered by ${{ github.event_name }}"
+
   benchmark:
     name: Benchmark (${{ matrix.os }}, Python ${{ matrix.python }})
+    needs: gate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
