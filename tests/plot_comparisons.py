@@ -17,11 +17,13 @@ from monai.transforms import (
     EnsureChannelFirst,
 )
 
+from test_utils import mprage_fixture_path
+
 # Output directory for plots
 OUTPUT_DIR = Path("tests/output/comparison_plots")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-TEST_IMAGE = "tests/fixtures/mprage_img.nii"
+TEST_IMAGE = str(mprage_fixture_path())
 
 
 def get_center_slices(data):

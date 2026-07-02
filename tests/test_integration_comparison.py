@@ -9,8 +9,12 @@ import numpy as np
 import pytest
 from pathlib import Path
 
-# Test data path
-TEST_IMAGE = Path("tests/fixtures/mprage_img.nii")
+from tests.test_utils import mprage_fixture_path
+
+# Test data path (uncompressed .nii, decompressed on demand from the
+# committed mprage_img.nii.gz fixture; load_cropped requires uncompressed
+# files).
+TEST_IMAGE = mprage_fixture_path()
 
 
 # ============================================================================

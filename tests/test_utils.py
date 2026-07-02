@@ -6,12 +6,39 @@ This module provides utilities for generating synthetic NIfTI files for testing,
 ensuring consistent test data across different test suites.
 """
 
+import gzip
 import os
+import shutil
 import tempfile
 import numpy as np
 import nibabel as nib
 from pathlib import Path
 from typing import Tuple, Optional, List, Union
+
+_FIXTURES_DIR = Path(__file__).parent / "fixtures"
+
+
+def mprage_fixture_path() -> Path:
+    """Return a path to an uncompressed copy of the MPRAGE test fixture.
+
+    The fixture is checked into the repo as ``mprage_img.nii.gz`` to keep
+    the repository small. Tests that need byte-exact access to an
+    uncompressed ``.nii`` (e.g. ``load_cropped``, which only supports
+    uncompressed files) get a decompressed copy cached in the system temp
+    directory, keyed by the source file's size and mtime so it is
+    regenerated only when the fixture changes.
+    """
+    gz_path = _FIXTURES_DIR / "mprage_img.nii.gz"
+    if not gz_path.exists():
+        raise FileNotFoundError(f"Test fixture not found: {gz_path}")
+
+    stat = gz_path.stat()
+    cache_key = f"{stat.st_size}_{int(stat.st_mtime)}"
+    cached = Path(tempfile.gettempdir()) / f"medrs_mprage_img_{cache_key}.nii"
+    if not cached.exists():
+        with gzip.open(gz_path, "rb") as f_in, open(cached, "wb") as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    return cached
 
 
 def generate_random_nifti(
