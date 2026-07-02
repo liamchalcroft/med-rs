@@ -4,8 +4,9 @@
 //! previously lacking test coverage, including error conditions
 //! and edge cases.
 
-use medrs::nifti::{self, DataType, NiftiImage};
+use medrs::nifti::{self, DataType, FastLoader, NiftiImage};
 use ndarray::ArrayD;
+use ndarray::IxDyn;
 use ndarray::ShapeBuilder;
 use tempfile::NamedTempFile;
 
@@ -126,17 +127,11 @@ fn test_load_roundtrip_preserves_metadata() {
     nifti::save(&img, file.path().to_str().unwrap()).unwrap();
     let reloaded_img = nifti::load(file.path().to_str().unwrap()).unwrap();
 
-    // Check that data is preserved (F-order vs C-order differences are expected)
+    // Check that data is preserved at every logical position. ndarray equality
+    // compares by logical index, so a transposed/axis-swapped result fails here.
     let reloaded_data = reloaded_img.to_f32().unwrap();
-    let reloaded_slice = reloaded_data.as_slice_memory_order().unwrap();
-
-    // The data should be the same set of values, but potentially in different order due to F-order
-    // Let's check that the sorted values are the same
-    let mut original_sorted = original_data.clone();
-    let mut reloaded_sorted = reloaded_slice.to_vec();
-    original_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    reloaded_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    assert_eq!(original_sorted, reloaded_sorted);
+    let expected = ArrayD::from_shape_vec(ndarray::IxDyn(&[2, 2, 2]), original_data).unwrap();
+    assert_eq!(reloaded_data, expected);
 
     // Check metadata is preserved
     assert_eq!(img.shape(), reloaded_img.shape());
@@ -338,7 +333,7 @@ fn test_negative_dimension_in_header_rejected() {
 fn test_zero_copy_feasibility_checks() {
     // Test that zero-copy is possible for uncompressed f32 files
     let data = vec![1.0f32; 1000];
-    let img = create_test_image(data.clone(), vec![10, 10, 10]);
+    let img = create_test_image(data, vec![10, 10, 10]);
 
     // Save as uncompressed .nii
     let dir = tempfile::tempdir().unwrap();
@@ -519,14 +514,10 @@ fn test_gzipped_roundtrip() {
     let loaded = nifti::load(path.to_str().unwrap()).unwrap();
     assert_eq!(loaded.shape(), [2, 2, 2]);
 
+    // Position-preserving comparison: each logical voxel must match.
     let loaded_data = loaded.to_f32().unwrap();
-    let loaded_slice = loaded_data.as_slice_memory_order().unwrap();
-
-    let mut original_sorted = data.clone();
-    let mut loaded_sorted = loaded_slice.to_vec();
-    original_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    loaded_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    assert_eq!(original_sorted, loaded_sorted);
+    let expected = ArrayD::from_shape_vec(ndarray::IxDyn(&[2, 2, 2]), data).unwrap();
+    assert_eq!(loaded_data, expected);
 }
 
 #[test]
@@ -551,6 +542,197 @@ fn test_cropped_load_bounds_validation() {
         "Expected error about bounds, got: {}",
         err_str
     );
+}
+
+/// Build an F-order NIfTI image of the given shape whose voxels each carry a
+/// distinct value (their C-order logical index), so axis transposition is
+/// detectable.
+fn distinct_valued_image(shape: &[usize]) -> NiftiImage {
+    let n: usize = shape.iter().product();
+    let data: Vec<f32> = (0..n).map(|i| i as f32).collect();
+    let c_order = ArrayD::from_shape_vec(IxDyn(shape), data).unwrap();
+    let mut f_order = ArrayD::zeros(IxDyn(shape).f());
+    f_order.assign(&c_order);
+    let affine = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+    NiftiImage::from_array(f_order, affine)
+}
+
+#[test]
+fn test_cropped_region_matches_full_load() {
+    // Non-symmetric shape with distinct per-voxel values: a transposed crop
+    // copy would place values at the wrong logical positions and fail here.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("distinct.nii");
+    let img = distinct_valued_image(&[7, 11, 13]);
+    nifti::save(&img, path.to_str().unwrap()).unwrap();
+
+    let full = nifti::load(path.to_str().unwrap())
+        .unwrap()
+        .to_f32()
+        .unwrap();
+
+    let offset = [1, 2, 3];
+    let shape = [3, 4, 5];
+    let cropped = nifti::load_cropped(path.to_str().unwrap(), offset, shape).unwrap();
+    assert_eq!(cropped.shape(), &shape);
+    let cropped_data = cropped.to_f32().unwrap();
+
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let expected = full[[offset[0] + i, offset[1] + j, offset[2] + k]];
+                let actual = cropped_data[[i, j, k]];
+                assert_eq!(
+                    actual, expected,
+                    "crop mismatch at [{i},{j},{k}]: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_gzipped_cropped_region_matches_full_load() {
+    // Same check for the gzipped decompress+crop path.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("distinct.nii.gz");
+    let img = distinct_valued_image(&[7, 11, 13]);
+    nifti::save(&img, path.to_str().unwrap()).unwrap();
+    nifti::clear_decompression_cache();
+
+    let full = nifti::load(path.to_str().unwrap())
+        .unwrap()
+        .to_f32()
+        .unwrap();
+
+    let offset = [2, 1, 4];
+    let shape = [4, 5, 3];
+    let cropped = nifti::load_cropped(path.to_str().unwrap(), offset, shape).unwrap();
+    let cropped_data = cropped.to_f32().unwrap();
+
+    for i in 0..shape[0] {
+        for j in 0..shape[1] {
+            for k in 0..shape[2] {
+                let expected = full[[offset[0] + i, offset[1] + j, offset[2] + k]];
+                assert_eq!(cropped_data[[i, j, k]], expected);
+            }
+        }
+    }
+    nifti::clear_decompression_cache();
+}
+
+#[test]
+fn test_large_dim_auto_promotes_to_nifti2() {
+    // A NIfTI-1 image with a dimension above i16::MAX must save without silent
+    // truncation by promoting to NIfTI-2, and round-trip its shape and data.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.nii");
+    let img = distinct_valued_image(&[40000, 2, 2]);
+    assert!(img.header().requires_nifti2());
+
+    nifti::save(&img, path.to_str().unwrap()).unwrap();
+    let loaded = nifti::load(path.to_str().unwrap()).unwrap();
+
+    assert_eq!(loaded.shape(), &[40000, 2, 2]);
+    // NIfTI-2 header is 540 bytes; a truncated NIfTI-1 save could not represent
+    // this shape.
+    assert_eq!(loaded.header().header_size(), 540);
+
+    let expected = img.to_f32().unwrap();
+    let actual = loaded.to_f32().unwrap();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn test_large_dim_auto_promotes_gzipped_and_load_header() {
+    // Also covers reading a gzipped NIfTI-2 header, which requires decompressing
+    // more than the 348-byte NIfTI-1 header.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.nii.gz");
+    let img = distinct_valued_image(&[40000, 2, 2]);
+    nifti::save(&img, path.to_str().unwrap()).unwrap();
+
+    let header = nifti::load_header(path.to_str().unwrap()).unwrap();
+    assert_eq!(header.header_size(), 540);
+    assert_eq!(header.shape(), vec![40000usize, 2, 2]);
+}
+
+#[test]
+fn test_intent_code_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("intent.nii");
+    let mut img = distinct_valued_image(&[3, 3, 3]);
+    img.header_mut().intent_code = 1007; // NIFTI_INTENT_VECTOR
+    nifti::save(&img, path.to_str().unwrap()).unwrap();
+
+    let loaded = nifti::load(path.to_str().unwrap()).unwrap();
+    assert_eq!(loaded.header().intent_code, 1007);
+}
+
+#[test]
+fn test_4d_zero_temporal_pixdim_validates_and_loads() {
+    // A 4D volume with pixdim[4] == 0 (unknown TR) is common and valid.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fourd.nii");
+    let mut img = distinct_valued_image(&[4, 4, 4, 3]);
+    img.header_mut().pixdim[4] = 0.0;
+
+    nifti::save(&img, path.to_str().unwrap()).unwrap();
+    let loaded = nifti::load(path.to_str().unwrap()).unwrap();
+    assert_eq!(loaded.shape(), &[4, 4, 4, 3]);
+}
+
+#[test]
+fn test_huge_isize_gzip_returns_err_not_abort() {
+    // A gzip file whose ISIZE trailer claims a multi-gigabyte payload must not
+    // trigger a huge eager allocation. With an invalid deflate body it should
+    // simply return an error.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("evil.nii.gz");
+
+    let mut bad = vec![0x1f, 0x8b, 0x08, 0x00, 0, 0, 0, 0, 0x00, 0x03];
+    bad.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // invalid deflate stream
+    bad.extend_from_slice(&[0, 0, 0, 0]); // crc32 placeholder
+    bad.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // ISIZE ~ 4 GiB
+    std::fs::write(&path, &bad).unwrap();
+
+    let result = nifti::load(path.to_str().unwrap());
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_seeded_fast_loader_single_worker_is_reproducible() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut paths = Vec::new();
+    for i in 0..3 {
+        let path = dir.path().join(format!("vol{i}.nii.gz"));
+        let img = distinct_valued_image(&[10, 10, 10]);
+        nifti::save(&img, path.to_str().unwrap()).unwrap();
+        paths.push(path);
+    }
+
+    let run = |paths: &Vec<std::path::PathBuf>| -> Vec<Vec<f32>> {
+        let loader = FastLoader::new(paths.clone(), [4, 4, 4])
+            .seed(1234)
+            .workers(1)
+            .shuffle(true)
+            .build()
+            .unwrap();
+        loader
+            .filter_map(std::result::Result::ok)
+            .map(|img| img.to_f32().unwrap().iter().copied().collect())
+            .collect()
+    };
+
+    let first = run(&paths);
+    let second = run(&paths);
+    assert_eq!(first.len(), 3);
+    assert_eq!(first, second);
 }
 
 #[test]

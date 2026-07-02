@@ -672,18 +672,45 @@ impl NiftiHeader {
     /// Write header to bytes.
     ///
     /// Writes NIfTI-1 format by default. Use `to_bytes_v2()` for NIfTI-2.
-    /// Returns error if dimensions exceed NIfTI-1 limits (32767).
-    pub fn to_bytes(&self) -> Vec<u8> {
+    /// Returns an error for a NIfTI-1 header whose dimensions exceed the
+    /// format limit (`i16::MAX`); promote to NIfTI-2 first via
+    /// [`promoted_for_write`](Self::promoted_for_write).
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
         match self.version {
             NiftiVersion::Nifti1 => self.to_bytes_v1(),
-            NiftiVersion::Nifti2 => self.to_bytes_v2(),
+            NiftiVersion::Nifti2 => Ok(self.to_bytes_v2()),
+        }
+    }
+
+    /// Returns a copy promoted to NIfTI-2 when the dimensions do not fit
+    /// NIfTI-1. This keeps `save` lossless: a NIfTI-1 header carrying a
+    /// dimension above `i16::MAX` is widened rather than silently truncated.
+    pub fn promoted_for_write(&self) -> Self {
+        if self.version == NiftiVersion::Nifti1 && self.requires_nifti2() {
+            let mut promoted = self.clone();
+            promoted.version = NiftiVersion::Nifti2;
+            let min_offset = NiftiVersion::Nifti2.default_vox_offset();
+            if promoted.vox_offset < min_offset {
+                promoted.vox_offset = min_offset;
+            }
+            promoted
+        } else {
+            self.clone()
         }
     }
 
     /// Write NIfTI-1 format header.
     #[allow(clippy::wildcard_imports)]
-    fn to_bytes_v1(&self) -> Vec<u8> {
+    fn to_bytes_v1(&self) -> Result<Vec<u8>> {
         use offsets_v1::*;
+
+        if self.requires_nifti2() {
+            return Err(Error::InvalidDimensions(format!(
+                "dimensions {:?} exceed NIfTI-1 limit ({}); use NIfTI-2",
+                self.dim,
+                i16::MAX
+            )));
+        }
 
         let mut buf = vec![0u8; Self::SIZE];
 
@@ -693,9 +720,14 @@ impl NiftiHeader {
         LittleEndian::write_i16(&mut buf[DIM..DIM + 2], self.ndim as i16);
         for i in 0..7 {
             let offset = DIM + 2 + i * 2;
-            let dim_val = self.dim[i].min(i16::MAX as i64) as i16;
-            LittleEndian::write_i16(&mut buf[offset..offset + 2], dim_val);
+            LittleEndian::write_i16(&mut buf[offset..offset + 2], self.dim[i] as i16);
         }
+
+        // intent_code (downcast from i32 to i16)
+        LittleEndian::write_i16(
+            &mut buf[INTENT_CODE..INTENT_CODE + 2],
+            self.intent_code as i16,
+        );
 
         // datatype and bitpix
         LittleEndian::write_i16(&mut buf[DATATYPE..DATATYPE + 2], self.datatype as i16);
@@ -761,7 +793,7 @@ impl NiftiHeader {
         // magic
         buf[MAGIC..MAGIC + 4].copy_from_slice(b"n+1\0");
 
-        buf
+        Ok(buf)
     }
 
     /// Write NIfTI-2 format header.
@@ -902,70 +934,122 @@ impl NiftiHeader {
 
     /// Set affine from 4x4 matrix (f32 input for API compatibility).
     pub fn set_affine(&mut self, affine: [[f32; 4]; 4]) {
-        self.srow_x = [
-            affine[0][0] as f64,
-            affine[0][1] as f64,
-            affine[0][2] as f64,
-            affine[0][3] as f64,
-        ];
-        self.srow_y = [
-            affine[1][0] as f64,
-            affine[1][1] as f64,
-            affine[1][2] as f64,
-            affine[1][3] as f64,
-        ];
-        self.srow_z = [
-            affine[2][0] as f64,
-            affine[2][1] as f64,
-            affine[2][2] as f64,
-            affine[2][3] as f64,
-        ];
-        self.sform_code = 1;
-
-        // Also set pixdim from affine column norms (voxel spacing)
-        // pixdim[0] is qfac (usually 1.0), pixdim[1..4] are x/y/z spacing
-        let spacing_x = (affine[0][0] * affine[0][0]
-            + affine[1][0] * affine[1][0]
-            + affine[2][0] * affine[2][0])
-            .sqrt();
-        let spacing_y = (affine[0][1] * affine[0][1]
-            + affine[1][1] * affine[1][1]
-            + affine[2][1] * affine[2][1])
-            .sqrt();
-        let spacing_z = (affine[0][2] * affine[0][2]
-            + affine[1][2] * affine[1][2]
-            + affine[2][2] * affine[2][2])
-            .sqrt();
-
-        self.pixdim[1] = spacing_x as f64;
-        self.pixdim[2] = spacing_y as f64;
-        self.pixdim[3] = spacing_z as f64;
+        let mut a = [[0.0f64; 4]; 4];
+        for i in 0..4 {
+            for j in 0..4 {
+                a[i][j] = affine[i][j] as f64;
+            }
+        }
+        self.set_affine_f64(a);
     }
 
     /// Set affine from 4x4 matrix with f64 precision.
+    ///
+    /// Writes the sform rows, recomputes pixdim from the column norms, and
+    /// recomputes the qform quaternion from the same matrix so both the sform
+    /// and qform describe the new geometry. A reader that trusts either
+    /// representation sees consistent coordinates.
     pub fn set_affine_f64(&mut self, affine: [[f64; 4]; 4]) {
         self.srow_x = affine[0];
         self.srow_y = affine[1];
         self.srow_z = affine[2];
         self.sform_code = 1;
 
-        // Also set pixdim from affine column norms (voxel spacing)
-        let spacing_x = (affine[0][0] * affine[0][0]
-            + affine[1][0] * affine[1][0]
-            + affine[2][0] * affine[2][0])
-            .sqrt();
-        let spacing_y = (affine[0][1] * affine[0][1]
-            + affine[1][1] * affine[1][1]
-            + affine[2][1] * affine[2][1])
-            .sqrt();
-        let spacing_z = (affine[0][2] * affine[0][2]
-            + affine[1][2] * affine[1][2]
-            + affine[2][2] * affine[2][2])
-            .sqrt();
+        let spacing = [
+            (affine[0][0] * affine[0][0]
+                + affine[1][0] * affine[1][0]
+                + affine[2][0] * affine[2][0])
+                .sqrt(),
+            (affine[0][1] * affine[0][1]
+                + affine[1][1] * affine[1][1]
+                + affine[2][1] * affine[2][1])
+                .sqrt(),
+            (affine[0][2] * affine[0][2]
+                + affine[1][2] * affine[1][2]
+                + affine[2][2] * affine[2][2])
+                .sqrt(),
+        ];
+        self.pixdim[1] = spacing[0];
+        self.pixdim[2] = spacing[1];
+        self.pixdim[3] = spacing[2];
 
-        self.pixdim[1] = spacing_x;
-        self.pixdim[2] = spacing_y;
-        self.pixdim[3] = spacing_z;
+        self.set_qform_from_affine(affine, spacing);
+    }
+
+    /// Recompute the qform quaternion, offset, and qfac from a 4x4 affine.
+    ///
+    /// Follows the NIfTI-1 `nifti_mat44_to_quatern` decomposition: normalise the
+    /// direction columns, take `qfac` from the sign of the determinant, and
+    /// convert the resulting proper rotation to a unit quaternion. Keeps the
+    /// qform in sync with the sform written by [`Self::set_affine_f64`].
+    #[allow(clippy::many_single_char_names)]
+    fn set_qform_from_affine(&mut self, affine: [[f64; 4]; 4], spacing: [f64; 3]) {
+        // Normalised rotation columns (fall back to identity for a zero column).
+        let mut r = [[0.0f64; 3]; 3];
+        for j in 0..3 {
+            if spacing[j] > 0.0 {
+                for i in 0..3 {
+                    r[i][j] = affine[i][j] / spacing[j];
+                }
+            } else {
+                r[j][j] = 1.0;
+            }
+        }
+
+        // qfac from the determinant sign; negate the k column for a left-handed
+        // system so the remaining matrix is a proper rotation.
+        let det = r[0][0] * (r[1][1] * r[2][2] - r[2][1] * r[1][2])
+            - r[0][1] * (r[1][0] * r[2][2] - r[2][0] * r[1][2])
+            + r[0][2] * (r[1][0] * r[2][1] - r[2][0] * r[1][1]);
+        let qfac = if det < 0.0 { -1.0 } else { 1.0 };
+        if det < 0.0 {
+            for row in &mut r {
+                row[2] = -row[2];
+            }
+        }
+
+        // Rotation matrix to quaternion (a, b, c, d), a >= 0.
+        let trace = r[0][0] + r[1][1] + r[2][2];
+        let (a, b, c, d) = if trace > 0.0 {
+            let s = 0.5 / (trace + 1.0).sqrt();
+            (
+                0.25 / s,
+                (r[2][1] - r[1][2]) * s,
+                (r[0][2] - r[2][0]) * s,
+                (r[1][0] - r[0][1]) * s,
+            )
+        } else if r[0][0] > r[1][1] && r[0][0] > r[2][2] {
+            let s = 2.0 * (1.0 + r[0][0] - r[1][1] - r[2][2]).sqrt();
+            (
+                (r[2][1] - r[1][2]) / s,
+                0.25 * s,
+                (r[0][1] + r[1][0]) / s,
+                (r[0][2] + r[2][0]) / s,
+            )
+        } else if r[1][1] > r[2][2] {
+            let s = 2.0 * (1.0 + r[1][1] - r[0][0] - r[2][2]).sqrt();
+            (
+                (r[0][2] - r[2][0]) / s,
+                (r[0][1] + r[1][0]) / s,
+                0.25 * s,
+                (r[1][2] + r[2][1]) / s,
+            )
+        } else {
+            let s = 2.0 * (1.0 + r[2][2] - r[0][0] - r[1][1]).sqrt();
+            (
+                (r[1][0] - r[0][1]) / s,
+                (r[0][2] + r[2][0]) / s,
+                (r[1][2] + r[2][1]) / s,
+                0.25 * s,
+            )
+        };
+
+        // NIfTI stores b, c, d with a >= 0 (a is recovered as sqrt(1-b^2-c^2-d^2)).
+        let sign = if a < 0.0 { -1.0 } else { 1.0 };
+        self.quatern = [sign * b, sign * c, sign * d];
+        self.qoffset = [affine[0][3], affine[1][3], affine[2][3]];
+        self.pixdim[0] = qfac;
+        self.qform_code = 1;
     }
 
     /// Convert quaternion representation to affine matrix (f64 precision).
@@ -1060,19 +1144,28 @@ impl NiftiHeader {
                 return Err(Error::InvalidDimensions(format!("dimension {} is zero", i)));
             }
             let spacing = self.pixdim[i + 1];
-            if !spacing.is_finite() || spacing <= 0.0 {
+            if !spacing.is_finite() {
                 return Err(Error::InvalidDimensions(format!(
-                    "pixdim[{}] must be finite and > 0, got {}",
+                    "pixdim[{}] must be finite, got {}",
+                    i + 1,
+                    spacing
+                )));
+            }
+            // Positivity is only meaningful for spatial dimensions. Higher
+            // dimensions (e.g. time) commonly carry a zero pixdim to mean
+            // "unspecified", which is valid.
+            if i < 3 && spacing <= 0.0 {
+                return Err(Error::InvalidDimensions(format!(
+                    "pixdim[{}] must be > 0 for spatial dimensions, got {}",
                     i + 1,
                     spacing
                 )));
             }
         }
 
-        let vox_offset_f64 = self.vox_offset as f64;
-        if !vox_offset_f64.is_finite() {
+        if self.vox_offset < 0 {
             return Err(Error::InvalidDimensions(format!(
-                "vox_offset must be finite, got {}",
+                "vox_offset must be non-negative, got {}",
                 self.vox_offset
             )));
         }
@@ -1093,19 +1186,15 @@ impl NiftiHeader {
                 .ok_or_else(|| Error::InvalidDimensions("dimension product overflow".into()))?;
         }
 
-        voxels
+        let data_bytes = voxels
             .checked_mul(self.datatype.byte_size())
             .ok_or_else(|| Error::InvalidDimensions("data size overflow".into()))?;
 
-        // vox_offset should be aligned to element size for mmap compatibility
-        let vox_offset_int = self.vox_offset as usize;
-        let byte_size = self.datatype.byte_size();
-        if vox_offset_int % byte_size != 0 {
-            return Err(Error::InvalidDimensions(format!(
-                "vox_offset {} not aligned to element size {}",
-                self.vox_offset, byte_size
-            )));
-        }
+        // Bound vox_offset: an attacker-controlled vox_offset (e.g. 1e18) must
+        // not overflow when combined with the data size at the read sites.
+        (self.vox_offset as usize)
+            .checked_add(data_bytes)
+            .ok_or_else(|| Error::InvalidDimensions("vox_offset + data size overflow".into()))?;
 
         Ok(())
     }
@@ -1114,6 +1203,61 @@ impl NiftiHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_set_affine_syncs_qform_with_sform() {
+        // An oblique affine: rotation about z by 30 degrees, anisotropic
+        // spacing, and a translation. After set_affine_f64 the qform (via
+        // qform_to_affine_f64) must reproduce the same matrix as the sform.
+        let (cos, sin) = (30.0_f64.to_radians().cos(), 30.0_f64.to_radians().sin());
+        let sp = [1.5, 2.0, 3.0];
+        let affine = [
+            [cos * sp[0], -sin * sp[1], 0.0, 10.0],
+            [sin * sp[0], cos * sp[1], 0.0, -5.0],
+            [0.0, 0.0, sp[2], 7.5],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+
+        let mut header = NiftiHeader::default();
+        header.set_affine_f64(affine);
+
+        assert!(header.qform_code > 0, "qform should be populated");
+        let from_qform = header.qform_to_affine_f64();
+        for i in 0..3 {
+            for j in 0..4 {
+                assert!(
+                    (from_qform[i][j] - affine[i][j]).abs() < 1e-9,
+                    "qform[{i}][{j}]={} != affine {}",
+                    from_qform[i][j],
+                    affine[i][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_set_affine_qform_handles_left_handed() {
+        // A left-handed system (negative determinant) must round-trip through
+        // qfac = -1 rather than producing a bogus rotation.
+        let affine = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut header = NiftiHeader::default();
+        header.set_affine_f64(affine);
+        assert!(header.pixdim[0] < 0.0, "qfac should be negative");
+        let from_qform = header.qform_to_affine_f64();
+        for i in 0..3 {
+            for j in 0..4 {
+                assert!(
+                    (from_qform[i][j] - affine[i][j]).abs() < 1e-9,
+                    "left-handed qform[{i}][{j}] mismatch"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_temporal_units_from_code() {
@@ -1156,28 +1300,34 @@ mod tests {
 
     #[test]
     fn test_spacing_returns_vec() {
-        let mut header = NiftiHeader::default();
-        header.ndim = 3;
-        header.pixdim = [-1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0];
+        let header = NiftiHeader {
+            ndim: 3,
+            pixdim: [-1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+            ..Default::default()
+        };
         assert_eq!(header.spacing(), vec![2.0f32, 3.0, 4.0]);
     }
 
     #[test]
     fn test_shape_returns_vec() {
-        let mut header = NiftiHeader::default();
-        header.ndim = 3;
-        header.dim = [100, 200, 300, 1, 1, 1, 1];
+        let header = NiftiHeader {
+            ndim: 3,
+            dim: [100, 200, 300, 1, 1, 1, 1],
+            ..Default::default()
+        };
         assert_eq!(header.shape(), vec![100usize, 200, 300]);
     }
 
     #[test]
     fn test_nifti1_roundtrip() {
-        let mut header = NiftiHeader::default();
-        header.ndim = 3;
-        header.dim = [64, 64, 64, 1, 1, 1, 1];
-        header.pixdim = [-1.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0];
+        let header = NiftiHeader {
+            ndim: 3,
+            dim: [64, 64, 64, 1, 1, 1, 1],
+            pixdim: [-1.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0],
+            ..Default::default()
+        };
 
-        let bytes = header.to_bytes();
+        let bytes = header.to_bytes().unwrap();
         assert_eq!(bytes.len(), 348);
 
         let parsed = NiftiHeader::from_bytes(&bytes).unwrap();
@@ -1188,12 +1338,14 @@ mod tests {
 
     #[test]
     fn test_nifti2_roundtrip() {
-        let mut header = NiftiHeader::default();
-        header.version = NiftiVersion::Nifti2;
-        header.ndim = 3;
-        header.dim = [100000, 100000, 100, 1, 1, 1, 1]; // Exceeds NIfTI-1 limit
-        header.pixdim = [-1.0, 0.5, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0];
-        header.vox_offset = 544;
+        let header = NiftiHeader {
+            version: NiftiVersion::Nifti2,
+            ndim: 3,
+            dim: [100000, 100000, 100, 1, 1, 1, 1], // Exceeds NIfTI-1 limit
+            pixdim: [-1.0, 0.5, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0],
+            vox_offset: 544,
+            ..Default::default()
+        };
 
         assert!(header.requires_nifti2());
 
@@ -1249,8 +1401,10 @@ mod tests {
 
     #[test]
     fn test_requires_nifti2() {
-        let mut header = NiftiHeader::default();
-        header.dim = [100, 100, 100, 1, 1, 1, 1];
+        let mut header = NiftiHeader {
+            dim: [100, 100, 100, 1, 1, 1, 1],
+            ..Default::default()
+        };
         assert!(!header.requires_nifti2());
 
         header.dim[0] = 50000; // Exceeds i16::MAX (32767)
