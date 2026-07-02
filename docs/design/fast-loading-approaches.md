@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # Alternative loading strategies for mmap-style speed on compressed volumes
 
 Status: design research, no code changes. Written 2026-07-02.

@@ -133,6 +133,14 @@ manual_is_multiple_of = "allow"
 option_map_or_none = "allow"
 map_unwrap_or = "allow"
 needless_pass_by_value = "allow"
+# Style and nursery lints that flap between clippy versions. Allowing them keeps
+# CI stable regardless of which stable clippy runs (the nursery group in
+# particular is explicitly unstable).
+cognitive_complexity = "allow"
+comparison_chain = "allow"
+manual_is_finite = "allow"
+redundant_clone = "allow"
+unnested_or_patterns = "allow"
 float_cmp = "allow"
 wildcard_enum_match_arm = "allow"
 explicit_iter_loop = "allow"
