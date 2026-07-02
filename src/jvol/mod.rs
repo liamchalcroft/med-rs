@@ -17,6 +17,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+use bincode::Options;
 use ndarray::{Array3, ArrayD, Axis, Ix3, ShapeBuilder, Zip};
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +86,45 @@ struct MedrsJvolFile {
     original_datatype: i16,
     scl_slope: f64,
     scl_inter: f64,
+}
+
+/// Maximum decompressed size accepted for a single `.jvol` file's bincode
+/// payload. A `.jvol` file is untrusted external input, so its zstd stream
+/// must not be trusted to decompress to a bounded size; without this cap, a
+/// small hostile file could decompress to an arbitrarily large buffer (a
+/// decompression bomb) before its contents are even parsed. 8 GiB is
+/// generous relative to any real encoded volume (the entropy-coded subband
+/// bytes are always far smaller than the raw voxel data they represent) but
+/// still bounds the allocation to a fixed size.
+const MAX_JVOL_DECOMPRESSED: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Read, size-bounded zstd-decompress, and bincode-deserialize a `.jvol`
+/// file's container. Shared by [`load_as`] and [`load_downsampled_as`] so
+/// both paths get the same decompression-bomb and oversized-length-prefix
+/// defenses: the zstd output is capped at [`MAX_JVOL_DECOMPRESSED`] bytes via
+/// `Read::take`, and bincode itself is configured with a matching byte limit
+/// so a corrupt/hostile length prefix inside the payload (e.g. a `Vec` field
+/// claiming an enormous element count) is rejected instead of driving an
+/// oversized allocation.
+fn read_jvol_file(path: &Path) -> Result<MedrsJvolFile> {
+    let input = File::open(path)?;
+    let decoder = zstd::Decoder::new(BufReader::new(input))?;
+    let mut limited = decoder.take(MAX_JVOL_DECOMPRESSED);
+    let mut buf = Vec::new();
+    limited.read_to_end(&mut buf)?;
+    if buf.len() as u64 >= MAX_JVOL_DECOMPRESSED {
+        return Err(Error::InvalidFileFormat(format!(
+            "jvol file decompresses to at least the {MAX_JVOL_DECOMPRESSED}-byte cap; \
+             refusing to load a possible decompression bomb"
+        )));
+    }
+
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .with_limit(MAX_JVOL_DECOMPRESSED)
+        .deserialize(&buf)
+        .map_err(|e| Error::InvalidFileFormat(format!("jvol deserialization failed: {e}")))
 }
 
 fn is_integer_dtype(dtype: DataType) -> bool {
@@ -250,13 +290,7 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<NiftiImage> {
 /// Lossy encoding of integer *source* data is still rejected at [`save`] time,
 /// unchanged by this override.
 pub fn load_as<P: AsRef<Path>>(path: P, dtype: Option<DataType>) -> Result<NiftiImage> {
-    let input = File::open(path.as_ref())?;
-    let mut decoder = zstd::Decoder::new(BufReader::new(input))?;
-    let mut buf = Vec::new();
-    decoder.read_to_end(&mut buf)?;
-
-    let file: MedrsJvolFile = bincode::deserialize(&buf)
-        .map_err(|e| Error::InvalidFileFormat(format!("jvol deserialization failed: {e}")))?;
+    let file = read_jvol_file(path.as_ref())?;
 
     let original_datatype = DataType::from_code(file.original_datatype)?;
     let target_datatype = dtype.unwrap_or(original_datatype);
@@ -269,32 +303,38 @@ pub fn load_as<P: AsRef<Path>>(path: P, dtype: Option<DataType>) -> Result<Nifti
     let mut image = if meta.quality != 0 && lossy_f32_target(target_datatype) {
         let mut channels = Vec::with_capacity(file.encoded.channels.len());
         for ch in &file.encoded.channels {
-            channels.push(decode_lossy_f32(
-                &ch.subbands,
-                meta.shape,
-                meta.wavelet,
-                meta.levels,
-                ch.step,
-                ch.intercept,
-                ch.slope,
-                meta.dtype,
-            ));
+            channels.push(
+                decode_lossy_f32(
+                    &ch.subbands,
+                    meta.shape,
+                    meta.wavelet,
+                    meta.levels,
+                    ch.step,
+                    ch.intercept,
+                    ch.slope,
+                    meta.dtype,
+                )
+                .map_err(|e| Error::InvalidFileFormat(e.to_string()))?,
+            );
         }
         build_typed_image_f32(channels, target_datatype, file.scl_slope, file.scl_inter)?
     } else {
         let mut channels = Vec::with_capacity(file.encoded.channels.len());
         for ch in &file.encoded.channels {
-            channels.push(decode_array(
-                &ch.subbands,
-                meta.shape,
-                meta.wavelet,
-                meta.levels,
-                ch.step,
-                ch.intercept,
-                ch.slope,
-                meta.quality,
-                meta.dtype,
-            ));
+            channels.push(
+                decode_array(
+                    &ch.subbands,
+                    meta.shape,
+                    meta.wavelet,
+                    meta.levels,
+                    ch.step,
+                    ch.intercept,
+                    ch.slope,
+                    meta.quality,
+                    meta.dtype,
+                )
+                .map_err(|e| Error::InvalidFileFormat(e.to_string()))?,
+            );
         }
         build_typed_image(channels, target_datatype, file.scl_slope, file.scl_inter)?
     };
@@ -347,13 +387,7 @@ pub fn load_downsampled_as<P: AsRef<Path>>(
         return load_as(path, dtype);
     }
 
-    let input = File::open(path.as_ref())?;
-    let mut decoder = zstd::Decoder::new(BufReader::new(input))?;
-    let mut buf = Vec::new();
-    decoder.read_to_end(&mut buf)?;
-
-    let file: MedrsJvolFile = bincode::deserialize(&buf)
-        .map_err(|e| Error::InvalidFileFormat(format!("jvol deserialization failed: {e}")))?;
+    let file = read_jvol_file(path.as_ref())?;
 
     let original_datatype = DataType::from_code(file.original_datatype)?;
     let target_datatype = dtype.unwrap_or(original_datatype);
@@ -379,16 +413,19 @@ pub fn load_downsampled_as<P: AsRef<Path>>(
 
     let mut channels = Vec::with_capacity(file.encoded.channels.len());
     for ch in &file.encoded.channels {
-        channels.push(decode_downsampled_f32(
-            &ch.subbands,
-            meta.shape,
-            meta.wavelet,
-            meta.levels,
-            ch.step,
-            ch.intercept,
-            ch.slope,
-            factor,
-        ));
+        channels.push(
+            decode_downsampled_f32(
+                &ch.subbands,
+                meta.shape,
+                meta.wavelet,
+                meta.levels,
+                ch.step,
+                ch.intercept,
+                ch.slope,
+                factor,
+            )
+            .map_err(|e| Error::InvalidFileFormat(e.to_string()))?,
+        );
     }
 
     let mut image =

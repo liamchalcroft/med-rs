@@ -2,9 +2,11 @@
 
 #![cfg(feature = "jvol")]
 
+use bincode::Options;
 use medrs::jvol::{self, JvolOptions};
 use medrs::nifti::{self, DataType, NiftiImage};
 use ndarray::{Array4, ArrayD, IxDyn};
+use std::io::Write;
 use tempfile::NamedTempFile;
 
 // The jvol codec indexes arrays logically ([i, j, k]), not by physical memory
@@ -779,4 +781,386 @@ fn dot_jvol_extension_dispatches_through_nifti_load_save() {
     let orig = img.as_array::<f32>().unwrap();
     let round = loaded.as_array::<f32>().unwrap();
     assert_eq!(orig, round);
+}
+
+// ============================================================================
+// Hardening: malformed/malicious `.jvol` input must return Err, never panic
+// or allocate unboundedly. `medrs::jvol`'s on-disk container types are
+// crate-private, so these tests build a wire-compatible mirror of the
+// bincode-serialized container (same field names, order, and types) to
+// synthesize hostile files without needing access to the private types.
+// Bincode's fixint encoding is purely positional, so a mirror struct
+// serializes to bytes the real (private) deserializer parses identically.
+// ============================================================================
+
+#[derive(serde::Serialize)]
+struct MirrorJvolFile {
+    encoded: MirrorEncodedVolume,
+    original_datatype: i16,
+    scl_slope: f64,
+    scl_inter: f64,
+}
+
+#[derive(serde::Serialize)]
+struct MirrorEncodedVolume {
+    metadata: MirrorMetadata,
+    channels: Vec<MirrorChannel>,
+}
+
+#[derive(serde::Serialize)]
+struct MirrorMetadata {
+    shape: [usize; 3],
+    num_channels: usize,
+    ijk_to_ras: [[f64; 4]; 4],
+    dtype: MirrorDtype,
+    wavelet: MirrorWavelet,
+    levels: usize,
+    quality: u8,
+}
+
+#[derive(serde::Serialize)]
+#[allow(dead_code)] // variant order/coverage mirrors the private JvolDtype; not every variant is exercised
+enum MirrorDtype {
+    U8,
+    U16,
+    I16,
+    I32,
+    F32,
+    F64,
+}
+
+#[derive(serde::Serialize)]
+enum MirrorWavelet {
+    LeGall53,
+    Cdf97,
+}
+
+#[derive(serde::Serialize)]
+struct MirrorChannel {
+    subbands: Vec<MirrorSubband>,
+    intercept: f64,
+    slope: f64,
+    step: f64,
+}
+
+#[derive(serde::Serialize)]
+struct MirrorSubband {
+    rice_k: u8,
+    num_values: u32,
+    data: Vec<u8>,
+}
+
+const MIRROR_IDENTITY_AFFINE: [[f64; 4]; 4] = [
+    [1.0, 0.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0, 0.0],
+    [0.0, 0.0, 0.0, 1.0],
+];
+
+/// Serialize a [`MirrorJvolFile`] with the same bincode options `medrs::jvol`
+/// uses (fixint encoding, trailing bytes allowed) and zstd-compress it to
+/// `path`, producing a file the crate's private loader will parse as a real
+/// `.jvol` container.
+fn write_malicious_jvol(path: &std::path::Path, file: &MirrorJvolFile) {
+    let payload = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .allow_trailing_bytes()
+        .serialize(file)
+        .expect("mirror struct must serialize");
+    let out = std::fs::File::create(path).unwrap();
+    let mut encoder = zstd::Encoder::new(out, 3).unwrap();
+    encoder.write_all(&payload).unwrap();
+    encoder.finish().unwrap();
+}
+
+#[test]
+fn load_rejects_absurd_shape_metadata() {
+    let file = MirrorJvolFile {
+        encoded: MirrorEncodedVolume {
+            metadata: MirrorMetadata {
+                shape: [usize::MAX / 2, 4, 4],
+                num_channels: 1,
+                ijk_to_ras: MIRROR_IDENTITY_AFFINE,
+                dtype: MirrorDtype::U8,
+                wavelet: MirrorWavelet::LeGall53,
+                levels: 0,
+                quality: 0,
+            },
+            channels: vec![MirrorChannel {
+                subbands: vec![MirrorSubband {
+                    rice_k: 255,
+                    num_values: 64,
+                    data: vec![0u8; 64],
+                }],
+                intercept: 0.0,
+                slope: 1.0,
+                step: 1.0,
+            }],
+        },
+        original_datatype: DataType::UInt8 as i16,
+        scl_slope: 1.0,
+        scl_inter: 0.0,
+    };
+
+    let path = jvol_path();
+    write_malicious_jvol(path.path(), &file);
+    assert!(
+        jvol::load(path.path()).is_err(),
+        "a shape that overflows on multiplication must return Err, not panic or allocate"
+    );
+}
+
+#[test]
+fn load_rejects_absurd_but_non_overflowing_shape_metadata() {
+    // A shape that does not overflow `usize` multiplication but still
+    // describes an absurd number of voxels (well beyond any real medical
+    // volume) must also be rejected, bounding the allocation.
+    let file = MirrorJvolFile {
+        encoded: MirrorEncodedVolume {
+            metadata: MirrorMetadata {
+                shape: [1 << 16, 1 << 16, 1 << 16],
+                num_channels: 1,
+                ijk_to_ras: MIRROR_IDENTITY_AFFINE,
+                dtype: MirrorDtype::U8,
+                wavelet: MirrorWavelet::LeGall53,
+                levels: 0,
+                quality: 0,
+            },
+            channels: vec![MirrorChannel {
+                subbands: vec![MirrorSubband {
+                    rice_k: 255,
+                    num_values: 64,
+                    data: vec![0u8; 64],
+                }],
+                intercept: 0.0,
+                slope: 1.0,
+                step: 1.0,
+            }],
+        },
+        original_datatype: DataType::UInt8 as i16,
+        scl_slope: 1.0,
+        scl_inter: 0.0,
+    };
+
+    let path = jvol_path();
+    write_malicious_jvol(path.path(), &file);
+    assert!(
+        jvol::load(path.path()).is_err(),
+        "an absurdly large but non-overflowing shape must still be rejected"
+    );
+}
+
+#[test]
+fn load_rejects_wrong_subband_count_lossless() {
+    // Lossless mode expects exactly one encoded block; declaring two is
+    // malformed metadata.
+    let file = MirrorJvolFile {
+        encoded: MirrorEncodedVolume {
+            metadata: MirrorMetadata {
+                shape: [2, 2, 2],
+                num_channels: 1,
+                ijk_to_ras: MIRROR_IDENTITY_AFFINE,
+                dtype: MirrorDtype::U8,
+                wavelet: MirrorWavelet::LeGall53,
+                levels: 0,
+                quality: 0,
+            },
+            channels: vec![MirrorChannel {
+                subbands: vec![
+                    MirrorSubband {
+                        rice_k: 255,
+                        num_values: 8,
+                        data: vec![0u8; 8],
+                    },
+                    MirrorSubband {
+                        rice_k: 255,
+                        num_values: 8,
+                        data: vec![0u8; 8],
+                    },
+                ],
+                intercept: 0.0,
+                slope: 1.0,
+                step: 1.0,
+            }],
+        },
+        original_datatype: DataType::UInt8 as i16,
+        scl_slope: 1.0,
+        scl_inter: 0.0,
+    };
+
+    let path = jvol_path();
+    write_malicious_jvol(path.path(), &file);
+    assert!(
+        jvol::load(path.path()).is_err(),
+        "a lossless file with more than one encoded block must return Err"
+    );
+}
+
+#[test]
+fn load_rejects_mismatched_num_values_lossy() {
+    // A lossy volume with a single detail level (levels=1) always has 7*1+1=8
+    // subbands; supplying only one, and declaring a `num_values` that doesn't
+    // match its own subband shape, must be rejected rather than misdecoded.
+    let file = MirrorJvolFile {
+        encoded: MirrorEncodedVolume {
+            metadata: MirrorMetadata {
+                shape: [8, 8, 8],
+                num_channels: 1,
+                ijk_to_ras: MIRROR_IDENTITY_AFFINE,
+                dtype: MirrorDtype::F32,
+                wavelet: MirrorWavelet::Cdf97,
+                levels: 1,
+                quality: 60,
+            },
+            channels: vec![MirrorChannel {
+                subbands: (0..8)
+                    .map(|_| MirrorSubband {
+                        rice_k: 0,
+                        num_values: 999_999, // does not match any real subband's voxel count
+                        data: vec![0u8; 16],
+                    })
+                    .collect(),
+                intercept: 0.0,
+                slope: 1.0,
+                step: 1.0,
+            }],
+        },
+        original_datatype: DataType::Float32 as i16,
+        scl_slope: 1.0,
+        scl_inter: 0.0,
+    };
+
+    let path = jvol_path();
+    write_malicious_jvol(path.path(), &file);
+    assert!(
+        jvol::load(path.path()).is_err(),
+        "a subband num_values that doesn't match its declared shape must return Err"
+    );
+}
+
+#[test]
+fn load_rejects_truncated_lossless_file() {
+    let shape = vec![12, 10, 8];
+    let n = 12 * 10 * 8;
+    let data: Vec<i16> = (0..n).map(|i| (i as i16) * 3 - 200).collect();
+    let arr = make_array(data, &shape);
+    let img = NiftiImage::from_array(arr, AFFINE);
+
+    let file = jvol_path();
+    jvol::save(&img, file.path(), JvolOptions::lossless()).unwrap();
+    let bytes = std::fs::read(file.path()).unwrap();
+    assert!(bytes.len() > 8, "test fixture file is unexpectedly tiny");
+
+    for cut in [0, 1, 4, bytes.len() / 4, bytes.len() / 2, bytes.len() - 1] {
+        std::fs::write(file.path(), &bytes[..cut]).unwrap();
+        assert!(
+            jvol::load(file.path()).is_err(),
+            "truncated lossless jvol (cut at {cut}/{}) must return Err, not panic",
+            bytes.len()
+        );
+    }
+}
+
+#[test]
+fn load_rejects_truncated_lossy_file() {
+    let shape = vec![24, 20, 16];
+    let n = 24 * 20 * 16;
+    let data: Vec<f32> = (0..n)
+        .map(|i| {
+            let x = (i % 24) as f32 / 24.0;
+            let y = ((i / 24) % 20) as f32 / 20.0;
+            let z = (i / (24 * 20)) as f32 / 16.0;
+            ((x * 6.0).sin() + (y * 5.0).cos() + (z * 7.0).sin()) * 300.0 + 500.0
+        })
+        .collect();
+    let arr = make_array(data, &shape);
+    let img = NiftiImage::from_array(arr, AFFINE);
+
+    let file = jvol_path();
+    jvol::save(&img, file.path(), JvolOptions::lossy(60)).unwrap();
+    let bytes = std::fs::read(file.path()).unwrap();
+    assert!(bytes.len() > 8, "test fixture file is unexpectedly tiny");
+
+    for cut in [0, 1, 4, bytes.len() / 4, bytes.len() / 2, bytes.len() - 1] {
+        std::fs::write(file.path(), &bytes[..cut]).unwrap();
+        assert!(
+            jvol::load(file.path()).is_err(),
+            "truncated lossy jvol (cut at {cut}/{}) must return Err, not panic",
+            bytes.len()
+        );
+    }
+}
+
+// This test genuinely drives the decompressed buffer up to the crate's 8 GiB
+// cap before the rejection fires (that allocation is the point: it proves the
+// cap, not a shortcut, is what stops it), so it takes real time and memory.
+// Ignored by default; run explicitly to verify the decompression-bomb defense
+// end-to-end: `cargo test --features jvol --test test_jvol -- --ignored
+// load_rejects_decompression_bomb`.
+#[test]
+#[ignore = "drives a real allocation up to the 8 GiB decompression cap; run explicitly"]
+fn load_rejects_decompression_bomb() {
+    // A tiny valid file followed by a concatenated zstd frame that
+    // decompresses to far more than the crate's decompressed-size cap: zstd
+    // treats concatenated frames as one continuous stream, so this
+    // reproduces a genuine decompression bomb end-to-end through the public
+    // `load` API. The bomb frame is streamed from `io::repeat` in chunks so
+    // the test itself never materializes gigabytes of data.
+    let shape = vec![4, 4, 4];
+    let data: Vec<f32> = (0..64).map(|i| i as f32).collect();
+    let arr = make_array(data, &shape);
+    let img = NiftiImage::from_array(arr, AFFINE);
+
+    let file = jvol_path();
+    jvol::save(&img, file.path(), JvolOptions::lossless()).unwrap();
+    let mut bytes = std::fs::read(file.path()).unwrap();
+
+    // One byte over the crate's 8 GiB decompressed-size cap.
+    let bomb_size: u64 = 8 * 1024 * 1024 * 1024 + 1;
+    let mut encoder = zstd::Encoder::new(Vec::new(), 1).unwrap();
+    let chunk = vec![0u8; 1 << 20];
+    let mut remaining = bomb_size;
+    while remaining > 0 {
+        let n = remaining.min(chunk.len() as u64) as usize;
+        encoder.write_all(&chunk[..n]).unwrap();
+        remaining -= n as u64;
+    }
+    let bomb_frame = encoder.finish().unwrap();
+    bytes.extend_from_slice(&bomb_frame);
+    std::fs::write(file.path(), &bytes).unwrap();
+
+    assert!(
+        jvol::load(file.path()).is_err(),
+        "a file decompressing past the size cap must return Err, not allocate unboundedly"
+    );
+}
+
+#[test]
+fn valid_files_still_round_trip_after_hardening() {
+    // Sanity check alongside the malicious-input tests above: valid lossy
+    // and lossless files still decode to the exact same content.
+    let shape = vec![10, 9, 8];
+    let n = 10 * 9 * 8;
+
+    let int_data: Vec<i16> = (0..n).map(|i| (i as i16) * 7 - 300).collect();
+    let int_img = NiftiImage::from_array(make_array(int_data, &shape), AFFINE);
+    let lossless_file = jvol_path();
+    jvol::save(&int_img, lossless_file.path(), JvolOptions::lossless()).unwrap();
+    let loaded = jvol::load(lossless_file.path()).unwrap();
+    assert_eq!(
+        loaded.as_array::<i16>().unwrap(),
+        int_img.as_array::<i16>().unwrap()
+    );
+
+    let float_data: Vec<f32> = (0..n).map(|i| (i as f32 * 0.09).sin() * 200.0).collect();
+    let float_img = NiftiImage::from_array(make_array(float_data, &shape), AFFINE);
+    let lossy_file = jvol_path();
+    jvol::save(&float_img, lossy_file.path(), JvolOptions::lossy(60)).unwrap();
+    let loaded_lossy_a = jvol::load(lossy_file.path()).unwrap();
+    let loaded_lossy_b = jvol::load(lossy_file.path()).unwrap();
+    assert_eq!(
+        loaded_lossy_a.to_f64().unwrap(),
+        loaded_lossy_b.to_f64().unwrap(),
+        "decoding the same valid lossy file twice must be deterministic/identical"
+    );
 }

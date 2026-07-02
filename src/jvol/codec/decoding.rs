@@ -1,9 +1,84 @@
 use ndarray::Array3;
 
 use super::entropy::rice_decode_subband;
-use super::subbands::{compute_subbands, inject_subband_i32, inject_subband_i32_f32};
+use super::subbands::{compute_subbands, inject_subband_i32, inject_subband_i32_f32, SubbandInfo};
 use super::types::{EncodedSubband, JvolDtype};
 use super::wavelet::{downsample_dc_gain, dwt3d_inverse, dwt3d_inverse_g, WaveletType};
+
+/// Error produced when a codec decode path encounters malformed or truncated
+/// `.jvol` input. `src/jvol/mod.rs` maps this to `Error::InvalidFileFormat`
+/// at the crate's public API boundary; a `.jvol` file is untrusted external
+/// input, so every decode entry point that touches its bytes returns this
+/// instead of panicking or indexing out of bounds.
+#[derive(Debug, Clone)]
+pub struct CodecError(pub String);
+
+impl std::fmt::Display for CodecError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CodecError {}
+
+/// Result alias for codec decode paths; see [`CodecError`].
+pub type CodecResult<T> = Result<T, CodecError>;
+
+/// Sanity cap on the total voxel count of a single decoded channel, checked
+/// before any array allocation. Chosen so the worst-case f64 allocation
+/// (`decode_lossless`, `decode_lossy`) stays on the same order of magnitude
+/// as the decompressed-file cap in `src/jvol/mod.rs` (8 GiB): 1024^3 voxels
+/// is already an unusually large medical volume, and no legitimate `.jvol`
+/// file comes close to this, so the cap only ever rejects hostile metadata.
+const MAX_VOXEL_COUNT: usize = 1usize << 30; // 1,073,741,824 voxels (1024^3)
+
+/// Sanity cap on the wavelet decomposition level count. A real `.jvol` file
+/// never exceeds 6 (see `wavelet::compute_max_levels`); this cap is far more
+/// generous but still bounds the per-level extent/subband bookkeeping
+/// allocations against an absurd `levels` value in untrusted metadata.
+const MAX_LEVELS: usize = 32;
+
+/// Validate a volume shape from untrusted metadata before it drives any
+/// allocation, returning the total voxel count on success.
+fn validate_shape(shape: [usize; 3]) -> CodecResult<usize> {
+    let [ni, nj, nk] = shape;
+    let voxels = ni
+        .checked_mul(nj)
+        .and_then(|v| v.checked_mul(nk))
+        .ok_or_else(|| CodecError(format!("jvol shape overflows: {ni}x{nj}x{nk}")))?;
+    if voxels > MAX_VOXEL_COUNT {
+        return Err(CodecError(format!(
+            "jvol shape too large: {ni}x{nj}x{nk} = {voxels} voxels exceeds the {MAX_VOXEL_COUNT} cap"
+        )));
+    }
+    Ok(voxels)
+}
+
+/// Validate a decomposition level count from untrusted metadata.
+fn validate_levels(levels: usize) -> CodecResult<()> {
+    if levels > MAX_LEVELS {
+        return Err(CodecError(format!(
+            "jvol levels too large: {levels} exceeds the {MAX_LEVELS} cap"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate that an encoded subband's declared `num_values` matches the
+/// voxel count its `SubbandInfo` expects, before it is used to preallocate
+/// the Rice-decoded coefficient buffer. `info.shape` is itself derived from
+/// an already-[`validate_shape`]d volume shape, so the returned count is
+/// bounded by [`MAX_VOXEL_COUNT`].
+fn validated_num_values(encoded: &EncodedSubband, info: &SubbandInfo) -> CodecResult<usize> {
+    let expected = info.shape[0] * info.shape[1] * info.shape[2];
+    let got = encoded.num_values as usize;
+    if got != expected {
+        return Err(CodecError(format!(
+            "jvol subband num_values mismatch: expected {expected}, got {got}"
+        )));
+    }
+    Ok(expected)
+}
 
 /// Decode encoded subbands back into a 3D array.
 #[allow(clippy::too_many_arguments)]
@@ -17,7 +92,7 @@ pub fn decode_array(
     slope: f64,
     quality: u8,
     dtype: JvolDtype,
-) -> Array3<f64> {
+) -> CodecResult<Array3<f64>> {
     if quality == 0 {
         decode_lossless(subbands, shape, dtype)
     } else {
@@ -32,12 +107,14 @@ fn decode_lossless(
     subbands: &[EncodedSubband],
     shape: [usize; 3],
     dtype: JvolDtype,
-) -> Array3<f64> {
-    assert_eq!(
-        subbands.len(),
-        1,
-        "Lossless mode expects single encoded block"
-    );
+) -> CodecResult<Array3<f64>> {
+    if subbands.len() != 1 {
+        return Err(CodecError(format!(
+            "jvol lossless mode expects exactly one encoded block, got {}",
+            subbands.len()
+        )));
+    }
+    let voxel_count = validate_shape(shape)?;
     let sub = &subbands[0];
     let [ni, nj, nk] = shape;
 
@@ -47,6 +124,7 @@ fn decode_lossless(
         JvolDtype::U8 => {
             let mut vals = sub.data.clone();
             delta_decode_u8(&mut vals);
+            require_len(vals.len(), voxel_count, "U8")?;
             let mut idx = 0;
             for k in 0..nk {
                 for j in 0..nj {
@@ -61,6 +139,7 @@ fn decode_lossless(
             let unshuffled = byte_unshuffle(&sub.data, 2);
             let mut vals = from_le_bytes_u16(&unshuffled);
             delta_decode_u16(&mut vals);
+            require_len(vals.len(), voxel_count, "U16")?;
             let mut idx = 0;
             for k in 0..nk {
                 for j in 0..nj {
@@ -75,6 +154,7 @@ fn decode_lossless(
             let unshuffled = byte_unshuffle(&sub.data, 2);
             let mut vals = from_le_bytes_i16(&unshuffled);
             delta_decode_i16(&mut vals);
+            require_len(vals.len(), voxel_count, "I16")?;
             let mut idx = 0;
             for k in 0..nk {
                 for j in 0..nj {
@@ -89,6 +169,7 @@ fn decode_lossless(
             let unshuffled = byte_unshuffle(&sub.data, 4);
             let mut vals = from_le_bytes_i32(&unshuffled);
             delta_decode_i32(&mut vals);
+            require_len(vals.len(), voxel_count, "I32")?;
             let mut idx = 0;
             for k in 0..nk {
                 for j in 0..nj {
@@ -100,6 +181,10 @@ fn decode_lossless(
             }
         }
         JvolDtype::F32 => {
+            let needed_bytes = voxel_count
+                .checked_mul(4)
+                .ok_or_else(|| CodecError("jvol F32 subband size overflows".to_string()))?;
+            require_len(sub.data.len(), needed_bytes, "F32")?;
             // Raw f32 bytes in Fortran order
             let mut idx = 0;
             for k in 0..nk {
@@ -119,6 +204,10 @@ fn decode_lossless(
             }
         }
         JvolDtype::F64 => {
+            let needed_bytes = voxel_count
+                .checked_mul(8)
+                .ok_or_else(|| CodecError("jvol F64 subband size overflows".to_string()))?;
+            require_len(sub.data.len(), needed_bytes, "F64")?;
             // Raw f64 bytes in Fortran order
             let mut idx = 0;
             for k in 0..nk {
@@ -143,7 +232,20 @@ fn decode_lossless(
         }
     }
 
-    array
+    Ok(array)
+}
+
+/// Reject a decoded/raw buffer shorter than the volume requires, naming the
+/// dtype for a useful error message. Used throughout [`decode_lossless`] in
+/// place of the direct indexing that would otherwise panic on truncated or
+/// undersized subband data.
+fn require_len(got: usize, needed: usize, what: &str) -> CodecResult<()> {
+    if got < needed {
+        return Err(CodecError(format!(
+            "jvol lossless {what} subband too short: expected at least {needed}, got {got}"
+        )));
+    }
+    Ok(())
 }
 
 // --- Byte unshuffle ---
@@ -206,6 +308,17 @@ fn from_le_bytes_i32(data: &[u8]) -> Vec<i32> {
         .collect()
 }
 
+/// Check that the decoded subband count matches what the (already-validated)
+/// shape and levels imply, naming both counts for a useful error message.
+fn require_subband_count(got: usize, expected: usize) -> CodecResult<()> {
+    if got != expected {
+        return Err(CodecError(format!(
+            "jvol subband count mismatch: expected {expected}, got {got}"
+        )));
+    }
+    Ok(())
+}
+
 /// Lossy decode: Rice decode → inverse DWT → denormalize.
 #[allow(clippy::too_many_arguments)]
 fn decode_lossy(
@@ -217,19 +330,17 @@ fn decode_lossy(
     intercept: f64,
     slope: f64,
     dtype: JvolDtype,
-) -> Array3<f64> {
+) -> CodecResult<Array3<f64>> {
+    validate_shape(shape)?;
+    validate_levels(levels)?;
     let subband_infos = compute_subbands(shape, levels);
-    assert_eq!(
-        subbands.len(),
-        subband_infos.len(),
-        "Subband count mismatch"
-    );
+    require_subband_count(subbands.len(), subband_infos.len())?;
 
     let mut data = Array3::zeros((shape[0], shape[1], shape[2]));
 
     for (encoded, info) in subbands.iter().zip(subband_infos.iter()) {
-        let coefficients =
-            rice_decode_subband(&encoded.data, encoded.num_values as usize, encoded.rice_k);
+        let num_values = validated_num_values(encoded, info)?;
+        let coefficients = rice_decode_subband(&encoded.data, num_values, encoded.rice_k)?;
         inject_subband_i32(&mut data, info, &coefficients);
     }
 
@@ -251,7 +362,7 @@ fn decode_lossy(
         data.mapv_inplace(|v| v.max(min_val).min(max_val));
     }
 
-    data
+    Ok(data)
 }
 
 /// f32 lossy decode: same pipeline as [`decode_lossy`] but keeps coefficients,
@@ -271,21 +382,19 @@ pub fn decode_lossy_f32(
     intercept: f64,
     slope: f64,
     dtype: JvolDtype,
-) -> Array3<f32> {
+) -> CodecResult<Array3<f32>> {
+    validate_shape(shape)?;
+    validate_levels(levels)?;
     let subband_infos = compute_subbands(shape, levels);
-    assert_eq!(
-        subbands.len(),
-        subband_infos.len(),
-        "Subband count mismatch"
-    );
+    require_subband_count(subbands.len(), subband_infos.len())?;
 
     let mut data = Array3::<f32>::zeros((shape[0], shape[1], shape[2]));
     let step_f32 = step as f32;
 
     // Rice decode + dequantize (fused into one pass per subband).
     for (encoded, info) in subbands.iter().zip(subband_infos.iter()) {
-        let coefficients =
-            rice_decode_subband(&encoded.data, encoded.num_values as usize, encoded.rice_k);
+        let num_values = validated_num_values(encoded, info)?;
+        let coefficients = rice_decode_subband(&encoded.data, num_values, encoded.rice_k)?;
         inject_subband_i32_f32(&mut data, info, &coefficients, step_f32);
     }
 
@@ -305,7 +414,7 @@ pub fn decode_lossy_f32(
         data.mapv_inplace(|v| v.max(mn).min(mx));
     }
 
-    data
+    Ok(data)
 }
 
 /// Progressive/multiresolution lossy decode at `1 / factor` of the full
@@ -327,19 +436,31 @@ pub fn decode_downsampled_f32(
     intercept: f64,
     slope: f64,
     factor: usize,
-) -> Array3<f32> {
+) -> CodecResult<Array3<f32>> {
+    validate_shape(full_shape)?;
+    validate_levels(levels)?;
+
     let k = factor.trailing_zeros() as usize;
+    if k > levels {
+        return Err(CodecError(format!(
+            "jvol downsample level {k} (factor {factor}) exceeds available levels {levels}"
+        )));
+    }
 
     // Extent at each level (level 0 = full shape).
     let mut extents = Vec::with_capacity(levels + 1);
     extents.push(full_shape);
     for _ in 0..levels {
-        let p = *extents.last().unwrap();
+        let p = *extents
+            .last()
+            .ok_or_else(|| CodecError("jvol internal error: empty extents".to_string()))?;
         extents.push([p[0].div_ceil(2), p[1].div_ceil(2), p[2].div_ceil(2)]);
     }
     let small_shape = extents[k];
 
     let subband_infos = compute_subbands(full_shape, levels);
+    require_subband_count(subbands.len(), subband_infos.len())?;
+
     let mut data = Array3::<f32>::zeros((small_shape[0], small_shape[1], small_shape[2]));
     let step_f32 = step as f32;
 
@@ -351,8 +472,8 @@ pub fn decode_downsampled_f32(
         if info.level < k {
             continue;
         }
-        let coefficients =
-            rice_decode_subband(&encoded.data, encoded.num_values as usize, encoded.rice_k);
+        let num_values = validated_num_values(encoded, info)?;
+        let coefficients = rice_decode_subband(&encoded.data, num_values, encoded.rice_k)?;
         inject_subband_i32_f32(&mut data, info, &coefficients, step_f32);
     }
 
@@ -373,7 +494,7 @@ pub fn decode_downsampled_f32(
         data.mapv_inplace(|v| v * scale + offset);
     }
 
-    data
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -407,7 +528,8 @@ mod tests {
             res.intercept,
             res.slope,
             JvolDtype::F32,
-        );
+        )
+        .unwrap();
         let f32_dec = decode_lossy_f32(
             &res.subbands,
             shape,
@@ -417,7 +539,8 @@ mod tests {
             res.intercept,
             res.slope,
             JvolDtype::F32,
-        );
+        )
+        .unwrap();
 
         let range = vol.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
             - vol.iter().cloned().fold(f64::INFINITY, f64::min);
@@ -448,7 +571,8 @@ mod tests {
             res.intercept,
             res.slope,
             JvolDtype::F32,
-        );
+        )
+        .unwrap();
         let full_mean = full.iter().map(|&v| v as f64).sum::<f64>() / full.len() as f64;
 
         for factor in [2usize, 4] {
@@ -461,7 +585,8 @@ mod tests {
                 res.intercept,
                 res.slope,
                 factor,
-            );
+            )
+            .unwrap();
             let expected = n / factor;
             assert_eq!(
                 down.shape(),
@@ -534,5 +659,156 @@ mod tests {
             "f32 downsample x4    : {d4_ms:8.2}  ({:.2}x vs f64 full)",
             f64_ms / d4_ms
         );
+    }
+
+    // --- Malicious/truncated-input hardening ---
+
+    #[test]
+    fn shape_overflow_is_rejected() {
+        assert!(validate_shape([usize::MAX, 2, 2]).is_err());
+    }
+
+    #[test]
+    fn shape_exceeding_voxel_cap_is_rejected() {
+        assert!(validate_shape([1 << 20, 1 << 20, 1 << 20]).is_err());
+    }
+
+    #[test]
+    fn shape_within_cap_is_accepted() {
+        assert_eq!(validate_shape([4, 5, 6]).unwrap(), 120);
+    }
+
+    #[test]
+    fn levels_exceeding_cap_is_rejected() {
+        assert!(validate_levels(MAX_LEVELS + 1).is_err());
+        assert!(validate_levels(MAX_LEVELS).is_ok());
+    }
+
+    #[test]
+    fn decode_lossless_rejects_wrong_subband_count() {
+        let subbands = vec![
+            EncodedSubband {
+                rice_k: 255,
+                num_values: 8,
+                data: vec![0u8; 8],
+            },
+            EncodedSubband {
+                rice_k: 255,
+                num_values: 8,
+                data: vec![0u8; 8],
+            },
+        ];
+        assert!(decode_lossless(&subbands, [2, 2, 2], JvolDtype::U8).is_err());
+    }
+
+    #[test]
+    fn decode_lossless_rejects_absurd_shape() {
+        let subbands = vec![EncodedSubband {
+            rice_k: 255,
+            num_values: 8,
+            data: vec![0u8; 8],
+        }];
+        assert!(decode_lossless(&subbands, [1 << 20, 1 << 20, 1 << 20], JvolDtype::U8).is_err());
+    }
+
+    #[test]
+    fn decode_lossless_rejects_truncated_subband_data() {
+        // Metadata declares an 4x4x4 = 64-voxel volume, but the subband only
+        // carries 4 bytes: the F64 raw-byte path must reject this instead of
+        // indexing past the end of `sub.data`.
+        let subbands = vec![EncodedSubband {
+            rice_k: 255,
+            num_values: 64,
+            data: vec![0u8; 4],
+        }];
+        assert!(decode_lossless(&subbands, [4, 4, 4], JvolDtype::F64).is_err());
+    }
+
+    #[test]
+    fn decode_lossy_rejects_subband_count_mismatch() {
+        let shape = [8, 8, 8];
+        let vol = smooth_volume(8);
+        let res = encode_array(&vol.view(), 60, JvolDtype::F32);
+        let mut bad_subbands = res.subbands.clone();
+        bad_subbands.pop();
+        assert!(decode_lossy(
+            &bad_subbands,
+            shape,
+            res.wavelet,
+            res.levels,
+            res.step,
+            res.intercept,
+            res.slope,
+            JvolDtype::F32,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn decode_lossy_rejects_num_values_mismatch() {
+        let shape = [8, 8, 8];
+        let vol = smooth_volume(8);
+        let res = encode_array(&vol.view(), 60, JvolDtype::F32);
+        let mut bad_subbands = res.subbands.clone();
+        bad_subbands[0].num_values += 1;
+        assert!(decode_lossy(
+            &bad_subbands,
+            shape,
+            res.wavelet,
+            res.levels,
+            res.step,
+            res.intercept,
+            res.slope,
+            JvolDtype::F32,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn decode_lossy_rejects_truncated_rice_data() {
+        let shape = [16, 16, 16];
+        let vol = smooth_volume(16);
+        let res = encode_array(&vol.view(), 60, JvolDtype::F32);
+        let mut bad_subbands = res.subbands.clone();
+        // Truncate the largest subband's Rice-coded bytes so its declared
+        // num_values can no longer be satisfied by the bitstream.
+        let largest = bad_subbands
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, s)| s.data.len())
+            .map(|(i, _)| i)
+            .unwrap();
+        let truncated_len = bad_subbands[largest].data.len() / 8;
+        bad_subbands[largest].data.truncate(truncated_len);
+        assert!(decode_lossy(
+            &bad_subbands,
+            shape,
+            res.wavelet,
+            res.levels,
+            res.step,
+            res.intercept,
+            res.slope,
+            JvolDtype::F32,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn decode_downsampled_rejects_factor_exceeding_levels() {
+        let shape = [16, 16, 16];
+        let vol = smooth_volume(16);
+        let res = encode_array(&vol.view(), 60, JvolDtype::F32);
+        let huge_factor = 1usize << (res.levels + 4);
+        assert!(decode_downsampled_f32(
+            &res.subbands,
+            shape,
+            res.wavelet,
+            res.levels,
+            res.step,
+            res.intercept,
+            res.slope,
+            huge_factor,
+        )
+        .is_err());
     }
 }

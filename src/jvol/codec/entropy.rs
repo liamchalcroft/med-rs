@@ -1,5 +1,7 @@
 //! Bit-level I/O and Rice/Golomb entropy coding for wavelet coefficients.
 
+use super::decoding::CodecError;
+
 // --- Zigzag encoding ---
 
 /// Map signed i32 to unsigned u32: 0→0, -1→1, 1→2, -2→3, ...
@@ -115,45 +117,70 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Read a single bit. Returns 0 or 1.
+    /// Read a single bit. Returns `None` once the underlying data is
+    /// exhausted, so a truncated bitstream is reported to the caller instead
+    /// of indexing past the end of `data`.
     #[inline]
-    pub fn read_bit(&mut self) -> u8 {
+    pub fn read_bit(&mut self) -> Option<u8> {
+        if self.byte_pos >= self.data.len() {
+            return None;
+        }
         let bit = (self.data[self.byte_pos] >> (7 - self.bit_pos)) & 1;
         self.bit_pos += 1;
         if self.bit_pos == 8 {
             self.bit_pos = 0;
             self.byte_pos += 1;
         }
-        bit
+        Some(bit)
     }
 
-    /// Read `n` bits as a u32 (MSB-first), where n <= 32.
+    /// Read `n` bits as a u32 (MSB-first). Returns `None` if `n > 32` (the
+    /// value wouldn't fit) or the bitstream runs out before `n` bits are read.
     #[inline]
-    pub fn read_bits(&mut self, n: u8) -> u32 {
-        debug_assert!(n <= 32);
+    pub fn read_bits(&mut self, n: u8) -> Option<u32> {
+        if n > 32 {
+            return None;
+        }
         let mut value: u32 = 0;
         for _ in 0..n {
-            value = (value << 1) | self.read_bit() as u32;
+            value = (value << 1) | u32::from(self.read_bit()?);
         }
-        value
+        Some(value)
     }
+
+    /// Ceiling on a unary code's zero-run length. Chosen far above anything a
+    /// real encoder produces (`compute_optimal_k` keeps the mean quotient
+    /// small, and caps `k` at 24), so it never rejects valid data, while
+    /// bounding a hostile all-zero bitstream to a fixed amount of work instead
+    /// of scanning the whole buffer, and keeping the running count (a `u32`)
+    /// from ever overflowing.
+    const MAX_UNARY_RUN: u32 = 1 << 24;
 
     /// Read a unary code: count zeros until a 1 is found, return the count.
+    /// Returns `None` if the bitstream is truncated before a terminating `1`
+    /// bit, or the run exceeds [`Self::MAX_UNARY_RUN`] (a malformed stream).
     #[inline]
-    pub fn read_unary(&mut self) -> u32 {
-        let mut count = 0u32;
-        while self.read_bit() == 0 {
+    pub fn read_unary(&mut self) -> Option<u32> {
+        let mut count: u32 = 0;
+        loop {
+            if self.read_bit()? == 1 {
+                return Some(count);
+            }
+            if count >= Self::MAX_UNARY_RUN {
+                return None;
+            }
             count += 1;
         }
-        count
     }
 
-    /// Rice-decode a single unsigned value with parameter k.
+    /// Rice-decode a single unsigned value with parameter k. Returns `None`
+    /// on a truncated/malformed bitstream, including `k >= 32` (which would
+    /// overflow the returned `u32`).
     #[inline]
-    pub fn rice_decode(&mut self, k: u8) -> u32 {
-        let q = self.read_unary();
-        let r = if k > 0 { self.read_bits(k) } else { 0 };
-        (q << k) | r
+    pub fn rice_decode(&mut self, k: u8) -> Option<u32> {
+        let q = self.read_unary()?;
+        let r = if k > 0 { self.read_bits(k)? } else { 0 };
+        q.checked_shl(u32::from(k)).map(|shifted| shifted | r)
     }
 }
 
@@ -197,15 +224,21 @@ pub fn rice_encode_subband(coefficients: &[i32]) -> (Vec<u8>, u8) {
     (writer.finish(), k)
 }
 
-/// Decode Rice-coded bytes back to i32 coefficients.
-pub fn rice_decode_subband(data: &[u8], num_values: usize, k: u8) -> Vec<i32> {
+/// Decode Rice-coded bytes back to i32 coefficients. `num_values` must
+/// already be validated by the caller against the expected voxel count for
+/// the subband (see `decoding::validated_num_values`), since it is used to
+/// preallocate the result; this function only guards against the bitstream
+/// itself running out or being malformed.
+pub fn rice_decode_subband(data: &[u8], num_values: usize, k: u8) -> Result<Vec<i32>, CodecError> {
     let mut reader = BitReader::new(data);
     let mut result = Vec::with_capacity(num_values);
     for _ in 0..num_values {
-        let unsigned = reader.rice_decode(k);
+        let unsigned = reader.rice_decode(k).ok_or_else(|| {
+            CodecError("jvol subband bitstream truncated or malformed".to_string())
+        })?;
         result.push(zigzag_decode(unsigned));
     }
-    result
+    Ok(result)
 }
 
 // --- 3D Lorenzo predictor ---
@@ -363,9 +396,26 @@ mod tests {
         let data = writer.finish();
 
         let mut reader = BitReader::new(&data);
-        assert_eq!(reader.read_bits(5), 0b10110);
-        assert_eq!(reader.read_bits(3), 0b001);
-        assert_eq!(reader.read_bits(8), 0xFF);
+        assert_eq!(reader.read_bits(5), Some(0b10110));
+        assert_eq!(reader.read_bits(3), Some(0b001));
+        assert_eq!(reader.read_bits(8), Some(0xFF));
+    }
+
+    #[test]
+    fn test_read_bits_rejects_too_wide() {
+        let data = [0xFFu8; 8];
+        let mut reader = BitReader::new(&data);
+        assert_eq!(reader.read_bits(33), None);
+    }
+
+    #[test]
+    fn test_read_bit_truncated_returns_none() {
+        let data = [0b1010_0000u8];
+        let mut reader = BitReader::new(&data);
+        for _ in 0..8 {
+            assert!(reader.read_bit().is_some());
+        }
+        assert_eq!(reader.read_bit(), None);
     }
 
     #[test]
@@ -378,10 +428,18 @@ mod tests {
         let data = writer.finish();
 
         let mut reader = BitReader::new(&data);
-        assert_eq!(reader.read_unary(), 0);
-        assert_eq!(reader.read_unary(), 3);
-        assert_eq!(reader.read_unary(), 7);
-        assert_eq!(reader.read_unary(), 1);
+        assert_eq!(reader.read_unary(), Some(0));
+        assert_eq!(reader.read_unary(), Some(3));
+        assert_eq!(reader.read_unary(), Some(7));
+        assert_eq!(reader.read_unary(), Some(1));
+    }
+
+    #[test]
+    fn test_unary_truncated_returns_none() {
+        // All-zero bits with no terminating 1: a truncated unary code.
+        let data = [0u8; 4];
+        let mut reader = BitReader::new(&data);
+        assert_eq!(reader.read_unary(), None);
     }
 
     #[test]
@@ -398,20 +456,43 @@ mod tests {
             for &expected in &values {
                 let got = reader.rice_decode(k);
                 assert_eq!(
-                    got, expected,
+                    got,
+                    Some(expected),
                     "Rice roundtrip failed for k={}, v={}",
-                    k, expected
+                    k,
+                    expected
                 );
             }
         }
     }
 
     #[test]
+    fn test_rice_decode_rejects_k_at_bit_width() {
+        let mut writer = BitWriter::new();
+        writer.rice_encode(5, 4);
+        let data = writer.finish();
+        let mut reader = BitReader::new(&data);
+        // k == 32 would overflow the returned u32 on the final shift; must be
+        // rejected rather than panicking or silently wrapping.
+        assert_eq!(reader.rice_decode(32), None);
+    }
+
+    #[test]
     fn test_subband_encode_decode() {
         let coefficients: Vec<i32> = vec![0, 1, -1, 2, -2, 0, 0, 3, -5, 100, -100, 0];
         let (data, k) = rice_encode_subband(&coefficients);
-        let decoded = rice_decode_subband(&data, coefficients.len(), k);
+        let decoded = rice_decode_subband(&data, coefficients.len(), k).unwrap();
         assert_eq!(coefficients, decoded);
+    }
+
+    #[test]
+    fn test_subband_decode_truncated_data_is_err() {
+        let coefficients: Vec<i32> = (0..200).map(|i| i * 3 - 50).collect();
+        let (data, k) = rice_encode_subband(&coefficients);
+        // Truncate the encoded bitstream partway through; decoding the full
+        // declared value count must fail rather than panic.
+        let truncated = &data[..data.len() / 4];
+        assert!(rice_decode_subband(truncated, coefficients.len(), k).is_err());
     }
 
     #[test]
@@ -421,7 +502,7 @@ mod tests {
         assert_eq!(k, 0);
         // 1000 zeros with k=0: each zero is unary(0)="1", so 1000 bits = 125 bytes
         assert_eq!(data.len(), 125);
-        let decoded = rice_decode_subband(&data, 1000, k);
+        let decoded = rice_decode_subband(&data, 1000, k).unwrap();
         assert_eq!(coefficients, decoded);
     }
 

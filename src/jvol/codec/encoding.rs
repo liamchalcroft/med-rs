@@ -296,7 +296,8 @@ mod tests {
             result.slope,
             0,
             JvolDtype::I16,
-        );
+        )
+        .unwrap();
         for (a, b) in array.iter().zip(decoded.iter()) {
             assert!(
                 (*a - *b).abs() < 1e-10,
@@ -324,7 +325,8 @@ mod tests {
             result.slope,
             0,
             JvolDtype::F32,
-        );
+        )
+        .unwrap();
         // f64 → f32 → f64 roundtrip may lose some precision
         for (a, b) in array.iter().zip(decoded.iter()) {
             let a_f32 = *a as f32 as f64;
@@ -352,7 +354,8 @@ mod tests {
             result.slope,
             60,
             JvolDtype::I16,
-        );
+        )
+        .unwrap();
         let max_err: f64 = array
             .iter()
             .zip(decoded.iter())
