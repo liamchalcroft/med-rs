@@ -106,8 +106,11 @@ pub fn compute_label_aware_crop_regions(
     let pos_per_batch = (num_samples as f32 / (1.0 + config.pos_neg_ratio)) as usize;
     let neg_per_batch = num_samples - pos_per_batch;
 
+    // Guarantee at least `min_pos_samples` positive crops (bounded by num_samples).
+    let pos_samples = pos_per_batch.max(config.min_pos_samples).min(num_samples);
+
     // Sample positive regions
-    for _ in 0..pos_per_batch.min(config.min_pos_samples) {
+    for _ in 0..pos_samples {
         if let Some(region) = sample_positive_region(
             &positive_voxels,
             &volume_shape,
@@ -202,16 +205,14 @@ pub fn compute_center_crop_regions(patch_size: [usize; 3], image: &NiftiImage) -
     ];
 
     let end = [
-        start[0] + patch_size[0],
-        start[1] + patch_size[1],
-        start[2] + patch_size[2],
+        (start[0] + patch_size[0]).min(volume_shape[0]),
+        (start[1] + patch_size[1]).min(volume_shape[1]),
+        (start[2] + patch_size[2]).min(volume_shape[2]),
     ];
 
-    CropRegion {
-        start,
-        end,
-        size: patch_size,
-    }
+    let size = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
+
+    CropRegion { start, end, size }
 }
 
 // Helper functions
@@ -499,6 +500,12 @@ impl ForegroundDetector {
                     foreground_count += 1;
                 }
             }
+        }
+
+        // No foreground: the bounding-box coordinates are still at their
+        // sentinels, so bail out before they underflow below.
+        if foreground_count == 0 {
+            return Ok(None);
         }
 
         // Check if we have enough foreground

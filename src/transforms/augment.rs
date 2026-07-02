@@ -6,7 +6,6 @@
 use crate::error::{Error, Result};
 use crate::nifti::image::ArrayData;
 use crate::nifti::{DataType, NiftiImage};
-use crate::pipeline::acquire_buffer;
 use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
@@ -83,13 +82,21 @@ pub fn random_gaussian_noise(
     let std = std.unwrap_or(0.1);
     let base_seed = seed.unwrap_or_else(rand::random);
 
-    let data = image.to_f32()?;
-    let slice = data.as_slice_memory_order().ok_or_else(|| {
-        Error::NonContiguousArray("Array must be contiguous for noise operation".to_string())
-    })?;
+    let owned;
+    let slice: &[f32] = if let Some(s) = image.as_f32_slice() {
+        s
+    } else {
+        owned = image.to_f32()?;
+        owned.as_slice_memory_order().ok_or_else(|| {
+            Error::NonContiguousArray("Array must be contiguous for noise operation".to_string())
+        })?
+    };
     let len = slice.len();
 
-    let mut output = acquire_buffer(len);
+    // Each chunk is seeded from base_seed + chunk_idx, so the noise is
+    // independent of thread count but keyed to CHUNK_SIZE: changing CHUNK_SIZE
+    // changes the generated noise for a given seed.
+    let mut output = vec![0.0f32; len];
     let n_chunks = len.div_ceil(CHUNK_SIZE);
 
     if n_chunks > 1 {
@@ -120,7 +127,7 @@ pub fn random_gaussian_noise(
     }
 
     // F-order to match NIfTI convention
-    let shape = data.shape();
+    let shape = image.shape();
     let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output)
         .map_err(|e| Error::MemoryAllocation(format!("Failed to create output array: {}", e)))?;
     let mut header = image.header().clone();
@@ -152,12 +159,17 @@ pub fn random_intensity_scale(
     // Sample scale factor uniformly from [1-range, 1+range]
     let scale = 1.0 + rng.gen_range(-scale_range..=scale_range);
 
-    let data = image.to_f32()?;
-    let slice = data.as_slice_memory_order().ok_or_else(|| {
-        Error::NonContiguousArray("Array must be contiguous for scale operation".to_string())
-    })?;
+    let owned;
+    let slice: &[f32] = if let Some(s) = image.as_f32_slice() {
+        s
+    } else {
+        owned = image.to_f32()?;
+        owned.as_slice_memory_order().ok_or_else(|| {
+            Error::NonContiguousArray("Array must be contiguous for scale operation".to_string())
+        })?
+    };
 
-    let mut output = acquire_buffer(slice.len());
+    let mut output = vec![0.0f32; slice.len()];
     output
         .par_iter_mut()
         .zip(slice.par_iter())
@@ -166,7 +178,7 @@ pub fn random_intensity_scale(
         });
 
     // F-order to match NIfTI convention
-    let shape = data.shape();
+    let shape = image.shape();
     let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output)
         .map_err(|e| Error::MemoryAllocation(format!("Failed to create output array: {}", e)))?;
     let mut header = image.header().clone();
@@ -198,12 +210,17 @@ pub fn random_intensity_shift(
     // Sample shift uniformly from [-range, range]
     let shift = rng.gen_range(-shift_range..=shift_range);
 
-    let data = image.to_f32()?;
-    let slice = data.as_slice_memory_order().ok_or_else(|| {
-        Error::NonContiguousArray("Array must be contiguous for shift operation".to_string())
-    })?;
+    let owned;
+    let slice: &[f32] = if let Some(s) = image.as_f32_slice() {
+        s
+    } else {
+        owned = image.to_f32()?;
+        owned.as_slice_memory_order().ok_or_else(|| {
+            Error::NonContiguousArray("Array must be contiguous for shift operation".to_string())
+        })?
+    };
 
-    let mut output = acquire_buffer(slice.len());
+    let mut output = vec![0.0f32; slice.len()];
     output
         .par_iter_mut()
         .zip(slice.par_iter())
@@ -212,7 +229,7 @@ pub fn random_intensity_shift(
         });
 
     // F-order to match NIfTI convention
-    let shape = data.shape();
+    let shape = image.shape();
     let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output)
         .map_err(|e| Error::MemoryAllocation(format!("Failed to create output array: {}", e)))?;
     let mut header = image.header().clone();
@@ -250,8 +267,16 @@ pub fn random_rotate_90(
     rotate_90(image, axes, k)
 }
 
-/// Rotate the image by k * 90 degrees in the specified plane.
-fn rotate_90(image: &NiftiImage, axes: (usize, usize), k: usize) -> Result<NiftiImage> {
+/// Rotate the image by `k * 90` degrees in the specified plane.
+///
+/// The affine (and hence pixdim) is updated so world coordinates are preserved:
+/// for odd `k` the two in-plane spacings swap.
+///
+/// # Errors
+///
+/// Returns `Error::InvalidDimensions` if the axes are out of bounds or equal.
+#[must_use = "this function returns a new image and does not modify the original"]
+pub fn rotate_90(image: &NiftiImage, axes: (usize, usize), k: usize) -> Result<NiftiImage> {
     let ndim = image.ndim();
     if axes.0 >= ndim || axes.1 >= ndim {
         return Err(Error::InvalidDimensions(format!(
@@ -321,6 +346,32 @@ fn rotate_90(image: &NiftiImage, axes: (usize, usize), k: usize) -> Result<Nifti
         header.dim[i] = s as i64;
     }
 
+    // Update the affine so world coordinates are preserved. Each 90-degree step
+    // sets column a <- column b, column b <- -column a, and shifts the origin by
+    // the pre-rotation column a scaled by its extent. set_affine then rewrites
+    // pixdim from the new column norms (swapping the two spacings for odd k).
+    // Rotations that involve a non-spatial axis leave the spatial geometry
+    // unchanged, so the affine is only touched for in-volume planes.
+    if axes.0 < 3 && axes.1 < 3 {
+        let (a, b) = axes;
+        let mut affine = image.affine();
+        let mut cur_shape = old_shape.to_vec();
+        for _ in 0..k {
+            let mut rot = affine;
+            for j in 0..3 {
+                rot[j][a] = affine[j][b];
+                rot[j][b] = -affine[j][a];
+            }
+            let extent = (cur_shape[a] - 1) as f32;
+            for j in 0..3 {
+                rot[j][3] = affine[j][3] + affine[j][a] * extent;
+            }
+            affine = rot;
+            cur_shape.swap(a, b);
+        }
+        header.set_affine(affine);
+    }
+
     Ok(NiftiImage::from_parts(header, new_data))
 }
 
@@ -333,6 +384,10 @@ fn rotate_90(image: &NiftiImage, axes: (usize, usize), k: usize) -> Result<Nifti
 /// * `image` - Input image (should be normalized to [0, 1] for best results)
 /// * `gamma_range` - Range for gamma sampling (default: (0.7, 1.5))
 /// * `seed` - Optional random seed for reproducibility
+///
+/// # Errors
+///
+/// Returns `Error::Configuration` unless `0 < gamma_min <= gamma_max`.
 #[must_use = "this function returns a Result and does not modify the original"]
 pub fn random_gamma(
     image: &NiftiImage,
@@ -340,16 +395,31 @@ pub fn random_gamma(
     seed: Option<u64>,
 ) -> Result<NiftiImage> {
     let (gamma_min, gamma_max) = gamma_range.unwrap_or((0.7, 1.5));
+
+    // Non-positive gamma yields constant or infinite output; an inverted range
+    // would also panic in gen_range.
+    if gamma_min <= 0.0 || gamma_max <= 0.0 || gamma_min > gamma_max {
+        return Err(Error::Configuration(format!(
+            "random_gamma requires 0 < gamma_min <= gamma_max, got ({}, {})",
+            gamma_min, gamma_max
+        )));
+    }
+
     let mut rng = get_rng(seed);
 
     let gamma = rng.gen_range(gamma_min..=gamma_max);
 
-    let data = image.to_f32()?;
-    let slice = data.as_slice_memory_order().ok_or_else(|| {
-        Error::NonContiguousArray("Array must be contiguous for gamma operation".to_string())
-    })?;
+    let owned;
+    let slice: &[f32] = if let Some(s) = image.as_f32_slice() {
+        s
+    } else {
+        owned = image.to_f32()?;
+        owned.as_slice_memory_order().ok_or_else(|| {
+            Error::NonContiguousArray("Array must be contiguous for gamma operation".to_string())
+        })?
+    };
 
-    let mut output = acquire_buffer(slice.len());
+    let mut output = vec![0.0f32; slice.len()];
     output
         .par_iter_mut()
         .zip(slice.par_iter())
@@ -360,7 +430,7 @@ pub fn random_gamma(
         });
 
     // F-order to match NIfTI convention
-    let shape = data.shape();
+    let shape = image.shape();
     let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output)
         .map_err(|e| Error::MemoryAllocation(format!("Failed to create output array: {}", e)))?;
     let mut header = image.header().clone();
@@ -634,7 +704,7 @@ mod tests {
     #[test]
     fn test_rotate_90_k0() {
         let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
-        let img = create_test_image(data.clone(), [2, 2, 2]);
+        let img = create_test_image(data, [2, 2, 2]);
 
         // k=0 should be identity
         let rotated = rotate_90(&img, (0, 1), 0).unwrap();
