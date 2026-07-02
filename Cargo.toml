@@ -1,7 +1,8 @@
 [package]
 name = "medrs"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.81"
 description = "Ultra-high-performance medical imaging I/O for deep learning"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/liamchalcroft/med-rs"
@@ -56,13 +57,19 @@ libdeflater = "0.14"
 pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
 numpy = { version = "0.24", optional = true }
 
+# Volumetric compression (jvol, optional)
+serde = { version = "1.0", features = ["derive"], optional = true }
+bincode = { version = "1", optional = true }
+zstd = { version = "0.13", optional = true }
+
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.14"
 
 [features]
 default = []
-python = ["pyo3", "numpy"]
+jvol = ["dep:serde", "dep:bincode", "dep:zstd"]
+python = ["pyo3", "numpy", "jvol"]
 
 
 [profile.release]
@@ -94,10 +101,47 @@ missing_docs = "warn"
 unsafe_code = "warn"
 
 [workspace.lints.clippy]
-all = "warn"
-pedantic = "warn"
-nursery = "warn"
-cargo = "warn"
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Allowances for a numeric/scientific codebase. Applied workspace-wide (lib,
+# tests, benches) so all crate roots share the same policy.
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_lossless = "allow"
+cast_possible_wrap = "allow"
+cast_ptr_alignment = "allow"
+ptr_as_ptr = "allow"
+similar_names = "allow"
+many_single_char_names = "allow"
+too_many_lines = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+suboptimal_flops = "allow"
+redundant_pub_crate = "allow"
+missing_const_for_fn = "allow"
+doc_markdown = "allow"
+uninlined_format_args = "allow"
+use_self = "allow"
+redundant_closure_for_method_calls = "allow"
+manual_is_multiple_of = "allow"
+option_map_or_none = "allow"
+needless_pass_by_value = "allow"
+float_cmp = "allow"
+wildcard_enum_match_arm = "allow"
+explicit_iter_loop = "allow"
+needless_borrow = "allow"
+manual_memcpy = "allow"
+# Test and benchmark code writes literal arrays and scratch data freely.
+approx_constant = "allow"
+unreadable_literal = "allow"
+manual_range_contains = "allow"
+needless_range_loop = "allow"
 
 [lints]
 workspace = true

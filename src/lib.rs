@@ -1,40 +1,13 @@
-// Clippy configuration for the crate
-// Allow these pedantic lints that are too noisy for this numeric/scientific codebase
-#![allow(clippy::cast_possible_truncation)] // Numeric casts are intentional
-#![allow(clippy::cast_precision_loss)] // Precision loss in f32/f64 casts is acceptable
-#![allow(clippy::cast_sign_loss)] // Sign handling is managed explicitly
-#![allow(clippy::cast_lossless)] // Using `as` for clarity in numeric code
-#![allow(clippy::cast_possible_wrap)] // Wrap behavior is handled
-#![allow(clippy::similar_names)] // c00, c01, c10, c11 naming is intentional for interpolation
-#![allow(clippy::many_single_char_names)] // x, y, z naming is standard in 3D code
-#![allow(clippy::too_many_lines)] // Some functions are necessarily long
-#![allow(clippy::module_name_repetitions)] // NiftiImage in nifti module is clear
-#![allow(clippy::must_use_candidate)] // Not all returns need #[must_use]
-#![allow(clippy::return_self_not_must_use)] // Builder pattern returns don't need #[must_use]
-#![allow(clippy::missing_errors_doc)] // Error docs would be redundant
-#![allow(clippy::missing_panics_doc)] // Panics are being converted to Results
-#![allow(clippy::suboptimal_flops)] // mul_add suggestions hurt readability
-#![allow(clippy::redundant_pub_crate)] // pub(crate) is intentional for visibility
-#![allow(clippy::missing_const_for_fn)] // const fn suggestions are premature optimization
-#![allow(clippy::doc_markdown)] // NIfTI doesn't need backticks everywhere
-#![allow(clippy::ptr_as_ptr)] // Pointer casts are intentional for binary parsing
-#![allow(clippy::cast_ptr_alignment)] // Alignment is handled in binary parsing
-#![allow(clippy::uninlined_format_args)] // format!("{}", x) is clearer than format!("{x}")
-#![allow(clippy::use_self)] // Self vs TypeName is stylistic
-#![allow(clippy::redundant_closure_for_method_calls)] // Closures can be clearer
-#![allow(clippy::manual_is_multiple_of)] // % 0 == 0 is clearer than is_multiple_of
-#![allow(clippy::option_map_or_none)] // map().unwrap_or is clearer
-#![allow(clippy::needless_pass_by_value)] // Pass by value is intentional for small types
-#![allow(clippy::float_cmp)] // Float comparison is intentional in some cases
-#![allow(clippy::wildcard_enum_match_arm)] // Wildcard matches are intentional
-#![allow(clippy::explicit_iter_loop)] // for x in iter is clearer than for x in &collection
-#![allow(clippy::needless_borrow)] // Borrow is intentional for clarity
-#![allow(clippy::manual_memcpy)] // Manual copy is clearer in some contexts
-
-// Deny panic-prone patterns to prevent regressions
-#![deny(clippy::panic)] // No panic!() in library code
-#![deny(clippy::unwrap_used)] // No .unwrap() in library code
-#![deny(clippy::expect_used)] // No .expect() in library code
+// Numeric-codebase lint allowances live in `[workspace.lints.clippy]` so the
+// lib, tests, and benches share one policy.
+//
+// Deny panic-prone patterns in library code to prevent regressions. Test code
+// may use unwrap/expect/panic freely for assertions.
+#![cfg_attr(
+    not(test),
+    deny(clippy::panic, clippy::unwrap_used, clippy::expect_used)
+)]
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 //! # medrs
 //!
@@ -101,6 +74,8 @@
 //! - [`error`]: Error types for the library
 
 pub mod error;
+#[cfg(feature = "jvol")]
+pub mod jvol;
 pub mod nifti;
 pub mod pipeline;
 pub mod transforms;
