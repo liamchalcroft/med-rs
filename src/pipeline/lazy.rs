@@ -4,15 +4,20 @@
 //! When the data is finally needed, all pending operations are composed and
 //! executed in a single optimized pass.
 
+use crate::error::{Error, Result};
 use crate::nifti::image::ArrayData;
 use crate::nifti::DataType;
 use crate::nifti::NiftiImage;
-use crate::pipeline::acquire_buffer;
 use crate::pipeline::simd_kernels::{
-    parallel_linear_transform_f32, parallel_minmax_f32, parallel_sum_and_sum_sq_f32,
+    parallel_linear_transform_clamp_f32, parallel_linear_transform_f32,
+    parallel_sum_and_sum_sq_f32, trilinear_resample_forder_adaptive,
 };
 use crate::transforms::Interpolation as TransformsInterpolation;
 use ndarray::{ArrayD, IxDyn};
+use rayon::prelude::*;
+
+/// Chunk size for the second z-normalization pass.
+const ZNORM_CHUNK_SIZE: usize = 4096;
 
 /// A pending operation that can be lazily evaluated.
 #[derive(Clone, Debug)]
@@ -27,13 +32,10 @@ pub enum PendingOp {
         /// Interpolation strategy to use for resampling.
         interpolation: Interpolation,
     },
-    /// Intensity normalization: output = (input - mean) * inv_std
-    ZNormalize {
-        /// Mean value used for centering.
-        mean: f32,
-        /// Inverse standard deviation for scaling.
-        inv_std: f32,
-    },
+    /// Intensity normalization to zero mean and unit variance. Statistics are
+    /// deferred to materialization time so the op can be fused with clamping and
+    /// linear scaling in a single pass.
+    ZNormalize,
     /// Linear intensity transform: output = input * scale + offset
     /// This can represent rescaling, clamping bounds, etc.
     LinearIntensity {
@@ -77,10 +79,8 @@ impl PendingOp {
                     interpolation: i2, ..
                 },
             ) => i1 == i2,
-            // Fuseable intensity operations (all these can be composed)
+            // Fuseable linear intensity operations
             (PendingOp::LinearIntensity { .. }, PendingOp::LinearIntensity { .. })
-            | (PendingOp::ZNormalize { .. }, PendingOp::LinearIntensity { .. })
-            | (PendingOp::ZNormalize { .. }, PendingOp::Clamp { .. })
             | (PendingOp::LinearIntensity { .. }, PendingOp::Clamp { .. }) => true,
             _ => false,
         }
@@ -125,29 +125,6 @@ impl PendingOp {
                     offset: o1 * s2 + o2,
                 })
             }
-            (
-                PendingOp::ZNormalize { mean, inv_std },
-                PendingOp::LinearIntensity { scale, offset },
-            ) => {
-                // ((x - mean) * inv_std) * scale + offset
-                // = x * (inv_std * scale) + (-mean * inv_std * scale + offset)
-                Some(PendingOp::LinearIntensity {
-                    scale: inv_std * scale,
-                    offset: -mean * inv_std * scale + offset,
-                })
-            }
-            (PendingOp::ZNormalize { mean, inv_std }, PendingOp::Clamp { min, max }) => {
-                // Turn into LinearIntensity + clamp
-                let linear = PendingOp::LinearIntensity {
-                    scale: *inv_std,
-                    offset: -mean * inv_std,
-                };
-                let clamp = PendingOp::Clamp {
-                    min: *min,
-                    max: *max,
-                };
-                linear.fuse_with(&clamp)
-            }
             (PendingOp::LinearIntensity { .. }, PendingOp::Clamp { min, max }) => {
                 Some(PendingOp::Clamp {
                     min: *min,
@@ -170,6 +147,20 @@ fn compose_affine(a: &[[f32; 4]; 4], b: &[[f32; 4]; 4]) -> [[f32; 4]; 4] {
         }
     }
     result
+}
+
+/// Append a pending operation, fusing it into the previous one when possible.
+pub(crate) fn push_pending(pending: &mut Vec<PendingOp>, op: PendingOp) {
+    if let Some(last) = pending.last() {
+        if last.can_fuse_with(&op) {
+            if let Some(fused) = last.fuse_with(&op) {
+                pending.pop();
+                pending.push(fused);
+                return;
+            }
+        }
+    }
+    pending.push(op);
 }
 
 /// A lazy image that accumulates pending operations.
@@ -204,17 +195,7 @@ impl LazyImage {
 
     /// Add a pending operation.
     pub fn push_op(&mut self, op: PendingOp) {
-        // Try to fuse with the last operation
-        if let Some(last) = self.pending.last() {
-            if last.can_fuse_with(&op) {
-                if let Some(fused) = last.fuse_with(&op) {
-                    self.pending.pop();
-                    self.pending.push(fused);
-                    return;
-                }
-            }
-        }
-        self.pending.push(op);
+        push_pending(&mut self.pending, op);
     }
 
     /// Check if there are pending operations.
@@ -228,23 +209,18 @@ impl LazyImage {
     }
 
     /// Execute all pending operations and return the materialized image.
-    pub fn materialize(self) -> crate::error::Result<NiftiImage> {
-        let mut image = if let Some(img) = self.image {
+    pub fn materialize(self) -> Result<NiftiImage> {
+        let image = if let Some(img) = self.image {
             img
         } else if let Some(path) = &self.path {
             crate::nifti::load(path)?
         } else {
-            return Err(crate::error::Error::InvalidDimensions(
+            return Err(Error::InvalidDimensions(
                 "LazyImage has no image or path".into(),
             ));
         };
 
-        // Group and execute pending operations
-        for op in &self.pending {
-            image = execute_op(image, op)?;
-        }
-
-        Ok(image)
+        materialize_ops(&image, &self.pending)
     }
 
     /// Get a reference to the pending operations.
@@ -253,8 +229,22 @@ impl LazyImage {
     }
 }
 
+/// Apply a chain of pending operations to an image, fusing intensity ops.
+pub(crate) fn materialize_ops(image: &NiftiImage, pending: &[PendingOp]) -> Result<NiftiImage> {
+    if let Some(fused) = execute_fused_intensity(image, pending)? {
+        return Ok(fused);
+    }
+
+    let mut result: Option<NiftiImage> = None;
+    for op in pending {
+        let input = result.as_ref().unwrap_or(image);
+        result = Some(execute_op(input, op)?);
+    }
+    result.map_or_else(|| Ok(image.clone()), Ok)
+}
+
 /// Execute a single pending operation on an image.
-fn execute_op(image: NiftiImage, op: &PendingOp) -> crate::error::Result<NiftiImage> {
+fn execute_op(image: &NiftiImage, op: &PendingOp) -> Result<NiftiImage> {
     use crate::transforms;
 
     match op {
@@ -271,225 +261,156 @@ fn execute_op(image: NiftiImage, op: &PendingOp) -> crate::error::Result<NiftiIm
                 Interpolation::Nearest => TransformsInterpolation::Nearest,
                 Interpolation::Trilinear => TransformsInterpolation::Trilinear,
             };
-            apply_affine(&image, matrix, shape, interp)
+            apply_affine(image, matrix, shape, interp)
         }
-        PendingOp::ZNormalize { .. } => {
-            // Fallback: eager
-            transforms::z_normalization(&image)
-        }
+        PendingOp::ZNormalize => transforms::z_normalization(image),
         PendingOp::LinearIntensity { scale, offset } => {
-            // Apply linear transform: output = input * scale + offset
-            apply_linear_intensity(&image, *scale, *offset)
+            apply_linear_intensity(image, *scale, *offset)
         }
-        PendingOp::Clamp { min, max } => transforms::clamp(&image, *min as f64, *max as f64),
+        PendingOp::Clamp { min, max } => transforms::clamp(image, *min as f64, *max as f64),
         PendingOp::Flip { axes } => {
             let axes_vec: Vec<usize> = (0..3).filter(|&i| (axes >> i) & 1 == 1).collect();
-            transforms::flip(&image, &axes_vec)
+            transforms::flip(image, &axes_vec)
         }
     }
 }
 
-/// Execute a fused chain of intensity ops if possible.
-/// Now properly handles LinearIntensity by accumulating scale/offset.
-pub fn execute_fused_intensity(image: &NiftiImage, pending: &[PendingOp]) -> Option<NiftiImage> {
+/// Borrow the image data as a contiguous f32 slice, converting only when the
+/// storage is not already owned identity-scaled f32.
+fn f32_input<'a>(image: &'a NiftiImage, owned: &'a mut Option<ArrayD<f32>>) -> Result<&'a [f32]> {
+    if let Some(slice) = image.as_f32_slice() {
+        return Ok(slice);
+    }
+    let arr = owned.insert(image.to_f32()?);
+    arr.as_slice_memory_order()
+        .ok_or_else(|| Error::NonContiguousArray("Array not contiguous".into()))
+}
+
+/// Execute a chain of intensity ops in a single fused pass.
+///
+/// Returns `Ok(None)` when the pending list contains a non-intensity op (the
+/// caller falls back to per-op execution), and `Err` when z-normalization
+/// statistics are not finite.
+pub(crate) fn execute_fused_intensity(
+    image: &NiftiImage,
+    pending: &[PendingOp],
+) -> Result<Option<NiftiImage>> {
+    use ndarray::ShapeBuilder;
+
+    if pending.is_empty() {
+        return Ok(None);
+    }
+
     let mut do_znorm = false;
-    let mut accumulated_scale = 1.0f32;
-    let mut accumulated_offset = 0.0f32;
-    let mut has_linear = false;
+    let mut scale = 1.0f32;
+    let mut offset = 0.0f32;
     let mut clamp: Option<(f32, f32)> = None;
 
     for op in pending {
         match op {
-            PendingOp::ZNormalize { .. } => do_znorm = true,
-            PendingOp::LinearIntensity { scale, offset } => {
-                // Accumulate: (prev_scale * x + prev_offset) * scale + offset
-                // = prev_scale * scale * x + (prev_offset * scale + offset)
-                accumulated_offset = accumulated_offset * scale + offset;
-                accumulated_scale *= scale;
-                has_linear = true;
+            PendingOp::ZNormalize => do_znorm = true,
+            PendingOp::LinearIntensity {
+                scale: s,
+                offset: o,
+            } => {
+                offset = offset * s + o;
+                scale *= s;
             }
             PendingOp::Clamp { min, max } => clamp = Some((*min, *max)),
-            _ => return None,
+            _ => return Ok(None),
         }
     }
 
-    // Rescale params are not used - linear transforms are handled directly via scale/offset
-    let rescale = None;
+    let mut owned = None;
+    let slice = f32_input(image, &mut owned)?;
 
-    // If we only have linear transforms, apply them directly
-    if has_linear && !do_znorm && clamp.is_none() {
-        use ndarray::ShapeBuilder;
-        let data = image.to_f32().ok()?;
-        let slice = data.as_slice_memory_order()?;
-        let mut output = acquire_buffer(slice.len());
-        parallel_linear_transform_f32(slice, &mut output, accumulated_scale, accumulated_offset);
-        let out_array =
-            ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(data.shape()).f(), output).ok()?;
-        let mut header = image.header().clone();
-        header.datatype = DataType::Float32;
-        header.scl_slope = 1.0;
-        header.scl_inter = 0.0;
-        return Some(NiftiImage::from_parts(header, ArrayData::F32(out_array)));
-    }
-
-    fuse_intensity_ops(image, do_znorm, rescale, clamp)
-}
-
-/// Apply a linear intensity transformation: output = input * scale + offset
-/// Uses SIMD-accelerated parallel processing with memory pool for buffer reuse.
-fn apply_linear_intensity(
-    image: &NiftiImage,
-    scale: f32,
-    offset: f32,
-) -> crate::error::Result<NiftiImage> {
-    use super::acquire_buffer;
-    use super::simd_kernels::parallel_linear_transform_f32;
-    use crate::error::Error;
-    use crate::nifti::image::ArrayData;
-    use crate::nifti::DataType;
-    use ndarray::{ArrayD, IxDyn, ShapeBuilder};
-
-    let header = image.header().clone();
-
-    // Fast path for f32 with SIMD
-    if let ArrayData::F32(a) = image.owned_data()? {
-        let slice = a
-            .as_slice_memory_order()
-            .ok_or_else(|| Error::InvalidDimensions("Array not contiguous".into()))?;
-        let mut output = acquire_buffer(slice.len());
-
-        parallel_linear_transform_f32(slice, &mut output, scale, offset);
-
-        let out_array = ArrayD::from_shape_vec(IxDyn(a.shape()).f(), output)
-            .map_err(|e| Error::InvalidDimensions(format!("Shape mismatch: {}", e)))?;
-        return Ok(NiftiImage::from_parts(header, ArrayData::F32(out_array)));
-    }
-
-    // Generic path: convert to f32
-    let data = image.to_f32()?;
-    let slice = data
-        .as_slice_memory_order()
-        .ok_or_else(|| Error::InvalidDimensions("Array not contiguous".into()))?;
-    let mut output = acquire_buffer(slice.len());
-
-    parallel_linear_transform_f32(slice, &mut output, scale, offset);
-
-    let out_array = ArrayD::from_shape_vec(IxDyn(data.shape()).f(), output)
-        .map_err(|e| Error::InvalidDimensions(format!("Shape mismatch: {}", e)))?;
-    let mut new_header = header;
-    new_header.datatype = DataType::Float32;
-    new_header.scl_slope = 1.0;
-    new_header.scl_inter = 0.0;
-    Ok(NiftiImage::from_parts(
-        new_header,
-        ArrayData::F32(out_array),
-    ))
-}
-
-/// Fuse z-normalize, rescale, and clamp into one pass when possible.
-/// Returns None if the array is not contiguous or shape conversion fails.
-#[allow(clippy::similar_names)]
-pub fn fuse_intensity_ops(
-    image: &NiftiImage,
-    do_znorm: bool,
-    rescale: Option<(f32, f32)>,
-    clamp: Option<(f32, f32)>,
-) -> Option<NiftiImage> {
-    use ndarray::ShapeBuilder;
-
-    // Work in f32
-    let data = image.to_f32().ok()?;
-    let slice = data.as_slice_memory_order()?;
-
-    let mut scale = 1.0f32;
-    let mut offset = 0.0f32;
-
-    // z-norm stats
     if do_znorm {
-        // Guard against empty array
-        if slice.is_empty() {
-            return None;
-        }
-        let (sum, sum_sq, count) = parallel_sum_and_sum_sq_f32(slice);
-        // Guard against zero count (shouldn't happen if slice is non-empty, but defensive)
-        if count == 0 {
-            return None;
-        }
-        let mean = (sum / count as f64) as f32;
-        let variance = (sum_sq / count as f64) - (mean as f64 * mean as f64);
-        // Handle constant image (zero variance) - no scaling needed
-        let inv_std = if variance <= 0.0 {
-            1.0
-        } else {
-            1.0 / (variance.sqrt() as f32)
-        };
+        let (mean, inv_std) = znorm_stats(slice)?;
+        // Compose z-normalization (applied first) with the accumulated linear op:
+        // ((x * inv_std) - mean * inv_std) * scale + offset
+        offset += -mean * inv_std * scale;
         scale *= inv_std;
-        offset += -mean * inv_std;
     }
 
-    // rescale to range
-    let mut clamp_min = None;
-    let mut clamp_max = None;
-
-    if let Some((out_min, out_max)) = rescale {
-        let (min, max) = parallel_minmax_f32(slice);
-        let range = if max - min == 0.0 { 1.0 } else { max - min };
-        let r_scale = (out_max - out_min) / range;
-        let r_offset = out_min - min * r_scale;
-        scale *= r_scale;
-        offset = offset * r_scale + r_offset;
+    let shape = image.shape();
+    let mut output = vec![0.0f32; slice.len()];
+    match clamp {
+        Some((min, max)) => {
+            parallel_linear_transform_clamp_f32(slice, &mut output, scale, offset, min, max);
+        }
+        None => parallel_linear_transform_f32(slice, &mut output, scale, offset),
     }
 
-    if let Some((min, max)) = clamp {
-        clamp_min = Some(min);
-        clamp_max = Some(max);
-    }
-
-    // Apply fused op
-    let mut output = acquire_buffer(slice.len());
-
-    match (clamp_min, clamp_max) {
-        (Some(min), Some(max)) => {
-            super::simd_kernels::parallel_linear_transform_clamp_f32(
-                slice,
-                &mut output,
-                scale,
-                offset,
-                min,
-                max,
-            );
-        }
-        (Some(min), None) => {
-            super::simd_kernels::parallel_linear_transform_clamp_f32(
-                slice,
-                &mut output,
-                scale,
-                offset,
-                min,
-                f32::MAX,
-            );
-        }
-        (None, Some(max)) => {
-            super::simd_kernels::parallel_linear_transform_clamp_f32(
-                slice,
-                &mut output,
-                scale,
-                offset,
-                f32::MIN,
-                max,
-            );
-        }
-        (None, None) => {
-            parallel_linear_transform_f32(slice, &mut output, scale, offset);
-        }
-    }
-
-    let out_array = ArrayD::from_shape_vec(IxDyn(data.shape()).f(), output).ok()?;
+    let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output)
+        .map_err(|e| Error::InvalidDimensions(format!("Shape mismatch: {}", e)))?;
     let mut header = image.header().clone();
     header.datatype = DataType::Float32;
     header.scl_slope = 1.0;
     header.scl_inter = 0.0;
-    Some(NiftiImage::from_parts(header, ArrayData::F32(out_array)))
+    Ok(Some(NiftiImage::from_parts(
+        header,
+        ArrayData::F32(out_array),
+    )))
+}
+
+/// Two-pass mean and inverse standard deviation, matching the eager
+/// `z_normalization` transform (mean, then squared deviations in f64).
+fn znorm_stats(slice: &[f32]) -> Result<(f32, f32)> {
+    let len = slice.len();
+    if len == 0 {
+        return Err(Error::InvalidDimensions(
+            "z-normalization on empty array".into(),
+        ));
+    }
+
+    let (sum, _, _) = parallel_sum_and_sum_sq_f32(slice);
+    let mean = sum / len as f64;
+
+    let sum_sq_dev: f64 = slice
+        .par_chunks(ZNORM_CHUNK_SIZE)
+        .map(|chunk| {
+            chunk
+                .iter()
+                .map(|&v| {
+                    let d = v as f64 - mean;
+                    d * d
+                })
+                .sum::<f64>()
+        })
+        .sum();
+    let variance = sum_sq_dev / len as f64;
+
+    if !mean.is_finite() || !variance.is_finite() {
+        return Err(Error::Configuration(
+            "z-normalization statistics are not finite (input contains NaN or infinity)".into(),
+        ));
+    }
+
+    let inv_std = if variance <= 0.0 {
+        1.0f32
+    } else {
+        1.0 / (variance.sqrt() as f32)
+    };
+    Ok((mean as f32, inv_std))
+}
+
+/// Apply a linear intensity transformation: output = input * scale + offset
+fn apply_linear_intensity(image: &NiftiImage, scale: f32, offset: f32) -> Result<NiftiImage> {
+    use ndarray::ShapeBuilder;
+
+    let mut owned = None;
+    let slice = f32_input(image, &mut owned)?;
+    let mut output = vec![0.0f32; slice.len()];
+    parallel_linear_transform_f32(slice, &mut output, scale, offset);
+
+    let shape = image.shape();
+    let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output)
+        .map_err(|e| Error::InvalidDimensions(format!("Shape mismatch: {}", e)))?;
+    let mut header = image.header().clone();
+    header.datatype = DataType::Float32;
+    header.scl_slope = 1.0;
+    header.scl_inter = 0.0;
+    Ok(NiftiImage::from_parts(header, ArrayData::F32(out_array)))
 }
 
 #[allow(clippy::similar_names)]
@@ -498,87 +419,115 @@ fn apply_affine(
     matrix: &[[f32; 4]; 4],
     output_shape: [usize; 3],
     interpolation: TransformsInterpolation,
-) -> crate::error::Result<NiftiImage> {
-    use crate::error::Error;
+) -> Result<NiftiImage> {
     use ndarray::ShapeBuilder;
 
-    let data = image.to_f32()?;
-    let shape = data.shape();
+    let mut owned = None;
+    let src = f32_input(image, &mut owned)?;
+    let shape = image.shape();
     let (id, ih, iw) = (shape[0], shape[1], shape[2]);
-    let src = data
-        .as_slice_memory_order()
-        .ok_or_else(|| Error::InvalidDimensions("Array not contiguous".into()))?;
     let stride_z = ih * iw;
     let stride_y = iw;
 
     let (od, oh, ow) = (output_shape[0], output_shape[1], output_shape[2]);
-    let mut out = vec![0.0f32; od * oh * ow];
 
-    for z in 0..od {
-        for y in 0..oh {
-            for x in 0..ow {
-                let ox = x as f32;
-                let oy = y as f32;
+    // Axis-aligned positive scaling (produced by the built-in resample
+    // transforms) goes through the shared half-pixel trilinear kernel so fused
+    // and unfused resamples agree. Translation and off-diagonal terms must be
+    // zero; flips carry a translation and fall through to the general path.
+    let is_pure_scale = matrix[0][1] == 0.0
+        && matrix[0][2] == 0.0
+        && matrix[0][3] == 0.0
+        && matrix[1][0] == 0.0
+        && matrix[1][2] == 0.0
+        && matrix[1][3] == 0.0
+        && matrix[2][0] == 0.0
+        && matrix[2][1] == 0.0
+        && matrix[2][3] == 0.0
+        && matrix[0][0] > 0.0
+        && matrix[1][1] > 0.0
+        && matrix[2][2] > 0.0;
+
+    let out = if is_pure_scale && matches!(interpolation, TransformsInterpolation::Trilinear) {
+        trilinear_resample_forder_adaptive(src, [id, ih, iw], [od, oh, ow])
+    } else {
+        let mut out = vec![0.0f32; od * oh * ow];
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(z, slab)| {
                 let oz = z as f32;
-                let sx = matrix[0][0] * ox + matrix[0][1] * oy + matrix[0][2] * oz + matrix[0][3];
-                let sy = matrix[1][0] * ox + matrix[1][1] * oy + matrix[1][2] * oz + matrix[1][3];
-                let sz = matrix[2][0] * ox + matrix[2][1] * oy + matrix[2][2] * oz + matrix[2][3];
+                for y in 0..oh {
+                    let oy = y as f32;
+                    for x in 0..ow {
+                        let ox = x as f32;
+                        let sx = matrix[0][0] * ox
+                            + matrix[0][1] * oy
+                            + matrix[0][2] * oz
+                            + matrix[0][3];
+                        let sy = matrix[1][0] * ox
+                            + matrix[1][1] * oy
+                            + matrix[1][2] * oz
+                            + matrix[1][3];
+                        let sz = matrix[2][0] * ox
+                            + matrix[2][1] * oy
+                            + matrix[2][2] * oz
+                            + matrix[2][3];
 
-                let idx = z * oh * ow + y * ow + x;
+                        let dst = &mut slab[y * ow + x];
 
-                // Valid range is [0, size-1] for each dimension
-                if sx < 0.0
-                    || sy < 0.0
-                    || sz < 0.0
-                    || sx > (iw - 1) as f32
-                    || sy > (ih - 1) as f32
-                    || sz > (id - 1) as f32
-                {
-                    out[idx] = 0.0;
-                    continue;
-                }
+                        if sx < 0.0
+                            || sy < 0.0
+                            || sz < 0.0
+                            || sx > (iw - 1) as f32
+                            || sy > (ih - 1) as f32
+                            || sz > (id - 1) as f32
+                        {
+                            *dst = 0.0;
+                            continue;
+                        }
 
-                match interpolation {
-                    TransformsInterpolation::Nearest => {
-                        let xi = (sx.round() as usize).min(iw - 1);
-                        let yi = (sy.round() as usize).min(ih - 1);
-                        let zi = (sz.round() as usize).min(id - 1);
-                        out[idx] = src[zi * stride_z + yi * stride_y + xi];
+                        match interpolation {
+                            TransformsInterpolation::Nearest => {
+                                let xi = (sx.round() as usize).min(iw - 1);
+                                let yi = (sy.round() as usize).min(ih - 1);
+                                let zi = (sz.round() as usize).min(id - 1);
+                                *dst = src[zi * stride_z + yi * stride_y + xi];
+                            }
+                            TransformsInterpolation::Trilinear => {
+                                let x0 = sx.floor() as usize;
+                                let y0 = sy.floor() as usize;
+                                let z0 = sz.floor() as usize;
+                                let x1 = (x0 + 1).min(iw - 1);
+                                let y1 = (y0 + 1).min(ih - 1);
+                                let z1 = (z0 + 1).min(id - 1);
+
+                                let fx = sx - x0 as f32;
+                                let fy = sy - y0 as f32;
+                                let fz = sz - z0 as f32;
+
+                                let c000 = src[z0 * stride_z + y0 * stride_y + x0];
+                                let c001 = src[z0 * stride_z + y0 * stride_y + x1];
+                                let c010 = src[z0 * stride_z + y1 * stride_y + x0];
+                                let c011 = src[z0 * stride_z + y1 * stride_y + x1];
+                                let c100 = src[z1 * stride_z + y0 * stride_y + x0];
+                                let c101 = src[z1 * stride_z + y0 * stride_y + x1];
+                                let c110 = src[z1 * stride_z + y1 * stride_y + x0];
+                                let c111 = src[z1 * stride_z + y1 * stride_y + x1];
+
+                                let c00 = c000 * (1.0 - fx) + c001 * fx;
+                                let c01 = c010 * (1.0 - fx) + c011 * fx;
+                                let c10 = c100 * (1.0 - fx) + c101 * fx;
+                                let c11 = c110 * (1.0 - fx) + c111 * fx;
+                                let c0 = c00 * (1.0 - fy) + c01 * fy;
+                                let c1 = c10 * (1.0 - fy) + c11 * fy;
+                                *dst = c0 * (1.0 - fz) + c1 * fz;
+                            }
+                        }
                     }
-                    TransformsInterpolation::Trilinear => {
-                        let x0 = sx.floor() as usize;
-                        let y0 = sy.floor() as usize;
-                        let z0 = sz.floor() as usize;
-                        // Clamp upper indices to handle boundary exactly at size-1
-                        let x1 = (x0 + 1).min(iw - 1);
-                        let y1 = (y0 + 1).min(ih - 1);
-                        let z1 = (z0 + 1).min(id - 1);
-
-                        let fx = sx - x0 as f32;
-                        let fy = sy - y0 as f32;
-                        let fz = sz - z0 as f32;
-
-                        let c000 = src[z0 * stride_z + y0 * stride_y + x0];
-                        let c001 = src[z0 * stride_z + y0 * stride_y + x1];
-                        let c010 = src[z0 * stride_z + y1 * stride_y + x0];
-                        let c011 = src[z0 * stride_z + y1 * stride_y + x1];
-                        let c100 = src[z1 * stride_z + y0 * stride_y + x0];
-                        let c101 = src[z1 * stride_z + y0 * stride_y + x1];
-                        let c110 = src[z1 * stride_z + y1 * stride_y + x0];
-                        let c111 = src[z1 * stride_z + y1 * stride_y + x1];
-
-                        let c00 = c000 * (1.0 - fx) + c001 * fx;
-                        let c01 = c010 * (1.0 - fx) + c011 * fx;
-                        let c10 = c100 * (1.0 - fx) + c101 * fx;
-                        let c11 = c110 * (1.0 - fx) + c111 * fx;
-                        let c0 = c00 * (1.0 - fy) + c01 * fy;
-                        let c1 = c10 * (1.0 - fy) + c11 * fy;
-                        out[idx] = c0 * (1.0 - fz) + c1 * fz;
-                    }
                 }
-            }
-        }
-    }
+            });
+        out
+    };
 
     let out_array = ArrayD::from_shape_vec(IxDyn(&[od, oh, ow]).f(), out)
         .map_err(|e| Error::InvalidDimensions(format!("Shape mismatch: {}", e)))?;
@@ -591,14 +540,15 @@ fn apply_affine(
     header.datatype = DataType::Float32;
     header.scl_slope = 1.0;
     header.scl_inter = 0.0;
-    // Keep spacing/affine from the source for now; caller may overwrite
     Ok(NiftiImage::from_parts(header, ArrayData::F32(out_array)))
 }
+
 /// Trait for transforms that support lazy evaluation.
 pub trait LazyTransform {
-    /// Return the pending operation(s) for this transform.
-    /// If the transform cannot be lazily evaluated, returns None.
-    fn to_pending_op(&self, image: &LazyImage) -> Option<Vec<PendingOp>>;
+    /// Return the pending operation(s) for this transform, given the current
+    /// (already materialized) image. Returns `None` when the transform cannot
+    /// be lazily evaluated.
+    fn to_pending_op(&self, image: &NiftiImage) -> Option<Vec<PendingOp>>;
 
     /// Whether this transform requires the actual image data.
     /// If false, the transform can be lazily composed.

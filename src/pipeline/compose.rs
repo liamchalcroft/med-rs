@@ -1,8 +1,9 @@
 //! Transform composition for building pipelines.
 
-use super::lazy::{execute_fused_intensity, LazyImage, LazyTransform, PendingOp};
+use super::lazy::{materialize_ops, push_pending, LazyTransform, PendingOp};
 use crate::error::Result;
 use crate::nifti::NiftiImage;
+use std::borrow::Cow;
 
 /// A composable transform that can be applied eagerly or lazily.
 pub trait Transform {
@@ -23,7 +24,7 @@ pub struct Compose {
 /// Internal trait for type-erased transforms.
 trait TransformBox: Send + Sync {
     fn apply_eager(&self, image: &NiftiImage) -> Result<NiftiImage>;
-    fn to_pending(&self, image: &LazyImage) -> Option<Vec<PendingOp>>;
+    fn to_pending(&self, image: &NiftiImage) -> Option<Vec<PendingOp>>;
     fn requires_data(&self) -> bool;
 }
 
@@ -32,7 +33,7 @@ impl<T: Transform + LazyTransform + Send + Sync + 'static> TransformBox for T {
         self.apply(image)
     }
 
-    fn to_pending(&self, image: &LazyImage) -> Option<Vec<PendingOp>> {
+    fn to_pending(&self, image: &NiftiImage) -> Option<Vec<PendingOp>> {
         self.to_pending_op(image)
     }
 
@@ -87,51 +88,53 @@ impl Compose {
 
     /// Apply transforms eagerly (one at a time).
     fn apply_eager(&self, image: &NiftiImage) -> Result<NiftiImage> {
-        let mut result = image.clone();
-        for transform in &self.transforms {
+        let mut iter = self.transforms.iter();
+        let Some(first) = iter.next() else {
+            return Ok(image.clone());
+        };
+        let mut result = first.apply_eager(image)?;
+        for transform in iter {
             result = transform.apply_eager(&result)?;
         }
         Ok(result)
     }
 
     /// Apply transforms lazily (accumulate and execute in batches).
+    ///
+    /// The input is borrowed until a transform produces a new image or pending
+    /// ops must be materialized, so the common all-lazy pipeline never clones
+    /// the input volume.
     fn apply_lazy(&self, image: &NiftiImage) -> Result<NiftiImage> {
-        let mut lazy_img = LazyImage::from_image(image.clone());
+        if self.transforms.is_empty() {
+            return Ok(image.clone());
+        }
+
+        let mut base: Cow<'_, NiftiImage> = Cow::Borrowed(image);
+        let mut pending: Vec<PendingOp> = Vec::new();
 
         for transform in &self.transforms {
             if transform.requires_data() {
-                // This transform needs actual data, materialize first
-                if lazy_img.has_pending() {
-                    let img = lazy_img.materialize()?;
-                    let result = transform.apply_eager(&img)?;
-                    lazy_img = LazyImage::from_image(result);
-                } else if let Some(img) = lazy_img.image.take() {
-                    let result = transform.apply_eager(&img)?;
-                    lazy_img = LazyImage::from_image(result);
+                if !pending.is_empty() {
+                    base = Cow::Owned(materialize_ops(base.as_ref(), &pending)?);
+                    pending.clear();
                 }
-            } else if let Some(ops) = transform.to_pending(&lazy_img) {
+                base = Cow::Owned(transform.apply_eager(base.as_ref())?);
+            } else if let Some(ops) = transform.to_pending(base.as_ref()) {
                 for op in ops {
-                    lazy_img.push_op(op);
+                    push_pending(&mut pending, op);
                 }
             } else {
-                // Transform can't be made lazy, apply eagerly
-                let img = lazy_img.materialize()?;
-                let result = transform.apply_eager(&img)?;
-                lazy_img = LazyImage::from_image(result);
+                let materialized = materialize_ops(base.as_ref(), &pending)?;
+                base = Cow::Owned(transform.apply_eager(&materialized)?);
+                pending.clear();
             }
         }
 
-        // Try to fuse pending intensity ops before materialization
-        if lazy_img.has_pending() {
-            let pending = lazy_img.pending.clone();
-            if let Some(img) = &lazy_img.image {
-                if let Some(fused) = execute_fused_intensity(img, &pending) {
-                    return Ok(fused);
-                }
-            }
+        if pending.is_empty() {
+            Ok(base.into_owned())
+        } else {
+            materialize_ops(base.as_ref(), &pending)
         }
-
-        lazy_img.materialize()
     }
 
     /// Get the number of transforms in the pipeline.
@@ -247,15 +250,10 @@ impl Transform for ZNormalizeTransform {
 }
 
 impl LazyTransform for ZNormalizeTransform {
-    fn to_pending_op(&self, _image: &LazyImage) -> Option<Vec<PendingOp>> {
-        // Z-normalization requires computing stats, so we need the data
-        // But we can return it as a pending op that will be fused later
-        // For now, return None to force eager evaluation for stats
-        None
-    }
-
-    fn requires_data(&self) -> bool {
-        true // Need to compute mean/std
+    fn to_pending_op(&self, _image: &NiftiImage) -> Option<Vec<PendingOp>> {
+        // Stats are deferred to materialization, letting z-normalize fuse with a
+        // following clamp or linear op in one pass.
+        Some(vec![PendingOp::ZNormalize])
     }
 }
 
@@ -271,7 +269,7 @@ impl Transform for RescaleTransform {
 }
 
 impl LazyTransform for RescaleTransform {
-    fn to_pending_op(&self, _image: &LazyImage) -> Option<Vec<PendingOp>> {
+    fn to_pending_op(&self, _image: &NiftiImage) -> Option<Vec<PendingOp>> {
         // Rescaling requires knowing min/max, needs data
         None
     }
@@ -293,15 +291,11 @@ impl Transform for ClampTransform {
 }
 
 impl LazyTransform for ClampTransform {
-    fn to_pending_op(&self, _image: &LazyImage) -> Option<Vec<PendingOp>> {
+    fn to_pending_op(&self, _image: &NiftiImage) -> Option<Vec<PendingOp>> {
         Some(vec![PendingOp::Clamp {
             min: self.min,
             max: self.max,
         }])
-    }
-
-    fn requires_data(&self) -> bool {
-        false
     }
 }
 
@@ -320,9 +314,9 @@ impl Transform for ResampleSpacingTransform {
 }
 
 impl LazyTransform for ResampleSpacingTransform {
-    fn to_pending_op(&self, image: &LazyImage) -> Option<Vec<PendingOp>> {
+    fn to_pending_op(&self, image: &NiftiImage) -> Option<Vec<PendingOp>> {
         // Get current spacing from image
-        let current_spacing = image.image.as_ref()?.spacing();
+        let current_spacing = image.spacing();
 
         // Compute scale factors: new_spacing / old_spacing
         // This maps output coordinates to input coordinates
@@ -331,7 +325,7 @@ impl LazyTransform for ResampleSpacingTransform {
         let scale_z = self.spacing[2] / current_spacing[2];
 
         // Compute output shape
-        let shape = image.image.as_ref()?.shape();
+        let shape = image.shape();
         let new_shape = [
             ((shape[0] as f32) / scale_x).round() as usize,
             ((shape[1] as f32) / scale_y).round() as usize,
@@ -373,9 +367,9 @@ impl Transform for ResampleShapeTransform {
 }
 
 impl LazyTransform for ResampleShapeTransform {
-    fn to_pending_op(&self, image: &LazyImage) -> Option<Vec<PendingOp>> {
+    fn to_pending_op(&self, image: &NiftiImage) -> Option<Vec<PendingOp>> {
         // Get current shape from image
-        let current_shape = image.image.as_ref()?.shape();
+        let current_shape = image.shape();
 
         // Compute scale factors: old_shape / new_shape
         // This maps output coordinates to input coordinates
@@ -415,12 +409,8 @@ impl Transform for FlipTransform {
 }
 
 impl LazyTransform for FlipTransform {
-    fn to_pending_op(&self, _image: &LazyImage) -> Option<Vec<PendingOp>> {
+    fn to_pending_op(&self, _image: &NiftiImage) -> Option<Vec<PendingOp>> {
         Some(vec![PendingOp::Flip { axes: self.axes }])
-    }
-
-    fn requires_data(&self) -> bool {
-        false
     }
 }
 
