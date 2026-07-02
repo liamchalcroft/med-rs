@@ -8,8 +8,8 @@ Thank you for your interest in contributing to medrs! This guide will help you g
 
 1. **Fork and clone the repository**
    ```bash
-   git clone https://github.com/your-username/medrs.git
-   cd medrs
+   git clone https://github.com/your-username/med-rs.git
+   cd med-rs
    ```
 
 2. **Set up the development environment**
@@ -63,7 +63,7 @@ pytest tests/ --cov=medrs
 
 # Run benchmarks
 cargo bench
-python examples/basic/benchmark.py
+python benchmarks/bench_medrs.py --quick
 
 # Test specific integrations
 pytest tests/test_monai_integration.py
@@ -95,22 +95,23 @@ medrs/
 +-- src/                     # Core Rust library
 |   +-- nifti/              # NIfTI file format support
 |   +-- transforms/         # High-performance transforms
-|   +-- pipeline/           # Training pipeline utilities
-|   +-- python.rs           # Python bindings (PyO3)
-+-- src/python/             # Python API and utilities
-|   +-- __init__.py         # Main Python module
-|   +-- exceptions.py       # Error handling
-|   +-- performance_profiler.py  # Performance monitoring
+|   +-- pipeline/           # Transform pipeline composition
+|   +-- jvol/               # .jvol volumetric compression (feature = "jvol")
+|   +-- python/             # Python bindings (PyO3, feature = "python")
+|       +-- mod.rs           # Module entry point
+|       +-- medrs/           # Python-source package (__init__.py, exceptions.py, ...)
 +-- examples/               # Usage examples
 |   +-- basic/             # Getting started examples
 |   +-- integrations/      # Framework examples
 |   +-- advanced/          # Production patterns
-+-- tests/                 # Comprehensive test suite
-|   +-- integration/       # Integration tests
-|   +-- conftest.py        # Test configuration
++-- tests/                 # Comprehensive test suite (Rust integration tests + pytest)
+|   +-- fixtures/          # Test data
+|   +-- conftest.py        # pytest configuration
 +-- benchmarks/            # Performance benchmarks
-+-- docs/                  # Documentation
++-- docs/                  # Sphinx documentation
++-- paper/                 # Accompanying paper (paper/medrs.tex)
 +-- pyproject.toml         # Python project configuration
++-- Cargo.toml             # Rust crate configuration
 ```
 
 ## Testing Guidelines
@@ -207,8 +208,9 @@ cargo bench
 # Python benchmarks
 pytest tests/ --benchmark-only
 
-# Compare with alternatives
-python examples/integrations/performance_comparison.py
+# Compare with alternatives (nibabel, MONAI, TorchIO)
+python benchmarks/bench_medrs.py
+python benchmarks/compare_all.py
 ```
 
 ### Performance Checklist
@@ -317,29 +319,10 @@ When requesting features:
 3. **Tag the release**
 4. **Build and publish to PyPI**
 
-## Community Guidelines
-
-### Code of Conduct
-
-- Be respectful and inclusive
-- Welcome newcomers
-- Focus on constructive feedback
-- Help others learn and contribute
-
-### Getting Help
+## Getting Help
 
 - **GitHub Issues**: For bugs and feature requests
-- **GitHub Discussions**: For questions and ideas
-- **Documentation**: For usage guidance
-
-## Recognition
-
-Contributors are recognized in:
-
-- **README.md**: Major contributors section
-- **CHANGELOG.md**: Feature attributions
-- **Release notes**: Specific contributions
-- **Documentation**: Author credits
+- **Documentation**: https://medrs.readthedocs.io
 
 ## Release Checklist
 
@@ -377,8 +360,8 @@ pytest tests/ --cov=medrs --cov-report=html
 # Documentation build
 cd docs && make html
 
-# Performance profiling
-cargo run --example profile_workload --release
+# Performance profiling (Criterion, HTML reports under target/criterion/)
+cargo bench
 ```
 
 ### IDE Setup

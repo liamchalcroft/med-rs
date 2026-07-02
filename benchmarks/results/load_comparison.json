@@ -1,0 +1,90 @@
+{
+  "128^3 nii": {
+    "medrs": {
+      "best_ms": 1.24,
+      "median_ms": 1.26
+    },
+    "nibabel": {
+      "best_ms": 1.42,
+      "median_ms": 1.75
+    },
+    "monai": {
+      "best_ms": 12.57,
+      "median_ms": 17.46
+    },
+    "torchio": {
+      "best_ms": 8.36,
+      "median_ms": 11.71
+    },
+    "simpleitk": {
+      "best_ms": 3.86,
+      "median_ms": 4.8
+    }
+  },
+  "128^3 nii.gz": {
+    "medrs": {
+      "best_ms": 41.51,
+      "median_ms": 81.74
+    },
+    "nibabel": {
+      "best_ms": 32.17,
+      "median_ms": 45.85
+    },
+    "monai": {
+      "best_ms": 44.25,
+      "median_ms": 100.63
+    },
+    "torchio": {
+      "best_ms": 15.22,
+      "median_ms": 19.26
+    },
+    "simpleitk": {
+      "best_ms": 16.52,
+      "median_ms": 23.88
+    }
+  },
+  "256^3 nii": {
+    "medrs": {
+      "best_ms": 11.72,
+      "median_ms": 16.62
+    },
+    "nibabel": {
+      "best_ms": 15.68,
+      "median_ms": 23.9
+    },
+    "monai": {
+      "best_ms": 319.55,
+      "median_ms": 378.42
+    },
+    "torchio": {
+      "best_ms": 188.85,
+      "median_ms": 216.56
+    },
+    "simpleitk": {
+      "best_ms": 31.51,
+      "median_ms": 67.09
+    }
+  },
+  "256^3 nii.gz": {
+    "medrs": {
+      "best_ms": 247.7,
+      "median_ms": 372.62
+    },
+    "nibabel": {
+      "best_ms": 560.8,
+      "median_ms": 664.52
+    },
+    "monai": {
+      "best_ms": 467.52,
+      "median_ms": 916.2
+    },
+    "torchio": {
+      "best_ms": 145.31,
+      "median_ms": 202.14
+    },
+    "simpleitk": {
+      "best_ms": 35.96,
+      "median_ms": 38.51
+    }
+  }
+}

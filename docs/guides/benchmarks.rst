@@ -1,245 +1,98 @@
+
 Benchmarks
 ==========
 
-Comprehensive performance benchmarks comparing medrs against MONAI and TorchIO across common medical imaging operations.
-
-.. _benchmark-summary:
-
-Benchmark Summary
------------------
-
-.. image:: /_static/benchmark_summary.png
-   :alt: Benchmark summary plot showing medrs, MONAI, and TorchIO performance
-   :align: center
-   :width: 100%
-
-*Figure: Median execution time (ms) vs volume size for common operations. Lower is better.*
-
-Key findings at 512³ volume size:
-
-- **load**: medrs ~38,000x faster than MONAI, ~6,600x faster than TorchIO
-- **load_cropped**: medrs ~6,600x faster than MONAI, ~1,400x faster than TorchIO
-- **load_resampled**: medrs ~900x faster than MONAI, ~600x faster than TorchIO
-- **load_cropped_to_torch**: medrs ~7,000x faster than MONAI, ~1,400x faster than TorchIO
-
-The speedup advantage increases dramatically with volume size due to medrs's O(log n) scaling vs O(n) for Python-based libraries.
+Performance measurements comparing medrs against nibabel, MONAI, TorchIO, and SimpleITK for common medical imaging operations, and the numbers behind medrs's own mixed-precision storage and FastLoader features.
 
 .. _load-performance:
 
-Load Performance
-----------------
+Single File Loading
+--------------------
 
-Basic NIfTI file loading without transformations.
+medrs memory-maps uncompressed ``.nii`` files, so opening and materializing a volume is comparable to nibabel (which also memory-maps) and roughly 10-25x faster than MONAI and TorchIO, whose default loaders eagerly read the data and build a tensor. For gzipped ``.nii.gz``, load time is bounded by the decompressor: medrs is competitive with nibabel and MONAI, while SimpleITK and TorchIO decompress faster than medrs's single-threaded path (the parallel Mgzip format below is medrs's fast path for compressed data).
+
+The table below times load plus full materialization to a numpy array, so every library does the same work. Multiples are relative to medrs.
 
 .. list-table::
    :header-rows: 1
-   :widths: 15 15 15 15 15 15
+   :widths: 12 14 12 12 12 12 14
 
-   * - Size
-     - medrs (ms)
-     - MONAI (ms)
-     - TorchIO (ms)
-     - vs MONAI
-     - vs TorchIO
-   * - 64³
-     - 0.13
-     - 1.34
-     - 2.35
-     - **10x**
-     - **18x**
+   * - Volume
+     - Format
+     - medrs
+     - nibabel
+     - MONAI
+     - TorchIO
+     - SimpleITK
    * - 128³
-     - 0.13
-     - 4.55
-     - 4.71
-     - **35x**
-     - **36x**
+     - .nii
+     - 1.3 ms
+     - 1.4x
+     - 14x
+     - 9x
+     - 4x
    * - 256³
-     - 0.14
-     - 159.11
-     - 95.18
-     - **1,136x**
-     - **680x**
-   * - 512³
-     - 0.13
-     - 5,006.76
-     - 866.54
-     - **38,513x**
-     - **6,665x**
-
-.. _crop-first-loading:
-
-Crop-First Loading
-------------------
-
-Loading only a cropped region (64³ patch) without reading the entire volume.
-
-.. list-table::
-   :header-rows: 1
-   :widths: 15 15 15 15 15 15
-
-   * - Source Size
-     - medrs (ms)
-     - MONAI (ms)
-     - TorchIO (ms)
-     - vs MONAI
-     - vs TorchIO
-   * - 64³
-     - 0.27
-     - 1.75
-     - 6.00
-     - **6x**
-     - **22x**
+     - .nii
+     - 17 ms
+     - 1.4x
+     - 23x
+     - 13x
+     - 4x
    * - 128³
-     - 0.41
-     - 4.68
-     - 9.86
-     - **11x**
-     - **24x**
+     - .nii.gz
+     - 82 ms
+     - 0.6x
+     - 1.2x
+     - 0.2x
+     - 0.3x
    * - 256³
-     - 0.55
-     - 154.86
-     - 104.48
-     - **282x**
-     - **190x**
-   * - 512³
-     - 0.76
-     - 5,041.42
-     - 1,076.89
-     - **6,633x**
-     - **1,417x**
+     - .nii.gz
+     - 370 ms
+     - 1.8x
+     - 2.5x
+     - 0.5x
+     - 0.1x
 
-This is the key differentiator for training pipelines where you extract random patches from large volumes.
+*Measured on Apple Silicon with* ``benchmarks/bench_load_comparison.py`` *(float32, structured data). For uncompressed volumes medrs and nibabel both memory-map, so they are close; the large multiples are against loaders that materialize eagerly.*
 
-.. _resampling:
+.. _mgzip-scaling:
 
-Load Resampled
----------------
+Mgzip Thread Scaling
+---------------------
 
-Loading with resampling to half resolution.
+Mgzip (multi-member gzip) splits a file into independently-decompressible blocks. Its own thread-scaling numbers, measured against medrs's single-threaded libdeflate baseline on a 256³ volume:
 
 .. list-table::
    :header-rows: 1
-   :widths: 15 15 15 15 15 15
+   :widths: 20 20 30 30
 
-   * - Source Size
-     - medrs (ms)
-     - MONAI (ms)
-     - TorchIO (ms)
-     - vs MONAI
-     - vs TorchIO
-   * - 64³ → 32³
-     - 0.18
-     - 1.93
-     - 5.45
-     - **11x**
-     - **30x**
-   * - 128³ → 64³
-     - 0.40
-     - 6.88
-     - 27.65
-     - **17x**
-     - **69x**
-   * - 256³ → 128³
-     - 2.02
-     - 178.87
-     - 363.85
-     - **89x**
-     - **180x**
-   * - 512³ → 256³
-     - 6.67
-     - 5,960.93
-     - 4,039.05
-     - **894x**
-     - **605x**
+   * - Threads
+     - Time (ms)
+     - Speedup vs 1 thread
+     - Speedup vs libdeflate baseline
+   * - 1
+     - 206
+     - 1.0x
+     - 0.7x (slightly slower)
+   * - 2
+     - 111
+     - 1.9x
+     - 1.2x
+   * - 4
+     - 62
+     - 3.3x
+     - 2.2x
+   * - 8
+     - 44
+     - 4.7x
+     - 3.0x
 
-.. _pytorch-integration:
-
-PyTorch Integration
--------------------
-
-Direct loading to PyTorch tensors without intermediate numpy arrays.
-
-.. list-table::
-   :header-rows: 1
-   :widths: 15 15 15 15 15 15
-
-   * - Source Size
-     - medrs (ms)
-     - MONAI (ms)
-     - TorchIO (ms)
-     - vs MONAI
-     - vs TorchIO
-   * - 64³
-     - 0.34
-     - 1.58
-     - 5.37
-     - **5x**
-     - **16x**
-   * - 128³
-     - 0.49
-     - 5.14
-     - 10.22
-     - **10x**
-     - **21x**
-   * - 256³
-     - 0.60
-     - 162.78
-     - 53.70
-     - **271x**
-     - **90x**
-   * - 512³
-     - 0.84
-     - 5,864.85
-     - 1,223.24
-     - **6,982x**
-     - **1,456x**
-
-.. _normalization:
-
-Load with Normalization
-------------------------
-
-Loading with z-score normalization (zero mean, unit variance).
-
-.. list-table::
-   :header-rows: 1
-   :widths: 15 15 15 15 15 15
-
-   * - Source Size
-     - medrs (ms)
-     - MONAI (ms)
-     - TorchIO (ms)
-     - vs MONAI
-     - vs TorchIO
-   * - 64³
-     - 0.49
-     - 2.15
-     - 7.04
-     - **4x**
-     - **14x**
-   * - 128³
-     - 0.60
-     - 5.36
-     - 12.26
-     - **9x**
-     - **20x**
-   * - 256³
-     - 0.73
-     - 163.38
-     - 53.59
-     - **224x**
-     - **73x**
-   * - 512³
-     - 1.01
-     - 3,735.31
-     - 1,092.25
-     - **3,698x**
-     - **1,081x**
+Single-threaded Mgzip is slower than the libdeflate baseline (channel and per-block buffer overhead dominate); the crossover is around 2-3 threads. This is a known limitation, not a bug; a custom parallel decompressor is planned.
 
 .. _storage-efficiency:
 
 Storage Efficiency
-------------------
+-------------------
 
 medrs supports mixed-precision storage with bf16/f16 for 40-50% file size reduction.
 
@@ -297,70 +150,66 @@ For normalized data in [0, 1]:
      - 0.000008
      - Storage/archival
 
+.. _fastloader-throughput:
+
+Training Throughput (FastLoader)
+--------------------------------
+
+The FastLoader prefetches patches across parallel worker threads with the GIL released, so patch loading overlaps decompression and disk I/O. On 64³ random crops from gzipped volumes it delivers roughly 4x the throughput of a naive sequential load-and-crop loop.
+
+.. list-table::
+   :header-rows: 1
+   :widths: 40 20 20 20
+
+   * - Loader
+     - Workers
+     - Patches/sec
+     - vs naive
+   * - medrs FastLoader
+     - 4
+     - 191
+     - 3.9x
+   * - naive sequential load + crop
+     - 1
+     - 49
+     - 1x
+
+Measured on Apple Silicon with structured 128³ volumes. Configuring a fair third-party DataLoader baseline (persistent workers, cached datasets) is workload-dependent; use ``benchmarks/bench_fastloader.py`` to compare against your own pipeline.
+
 .. _running-benchmarks:
 
-Running Benchmarks
-------------------
+Reproducing Benchmarks
+------------------------
 
-Run benchmarks locally to measure performance on your hardware:
+``benchmarks/results/`` is not checked into the repository (it is regenerated output, not a source of truth). Run the suites yourself to get numbers for your own hardware:
 
 .. code-block:: bash
 
-   # Install dependencies
-   pip install torch monai torchio
+   pip install -e ".[examples]"
 
-   # Quick benchmark (64³-256³, 5 iterations)
-   python benchmarks/bench_medrs.py --quick
-   python benchmarks/bench_monai.py --quick
-   python benchmarks/bench_torchio.py --quick
-
-   # Full benchmark (64³-512³, 20 iterations)
+   # Individual suites
    python benchmarks/bench_medrs.py
+   python benchmarks/bench_nibabel.py
    python benchmarks/bench_monai.py
    python benchmarks/bench_torchio.py
+   python benchmarks/bench_mgzip.py
+   python benchmarks/bench_fastloader.py
 
-   # Extended iterations (30 iterations)
-   python benchmarks/bench_medrs.py --full
+   # Rust-side microbenchmarks
+   cargo bench
 
-   # Generate plots from results
+   # Combined comparison report and plots
+   python benchmarks/compare_all.py
    python benchmarks/plot_results.py
 
-Plot outputs are saved to ``benchmarks/results/plots/``:
-
-- ``load.png`` - Basic loading performance
-- ``load_cropped.png`` - Crop-first loading
-- ``load_resampled.png`` - Load with resampling
-- ``load_cropped_to_torch.png`` - Direct PyTorch tensor loading
-- ``load_cropped_normalized.png`` - Load with normalization
-- ``summary.png`` - Combined summary plot
-- ``speedup_heatmap.png`` - Speedup comparison heatmap
+See ``benchmarks/BENCHMARK_PLAN.md`` for the full benchmark matrix (libraries, volume sizes, dtypes, formats).
 
 .. _methodology:
 
-Methodology
------------
+Methodology Notes
+-------------------
 
-Benchmark Conditions
-~~~~~~~~~~~~~~~~~~~~
-
-- **Iterations**: 20 per operation (default), 5 for quick, 30 for full
-- **Warmup**: 3 iterations before timing
-- **Data**: Synthetic Gaussian noise with realistic intensity distribution
-- **Format**: Uncompressed NIfTI (.nii) for fair comparison
-- **Hardware**: Apple M1 Pro (macOS arm64)
-- **Date**: December 2024
-
-What We Measure
-~~~~~~~~~~~~~~~
-
-- **Median time**: Robust central tendency (less sensitive to outliers)
-- **Std dev**: Consistency of performance
-- **Min/Max**: Range of observed times
-
-Notes
-~~~~~
-
-- Crop-first speedups depend heavily on the ratio of patch size to volume size
-- GPU benchmarks not included in default suite (CPU only)
-- Results are from synthetic data; real medical imaging data may vary
-- First load may be slower due to disk caching effects
+- medrs's uncompressed-``.nii`` load path memory-maps the file and parses the header; it does not eagerly copy voxel data into a fresh buffer. This is the main reason the uncompressed-``.nii`` numbers above look different in character from the ``.nii.gz`` numbers, where both sides decompress the full volume.
+- The Mgzip thread-scaling table isolates Mgzip's own multi-threading efficiency against medrs's single-threaded libdeflate baseline; it is a different comparison from the load-plus-materialize numbers in the single-file-loading table above.
+- Crop-first loading benefits scale with the ratio of patch size to volume size; a small patch pulled from a large volume benefits more than a patch close to the full volume size.
+- Results are from synthetic data on Apple Silicon; real medical imaging data and different hardware will vary.

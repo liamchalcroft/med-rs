@@ -20,6 +20,7 @@ Contents
    guides/advanced_features
    guides/performance_optimization
    guides/benchmarks
+   guides/compression
    guides/error_handling
 
 .. toctree::
@@ -27,6 +28,7 @@ Contents
    :caption: API Reference
 
    api
+   api/python_api_reference
 
 .. toctree::
    :maxdepth: 1

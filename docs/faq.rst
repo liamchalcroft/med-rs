@@ -38,10 +38,10 @@ The Rust components are automatically compiled during installation.
 
 medrs uses several optimization techniques:
 - **Crop-first loading**: Only reads the exact bytes needed for your crop
-- **Zero-copy operations**: Direct tensor creation without intermediate copies
-- **SIMD optimization**: Vectorized operations for data processing
-- **Memory pooling**: Intelligent buffer reuse to minimize allocations
-- **Parallel I/O**: Multi-threaded file operations
+- **Zero-copy operations**: Direct tensor creation without intermediate copies (where the source data type and endianness allow it)
+- **SIMD optimization**: Portable SIMD (``wide::f32x8``) for vectorized data processing, 8-wide when built with AVX2
+- **Operation fusion**: Consecutive axis-aligned resamples and trailing intensity operations are resolved once and applied in a single pass
+- **Parallel I/O**: Multi-threaded file operations and Mgzip parallel decompression
 - **GPU integration**: Direct GPU memory allocation
 
 Performance Comparison
@@ -355,7 +355,7 @@ Yes, medrs is optimized for both training and inference:
        return combined
 
 Contributing
------------
+------------
 
 **How can I contribute to medrs?**
 

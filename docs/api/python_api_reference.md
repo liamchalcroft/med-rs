@@ -875,4 +875,4 @@ summary = profiler.get_summary()
 print(f"Performance summary: {summary}")
 ```
 
-For more detailed examples and advanced usage patterns, see the [Advanced Features Guide](../guides/advanced_features.md).
+For more detailed examples and advanced usage patterns, see the [Advanced Features Guide](../guides/advanced_features.rst).
