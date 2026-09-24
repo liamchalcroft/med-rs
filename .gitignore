@@ -1,82 +1,21 @@
 # Rust
 /target/
-**/*.rs.bk
-*.prof
 
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
 *.so
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
-
-# Virtual environments
-.env
+*.pyd
+/dist/
 .venv/
-env/
-venv/
-ENV/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Testing
 .pytest_cache/
-.coverage
-htmlcov/
-.tox/
-.cache/
-.hypothesis/
-coverage.xml
-*.cover
-
-# Documentation
-docs/_build/
-docs/.doctrees/
-
-# Jupyter
-.ipynb_checkpoints/
-
-# mypy / type checking
 .mypy_cache/
-.dmypy.json
 .ruff_cache/
-.pyright/
 
-# Development
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local Claude Code settings
 .claude/
-
-# Test output
-tests/output/
-
-# Benchmark results (regeneratable, keep out of version control)
-benchmarks/results/*
-!benchmarks/results/load_comparison.json
-benchmarks/test_data/
-
-# Paper (keep separate from library code)
-paper/
