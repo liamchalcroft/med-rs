@@ -239,3 +239,16 @@ fn corruption_and_hostile_files_are_detected() {
     b[12..16].copy_from_slice(&u32::MAX.to_le_bytes());
     assert!(check(&b));
 }
+
+#[test]
+fn files_from_medrs_0_2_and_other_formats_are_named_in_errors() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("old.jvol");
+    // medrs 0.2 files are a zstd frame.
+    std::fs::write(&path, [0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0]).unwrap();
+    let err = crate::nifti::load(&path).unwrap_err().to_string();
+    assert!(err.contains("written by medrs 0.2"), "{err}");
+    std::fs::write(&path, b"not a volume").unwrap();
+    let err = crate::nifti::load(&path).unwrap_err().to_string();
+    assert!(err.contains("not a .jvol file"), "{err}");
+}

@@ -48,6 +48,10 @@ fn load_cropped(
 }
 
 /// Read only the header of an image file, as a dictionary.
+///
+/// No voxel data is read: `.nii` files read the header and extensions,
+/// gzipped files decompress only those bytes, and `.jvol` files read only the
+/// header and chunk index.
 #[pyfunction]
 fn load_header(py: Python<'_>, path: PathBuf) -> PyResult<Bound<'_, PyDict>> {
     let header = py.detach(|| medrs::nifti::load_header(&path)).or_raise()?;

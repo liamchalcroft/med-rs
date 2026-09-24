@@ -72,6 +72,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 const MAGIC: &[u8; 8] = b"\x89JVL\r\n\x1a\n";
+/// Files written by medrs 0.2 were a single zstd frame.
+const MAGIC_0_2: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 const VERSION: u16 = 1;
 const PREAMBLE: usize = 40;
 const TABLE_ENTRY: usize = 16;
@@ -443,8 +445,19 @@ impl Reader {
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self> {
         let path = path.as_ref();
         let buf = open_bytes(path)?;
+        if buf.starts_with(&MAGIC_0_2) {
+            return Err(invalid(
+                path,
+                "this .jvol file was written by medrs 0.2, whose format medrs 0.3 cannot read; \
+                 convert it with medrs 0.2 (see the 0.3.0 notes in CHANGELOG.md)",
+            ));
+        }
         if buf.len() < PREAMBLE || &buf[..8] != MAGIC {
-            return Err(invalid(path, "not a .jvol file (bad magic number)"));
+            let start = &buf[..buf.len().min(8)];
+            return Err(invalid(
+                path,
+                &format!("not a .jvol file (unrecognised header bytes {start:02x?})"),
+            ));
         }
         let u32_at = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
         let version = u16::from_le_bytes([buf[8], buf[9]]);

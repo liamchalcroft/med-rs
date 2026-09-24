@@ -24,7 +24,7 @@ under Fixes), so upgrading is strongly recommended.
 | `medrs.monai_compat`, `metatensor_support`, `dictionary_transforms` | `medrs.monai.MedrsReader` with MONAI's own `LoadImage(d)` |
 | `medrs.exceptions` classes | `medrs.FormatError` (a `ValueError`) and built-in exceptions |
 | `flip` left the affine unchanged | All spatial transforms update the affine (world-preserving) |
-| `.jvol` files written by 0.2 | Not readable; re-encode from the original images |
+| `.jvol` files written by 0.2 | Not readable (loading one says it was written by 0.2). Re-encode from the source images, or decode with medrs 0.2 and save with 0.3: losslessly to keep the decoded values exactly (about 12 times larger for lossy files), or lossily. 0.3's `quality` 60, 70, and 80 give about the size and error of 0.2's 70, 80, and 90 |
 | Rust: `medrs::pipeline::compose::TransformPipeline`, `LazyImage`, `simd_kernels` | `medrs::Pipeline` |
 | Rust: `python` Cargo feature | The bindings are a separate crate built by maturin |
 | Alternative spellings such as `"f32"`, `"linear"`, `"ras"` | One name each: NumPy dtype names, `"nearest"`/`"trilinear"`, upper-case orientation codes |

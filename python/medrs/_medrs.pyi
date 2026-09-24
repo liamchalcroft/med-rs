@@ -211,9 +211,28 @@ class FastLoader:
     @property
     def seed(self) -> int: ...
 
-def load(path: _StrPath, *, cache: bool = False) -> NiftiImage: ...
-def load_cropped(path: _StrPath, offset: _Shape3, shape: _Shape3) -> NiftiImage: ...
-def load_header(path: _StrPath) -> _Header: ...
+def load(path: _StrPath, *, cache: bool = False) -> NiftiImage:
+    """Load an image (`.nii`, `.nii.gz`, `.hdr`/`.img`, or `.jvol`).
+
+    With `cache=True`, decompressed data is kept in the cache (see
+    `set_cache_limits`).
+    """
+
+def load_cropped(path: _StrPath, offset: _Shape3, shape: _Shape3) -> NiftiImage:
+    """Load `shape` voxels starting at `offset` along the first three axes.
+
+    Uncompressed files read only the region, and `.jvol` files decode only
+    the chunks it overlaps. Gzipped files are decompressed once and cached.
+    """
+
+def load_header(path: _StrPath) -> _Header:
+    """Read only the header of an image file.
+
+    No voxel data is read: `.nii` files read the header and extensions,
+    gzipped files decompress only those bytes, and `.jvol` files read only the
+    header and chunk index, so scanning many files is cheap.
+    """
+
 def load_multi(
     paths: Sequence[_StrPath],
     *,

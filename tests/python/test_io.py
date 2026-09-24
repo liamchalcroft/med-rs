@@ -231,3 +231,10 @@ def test_real_volume_matches_nibabel(fixture_path):
     ref = nib.load(fixture_path)
     np.testing.assert_array_equal(img.to_numpy(), np.asanyarray(ref.dataobj))
     np.testing.assert_allclose(img.affine, ref.affine, atol=1e-6)
+
+
+def test_jvol_files_from_medrs_0_2_are_named_in_the_error(tmp_path):
+    path = tmp_path / "old.jvol"
+    path.write_bytes(bytes([0x28, 0xB5, 0x2F, 0xFD]) + bytes(60))  # a zstd frame, as 0.2 wrote
+    with pytest.raises(medrs.FormatError, match=r"written by medrs 0\.2"):
+        medrs.load(path)
