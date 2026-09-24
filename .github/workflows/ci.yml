@@ -44,10 +44,12 @@ jobs:
           RUSTDOCFLAGS: -D warnings
       - run: |
           python -m pip install --upgrade pip
-          python -m pip install --group lint
+          python -m pip install --group lint --group docs
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy
+      - name: Build the documentation site
+        run: mkdocs build
 
   rust:
     name: Rust (${{ matrix.os }})

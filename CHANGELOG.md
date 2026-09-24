@@ -84,8 +84,9 @@ under Fixes), so upgrading is strongly recommended.
 
 ### Removed
 
-- The Sphinx documentation site (replaced by `docs/guide.md` and docs.rs),
-  the `benchmark` and `docs` workflows, and the profiling and compatibility
+- The Sphinx documentation. medrs.readthedocs.io now shows the README, the
+  user guide, and this changelog, and the Rust API is on docs.rs.
+- The `benchmark` and `docs` workflows, and the profiling and compatibility
   helper modules.
 
 ## 0.2.0 (2026-07-02)

@@ -1,0 +1,44 @@
+site_name: medrs
+site_description: Fast medical image I/O, transforms, and training patch loading
+# Read the Docs sets the canonical URL of each version it builds.
+site_url: !ENV [READTHEDOCS_CANONICAL_URL, "https://medrs.readthedocs.io/"]
+repo_url: https://github.com/liamchalcroft/med-rs
+repo_name: liamchalcroft/med-rs
+strict: true
+
+nav:
+  - Home: index.md
+  - Guide: guide.md
+  - Changelog: changelog.md
+
+theme:
+  name: material
+  features:
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+
+markdown_extensions:
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+  # Pulls README.md and CHANGELOG.md into the site (see docs/index.md).
+  - pymdownx.snippets:
+      base_path: !relative $config_dir
+      check_paths: true
+
+validation:
+  omitted_files: warn
+  absolute_links: warn
+  unrecognized_links: warn
+  anchors: warn

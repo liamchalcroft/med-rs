@@ -138,19 +138,20 @@ smaller and supports crop-first reads.
 
 ## Documentation
 
-- [User guide](docs/guide.md): formats, dtype rules, transforms, pipelines,
-  training, and performance tips
+- [User guide](https://medrs.readthedocs.io/en/stable/guide/): formats, dtype
+  rules, transforms, pipelines, training, and performance tips
 - [Rust API](https://docs.rs/medrs), including the `.jvol` file format
-- [Changelog](CHANGELOG.md)
+- [Changelog](https://medrs.readthedocs.io/en/stable/changelog/)
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](https://github.com/liamchalcroft/med-rs/blob/main/CONTRIBUTING.md).
 
 ## License
 
-Licensed under either of [Apache License 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT), at your option.
+Licensed under either of
+[Apache License 2.0](https://github.com/liamchalcroft/med-rs/blob/main/LICENSE-APACHE) or
+[MIT license](https://github.com/liamchalcroft/med-rs/blob/main/LICENSE-MIT), at your option.
 
 The `.jvol` name and its wavelet approach come from Fernando Pérez-García's
 [jvol](https://github.com/fepegar/jvol).

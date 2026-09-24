@@ -30,11 +30,17 @@ monai = ["monai>=1.3"]
 [dependency-groups]
 test = ["pytest>=8", "nibabel>=5", "scipy>=1.10"]
 lint = ["ruff==0.16.8", "mypy==2.3.1", "numpy>=1.24"]
-dev = ["maturin>=1.9.4,<2", { include-group = "test" }, { include-group = "lint" }]
+docs = ["mkdocs-material==9.7.7"]
+dev = [
+  "maturin>=1.9.4,<2",
+  { include-group = "test" },
+  { include-group = "lint" },
+  { include-group = "docs" },
+]
 
 [project.urls]
 Repository = "https://github.com/liamchalcroft/med-rs"
-Documentation = "https://github.com/liamchalcroft/med-rs/tree/main/docs"
+Documentation = "https://medrs.readthedocs.io/"
 Changelog = "https://github.com/liamchalcroft/med-rs/blob/main/CHANGELOG.md"
 
 [project.scripts]

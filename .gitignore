@@ -12,6 +12,9 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
+# Documentation site (mkdocs build)
+/site/
+
 # Editors and OS
 .idea/
 .vscode/

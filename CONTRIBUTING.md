@@ -13,6 +13,7 @@ please include the output of `medrs info` for it.
 | `python/medrs/` | The Python package: re-exports, type stubs, `monai.py`, `cli.py` |
 | `tests/*.rs` | Rust integration and property tests (unit tests live next to the code) |
 | `tests/python/` | Python tests, mostly checked against nibabel |
+| `docs/` | The user guide. `mkdocs.yml` builds it, the README, and the changelog into medrs.readthedocs.io |
 | `benches/` | Criterion benchmarks |
 | `benchmarks/` | `compare.py` (the README comparison) and `jvol_chunks.py` (the guide's chunk-shape table) |
 | `examples/` | Small runnable examples (run in CI) |
@@ -38,9 +39,11 @@ cargo test --workspace --all-features --exclude medrs-python
 maturin develop && pytest
 ruff check . && ruff format --check . && mypy
 python -m mypy.stubtest medrs._medrs --mypy-config-file pyproject.toml
+mkdocs build  # strict: broken links and anchors fail
 ```
 
 Benchmarks: `cargo bench --all-features` and `python benchmarks/compare.py`.
+Preview the documentation site with `mkdocs serve`.
 
 ## Guidelines
 
