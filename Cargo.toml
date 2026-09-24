@@ -22,7 +22,7 @@ half = { version = "2.4", features = ["bytemuck"] }
 libdeflater = "1.25"
 memmap2 = "0.9.11"
 ndarray = "0.16"
-rand = "0.9"
+rand = "0.10"
 rand_chacha = "0.9"
 rand_distr = "0.5"
 rayon = "1.10"
