@@ -105,12 +105,12 @@ impl Orientation {
 impl FromStr for Orientation {
     type Err = Error;
 
-    /// Parse a three-letter code such as `"RAS"` or `"lps"`.
+    /// Parse a three-letter code such as `"RAS"` or `"LPS"`.
     fn from_str(s: &str) -> Result<Self> {
         let bad = || {
             Error::InvalidOrientation(format!(
-                "invalid orientation '{s}': expected three letters from R/L, A/P, S/I \
-                 using each pair once (e.g. 'RAS', 'LPS')"
+                "'{s}' (expected three of the letters R/L, A/P, S/I, one from each \
+                 pair, such as 'RAS' or 'LPS')"
             ))
         };
         let chars: Vec<char> = s.chars().collect();
@@ -119,7 +119,7 @@ impl FromStr for Orientation {
         }
         let mut codes = [AxisCode::R; 3];
         for (code, c) in codes.iter_mut().zip(chars) {
-            *code = match c.to_ascii_uppercase() {
+            *code = match c {
                 'R' => AxisCode::R,
                 'L' => AxisCode::L,
                 'A' => AxisCode::A,
@@ -295,9 +295,9 @@ mod tests {
 
     #[test]
     fn parse_validates_axes() {
-        assert_eq!("ras".parse::<Orientation>().unwrap(), Orientation::RAS);
+        assert_eq!("RAS".parse::<Orientation>().unwrap(), Orientation::RAS);
         assert_eq!("LPS".parse::<Orientation>().unwrap().to_string(), "LPS");
-        for bad in ["RRR", "RLA", "XYZ", "RA", "RASS"] {
+        for bad in ["RRR", "RLA", "XYZ", "RA", "RASS", "ras"] {
             assert!(bad.parse::<Orientation>().is_err(), "{bad}");
         }
         // All 48 valid orientations parse.

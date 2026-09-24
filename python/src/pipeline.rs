@@ -109,7 +109,7 @@ impl PyPipeline {
     }
 
     /// Rotate by `k` × 90 degrees in the plane of `axes`.
-    #[pyo3(signature = (axes = (0, 1), k = 1))]
+    #[pyo3(signature = (axes = (0, 1), k = 1), text_signature = "($self, axes=(0, 1), k=1)")]
     fn rotate_90(&self, py: Python<'_>, axes: (usize, usize), k: i32) -> PyResult<Self> {
         let args = (axes, k).into_pyobject(py)?;
         self.with("rotate_90", args, |p| p.rotate_90(axes, k))
@@ -151,19 +151,22 @@ impl PyPipeline {
     /// Convert to another stored datatype (for example `"float16"`).
     fn cast(&self, py: Python<'_>, dtype: &Bound<'_, PyAny>) -> PyResult<Self> {
         let parsed = parse_dtype(dtype)?;
-        let args = (parsed.numpy_name(),).into_pyobject(py)?;
+        let args = (parsed.name(),).into_pyobject(py)?;
         self.with("cast", args, |p| p.cast(parsed))
     }
 
     /// Flip each of `axes` with probability `prob`.
-    #[pyo3(signature = (axes = vec![0, 1, 2], prob = 0.5))]
+    #[pyo3(
+        signature = (axes = vec![0, 1, 2], prob = 0.5),
+        text_signature = "($self, axes=(0, 1, 2), prob=0.5)"
+    )]
     fn random_flip(&self, py: Python<'_>, axes: Vec<usize>, prob: f64) -> PyResult<Self> {
         let args = (axes.clone(), prob).into_pyobject(py)?;
         self.with("random_flip", args, |p| p.random_flip(&axes, prob))
     }
 
     /// Rotate by a random multiple of 90 degrees in the plane of `axes`.
-    #[pyo3(signature = (axes = (0, 1)))]
+    #[pyo3(signature = (axes = (0, 1)), text_signature = "($self, axes=(0, 1))")]
     fn random_rotate_90(&self, py: Python<'_>, axes: (usize, usize)) -> PyResult<Self> {
         let args = (axes,).into_pyobject(py)?;
         self.with("random_rotate_90", args, |p| p.random_rotate_90(axes))
@@ -197,7 +200,7 @@ impl PyPipeline {
     }
 
     /// Range-preserving gamma adjustment with gamma uniform in `range`.
-    #[pyo3(signature = (range = (0.7, 1.5)))]
+    #[pyo3(signature = (range = (0.7, 1.5)), text_signature = "($self, range=(0.7, 1.5))")]
     fn random_gamma(&self, py: Python<'_>, range: (f64, f64)) -> PyResult<Self> {
         let args = (range,).into_pyobject(py)?;
         self.with("random_gamma", args, |p| p.random_gamma(range))

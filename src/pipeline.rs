@@ -138,7 +138,7 @@ impl Pipeline {
         self.spatial(Spatial::Crop(offset, shape))
     }
 
-    /// See [`crop_or_pad`](crate::transforms::crop_or_pad).
+    /// See [`crop_or_pad`].
     #[must_use]
     pub fn crop_or_pad(self, shape: [usize; 3], pad_value: f64) -> Self {
         self.spatial(Spatial::CropOrPad(shape, pad_value))
@@ -168,7 +168,7 @@ impl Pipeline {
         self.push(Step::ZNormalize)
     }
 
-    /// See [`z_normalization_nonzero`](crate::transforms::z_normalization_nonzero).
+    /// See [`z_normalization_nonzero`].
     #[must_use]
     pub fn z_normalize_nonzero(self) -> Self {
         self.push(Step::ZNormalizeNonzero)
@@ -180,7 +180,7 @@ impl Pipeline {
         self.push(Step::Rescale(out_min, out_max))
     }
 
-    /// See [`adjust_gamma`](crate::transforms::adjust_gamma).
+    /// See [`adjust_gamma`].
     #[must_use]
     pub fn adjust_gamma(self, gamma: f64) -> Self {
         self.push(Step::Gamma(gamma))

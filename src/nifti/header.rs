@@ -119,26 +119,8 @@ impl DataType {
         !self.is_float()
     }
 
-    /// Short Rust-style name (`u8`, `f32`, ...).
-    pub const fn type_name(self) -> &'static str {
-        match self {
-            Self::UInt8 => "u8",
-            Self::Int8 => "i8",
-            Self::Int16 => "i16",
-            Self::UInt16 => "u16",
-            Self::Int32 => "i32",
-            Self::UInt32 => "u32",
-            Self::Int64 => "i64",
-            Self::UInt64 => "u64",
-            Self::Float16 => "f16",
-            Self::BFloat16 => "bf16",
-            Self::Float32 => "f32",
-            Self::Float64 => "f64",
-        }
-    }
-
-    /// NumPy-style name (`uint8`, `float32`, ...).
-    pub const fn numpy_name(self) -> &'static str {
+    /// Name of the type, as in NumPy (`uint8`, `float32`, ...).
+    pub const fn name(self) -> &'static str {
         match self {
             Self::UInt8 => "uint8",
             Self::Int8 => "int8",
@@ -158,7 +140,7 @@ impl DataType {
 
 impl std::fmt::Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.type_name())
+        f.write_str(self.name())
     }
 }
 
@@ -166,28 +148,33 @@ impl std::str::FromStr for DataType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        Ok(match s.to_ascii_lowercase().as_str() {
-            "u8" | "uint8" => Self::UInt8,
-            "i8" | "int8" => Self::Int8,
-            "i16" | "int16" => Self::Int16,
-            "u16" | "uint16" => Self::UInt16,
-            "i32" | "int32" => Self::Int32,
-            "u32" | "uint32" => Self::UInt32,
-            "i64" | "int64" => Self::Int64,
-            "u64" | "uint64" => Self::UInt64,
-            "f16" | "float16" => Self::Float16,
-            "bf16" | "bfloat16" => Self::BFloat16,
-            "f32" | "float32" => Self::Float32,
-            "f64" | "float64" => Self::Float64,
-            _ => {
-                return Err(Error::InvalidArgument(format!(
-                    "unknown data type '{s}' (expected one of uint8, int8, int16, uint16, \
-                     int32, uint32, int64, uint64, float16, bfloat16, float32, float64)"
-                )))
-            }
-        })
+        ALL_TYPES
+            .into_iter()
+            .find(|t| t.name() == s)
+            .ok_or_else(|| {
+                let names: Vec<&str> = ALL_TYPES.iter().map(|t| t.name()).collect();
+                Error::InvalidArgument(format!(
+                    "unknown data type '{s}' (expected one of {})",
+                    names.join(", ")
+                ))
+            })
     }
 }
+
+const ALL_TYPES: [DataType; 12] = [
+    DataType::UInt8,
+    DataType::Int8,
+    DataType::UInt16,
+    DataType::Int16,
+    DataType::UInt32,
+    DataType::Int32,
+    DataType::UInt64,
+    DataType::Int64,
+    DataType::Float16,
+    DataType::BFloat16,
+    DataType::Float32,
+    DataType::Float64,
+];
 
 /// Describe a datatype code medrs cannot load, for error messages.
 pub(crate) fn describe_unsupported_code(code: i16) -> &'static str {

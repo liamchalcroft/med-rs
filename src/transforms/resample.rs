@@ -47,9 +47,9 @@ impl std::str::FromStr for Interpolation {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        match s.to_ascii_lowercase().as_str() {
-            "nearest" | "nn" => Ok(Self::Nearest),
-            "trilinear" | "linear" | "bilinear" => Ok(Self::Trilinear),
+        match s {
+            "nearest" => Ok(Self::Nearest),
+            "trilinear" => Ok(Self::Trilinear),
             _ => Err(Error::InvalidArgument(format!(
                 "unknown interpolation '{s}' (expected 'nearest' or 'trilinear')"
             ))),

@@ -338,7 +338,7 @@ pub(crate) fn header_dict<'py>(py: Python<'py>, h: &NiftiHeader) -> PyResult<Bou
     };
     d.set_item("version", version)?;
     d.set_item("shape", PyTuple::new(py, h.shape())?)?;
-    d.set_item("dtype", h.datatype.numpy_name())?;
+    d.set_item("dtype", h.datatype.name())?;
     d.set_item("affine", affine_to_py(py, &h.affine()))?;
     d.set_item("qform", h.qform().map(|a| affine_to_py(py, &a)))?;
     d.set_item("sform", h.sform().map(|a| affine_to_py(py, &a)))?;
@@ -458,7 +458,7 @@ impl PyNiftiImage {
     /// Stored datatype name (`"uint8"`, `"float32"`, ...).
     #[getter]
     fn dtype(&self) -> &'static str {
-        self.inner.dtype().numpy_name()
+        self.inner.dtype().name()
     }
 
     /// The 4x4 voxel-to-world affine (float64).
@@ -697,7 +697,7 @@ impl PyNiftiImage {
 
     /// Rotate by `k` × 90 degrees in the plane of `axes` (like `numpy.rot90`),
     /// world-preserving.
-    #[pyo3(signature = (axes = (0, 1), k = 1))]
+    #[pyo3(signature = (axes = (0, 1), k = 1), text_signature = "($self, axes=(0, 1), k=1)")]
     fn rotate_90(&self, py: Python<'_>, axes: (usize, usize), k: i32) -> PyResult<Self> {
         let img = &self.inner;
         Ok(py.detach(|| t::rotate_90(img, axes, k)).or_raise()?.into())
@@ -794,7 +794,7 @@ impl PyNiftiImage {
         };
         format!(
             "NiftiImage(shape=({shape}), dtype={}, spacing=({}), orientation={})",
-            self.inner.dtype().numpy_name(),
+            self.inner.dtype().name(),
             spacing.join(", "),
             self.inner.orientation()
         )
@@ -815,6 +815,7 @@ impl PyNiftiImage {
         slf
     }
 
+    #[pyo3(signature = (_memo, /))]
     fn __deepcopy__<'py>(slf: Bound<'py, Self>, _memo: &Bound<'py, PyAny>) -> Bound<'py, Self> {
         slf
     }

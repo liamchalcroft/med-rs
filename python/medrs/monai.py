@@ -11,19 +11,21 @@
         EnsureChannelFirstd(keys=["image", "label"]),
     ])
 
-The returned arrays and metadata match MONAI's ``NibabelReader``: C-contiguous
-arrays indexed ``[x, y, z, ...]`` and a RAS affine.
+Arrays are indexed ``[x, y, z, ...]`` like those of MONAI's ``NibabelReader``,
+and the metadata has the keys MONAI's transforms use: ``affine``,
+``original_affine``, ``spatial_shape``, ``space``, ``original_channel_dim``,
+``pixdim``, and ``dim``.
 """
 
 from __future__ import annotations
 
 import os
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from monai.data import ImageReader
-from monai.utils import ensure_tuple
+from monai.utils import SpaceKeys, ensure_tuple
 
 import medrs
 
@@ -37,13 +39,15 @@ class MedrsReader(ImageReader):  # type: ignore[misc]  # MONAI is untyped
 
     Args:
         channel_dim: Index of the channel dimension of the stored arrays, or
-            ``None`` if they have no channel dimension (then 4D images are
-            treated as channel-last, like ``NibabelReader``).
+            ``"no_channel"``. By default 4D images are treated as channel-last
+            and 3D images as having no channel, like ``NibabelReader``.
     """
 
-    def __init__(self, channel_dim: int | None = None) -> None:
+    def __init__(self, channel_dim: int | Literal["no_channel"] | None = None) -> None:
         super().__init__()
-        self.channel_dim = channel_dim
+        self.channel_dim: float | None = (
+            float("nan") if isinstance(channel_dim, str) else channel_dim
+        )
 
     def verify_suffix(
         self, filename: Sequence[os.PathLike[str] | str] | os.PathLike[str] | str
@@ -59,30 +63,51 @@ class MedrsReader(ImageReader):  # type: ignore[misc]  # MONAI is untyped
     def get_data(
         self, img: medrs.NiftiImage | Sequence[medrs.NiftiImage]
     ) -> tuple[np.ndarray, dict[str, Any]]:
-        arrays = []
-        meta: dict[str, Any] = {}
-        for image in ensure_tuple(img):
-            array = np.ascontiguousarray(image.to_numpy())
-            spatial_rank = min(image.ndim, 3)
-            header = image.header
-            if self.channel_dim is not None:
-                channel_dim: float | int = self.channel_dim
-            else:
-                channel_dim = float("nan") if array.ndim == spatial_rank else -1
-            meta = {
-                "affine": image.affine,
-                "original_affine": image.affine.copy(),
-                "spatial_shape": np.asarray(image.shape[:spatial_rank]),
-                "space": "RAS",
-                "pixdim": np.asarray(header["pixdim"]),
-                "dim": np.asarray([image.ndim, *image.shape] + [1] * (7 - image.ndim)),
-                "original_channel_dim": channel_dim,
-            }
-            arrays.append(array)
+        images = ensure_tuple(img)
+        meta = self._meta(images[0])
+        for other in images[1:]:
+            if not np.allclose(other.affine, images[0].affine):
+                raise RuntimeError("all images must have the same affine to be stacked")
+            if not np.array_equal(self._meta(other)["spatial_shape"], meta["spatial_shape"]):
+                raise RuntimeError("all images must have the same spatial shape to be stacked")
+        arrays = [_writable_c_array(image) for image in images]
         if len(arrays) == 1:
             return arrays[0], meta
         channel_dim = meta["original_channel_dim"]
-        if isinstance(channel_dim, int):
-            return np.concatenate(arrays, axis=channel_dim), meta
+        if not np.isnan(channel_dim):
+            return np.concatenate(arrays, axis=int(channel_dim)), meta
         meta["original_channel_dim"] = 0
         return np.stack(arrays, axis=0), meta
+
+    def _meta(self, image: medrs.NiftiImage) -> dict[str, Any]:
+        spatial_rank = max(min(image.ndim, 3), 1)
+        size = list(image.shape) + [1] * (7 - image.ndim)
+        if self.channel_dim is None:
+            channel_dim: float = float("nan") if image.ndim == spatial_rank else -1
+        else:
+            channel_dim = self.channel_dim
+            if not np.isnan(channel_dim):
+                size.pop(int(channel_dim))
+        pixdim = np.asarray(image.header["pixdim"])
+        return {
+            "affine": image.affine,
+            "original_affine": image.affine,
+            "spatial_shape": np.asarray(size[:spatial_rank]),
+            "space": SpaceKeys.RAS,
+            "pixdim": pixdim,
+            "original_pixdim": pixdim.copy(),
+            "dim": np.asarray([image.ndim, *image.shape] + [1] * (7 - image.ndim)),
+            "original_channel_dim": channel_dim,
+        }
+
+
+def _writable_c_array(image: medrs.NiftiImage) -> np.ndarray:
+    """The image's voxels as a writable, C-contiguous array.
+
+    MONAI wraps reader output in tensors that transforms may modify in place,
+    and makes it C-contiguous; doing both here costs one copy instead of two.
+    """
+    array = image.to_numpy()
+    if array.flags.writeable and array.flags.c_contiguous:
+        return array
+    return np.array(array, order="C")

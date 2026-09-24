@@ -314,8 +314,8 @@ impl NiftiImage {
     pub(crate) fn elements<T: NiftiElement>(&self) -> Result<Elements<'_, T>> {
         if T::DATA_TYPE != self.dtype() {
             return Err(Error::DataTypeMismatch {
-                expected: T::DATA_TYPE.type_name(),
-                found: self.dtype().type_name(),
+                expected: T::DATA_TYPE.name(),
+                found: self.dtype().name(),
             });
         }
         Ok(match &self.storage {
