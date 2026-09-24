@@ -21,7 +21,7 @@ gzp = { version = "2.0.4", default-features = false, features = ["deflate_zlib_n
 half = { version = "2.4", features = ["bytemuck"] }
 libdeflater = "1.25"
 memmap2 = "0.9.11"
-ndarray = "0.16"
+ndarray = "0.17"
 rand = "0.9"
 rand_chacha = "0.9"
 rand_distr = "0.5"
