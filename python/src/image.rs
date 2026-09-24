@@ -728,6 +728,39 @@ impl PyNiftiImage {
             .into())
     }
 
+    /// Percentiles of the values (NumPy's default linear interpolation), for
+    /// each of `q` in `[0, 100]`. With `nonzero`, zero voxels are left out.
+    #[pyo3(signature = (q, *, nonzero = false))]
+    fn percentiles<'py>(
+        &self,
+        py: Python<'py>,
+        q: Vec<f64>,
+        nonzero: bool,
+    ) -> PyResult<Bound<'py, PyTuple>> {
+        let img = &self.inner;
+        let values = py.detach(|| t::percentiles(img, &q, nonzero)).or_raise()?;
+        PyTuple::new(py, values)
+    }
+
+    /// Clip to the `lower` and `upper` percentiles (of the non-zero voxels,
+    /// if `nonzero`) and map that range linearly onto `[out_min, out_max]`.
+    #[pyo3(signature = (lower, upper, *, nonzero = false, out_min = 0.0, out_max = 1.0))]
+    fn rescale_percentiles(
+        &self,
+        py: Python<'_>,
+        lower: f64,
+        upper: f64,
+        nonzero: bool,
+        out_min: f64,
+        out_max: f64,
+    ) -> PyResult<Self> {
+        let img = &self.inner;
+        Ok(py
+            .detach(|| t::rescale_percentiles(img, lower, upper, nonzero, out_min, out_max))
+            .or_raise()?
+            .into())
+    }
+
     /// Clamp values to `[min, max]`.
     fn clamp(&self, py: Python<'_>, min: f64, max: f64) -> PyResult<Self> {
         let img = &self.inner;

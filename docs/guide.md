@@ -116,11 +116,23 @@ Every transform returns a new image, following these conventions:
 | `flip(axes)`, `rotate_90(axes, k)` | `rotate_90` matches `numpy.rot90` |
 | `clamp(min, max)`, `rescale(out_min, out_max)` | |
 | `z_normalize(nonzero=False)` | `nonzero=True` uses only non-zero voxels and keeps zeros |
+| `rescale_percentiles(lower, upper, nonzero=False)` | Clips to two percentiles and maps them to `[out_min, out_max]` (default `[0, 1]`) |
+| `percentiles(q, nonzero=False)` | Exact, like `numpy.percentile`; returns a tuple of floats |
 | `adjust_gamma(gamma)` | Preserves the value range (MONAI `AdjustContrast`) |
 | `with_dtype(dtype)` | Applies and then resets scaling |
 
 When resampling, target voxels whose centres fall outside the source image
 are 0: stored 0 for nearest-neighbour, 0.0 for trilinear.
+
+`nonzero=True` leaves out voxels whose scaled value is zero, the usual choice
+for skull-stripped images. To keep the statistics of a percentile rescale,
+for example to map values back to the original intensities later, compute
+them first; `rescale_percentiles` computes the same values:
+
+```python
+lo, hi = img.percentiles((0.5, 99.5), nonzero=True)
+normalized = img.rescale_percentiles(0.5, 99.5, nonzero=True)  # (x - lo) / (hi - lo), clipped
+```
 
 ## Pipelines
 
@@ -159,8 +171,8 @@ out_img, out_seg = pipeline.apply(img, seg, seed=0)
 
 ## Training
 
-`FastLoader` produces fixed-size patches from a list of volumes, optionally
-with label maps:
+`FastLoader` produces patches from a list of volumes, optionally with label
+maps:
 
 ```python
 loader = medrs.FastLoader(
@@ -184,10 +196,34 @@ for patch in loader:  # patch.image, patch.label, patch.volume, patch.offset
 - For a given seed, the sequence of patches does not depend on `workers`.
 - Volumes smaller than the patch are padded (images with `pad_value`,
   labels with 0), and `patch.shape` is the region actually read.
+- With `foreground_prob`, the foreground is the non-zero label voxels, or,
+  with `foreground_threshold=t`, the image voxels above `t` (in scaled
+  units), which needs no labels.
 - A file that fails to load raises when its patches are reached; later files
   are still loaded if you keep iterating.
 - An epoch iterator can be closed early with `close()`, or used as a context
   manager.
+
+Patch shapes and volumes can also be sampled:
+
+```python
+loader = medrs.FastLoader(
+    images,
+    patch_shape=[(128, 128, 128), (160, 160, 96), (96, 96, 96)],
+    patch_shape_weights=[0.5, 0.25, 0.25],  # default: equal
+    weights=sampling_weights,  # one per image; draws with replacement
+    volumes_per_epoch=10_000,  # default: len(images)
+    foreground_prob=0.9,
+    foreground_threshold=0.0,  # foreground = voxels above 0, no labels needed
+    seed=0,
+)
+```
+
+Each patch draws its own shape. With `weights`, every epoch draws
+`volumes_per_epoch` volumes in proportion to the weights (`shuffle` then has
+no effect), and repeated draws of a volume give different patches. Batching
+patches of different shapes is up to you, for example by grouping them by
+shape.
 
 To feed a PyTorch `DataLoader`, wrap the loader in an `IterableDataset` and
 let medrs do the parallel work:

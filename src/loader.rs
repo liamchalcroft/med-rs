@@ -10,8 +10,11 @@
 //!   of patches in flight.
 //! * Output order is deterministic: for a given seed and epoch the sequence of
 //!   patches is identical regardless of the number of workers.
-//! * Patches smaller than the requested shape (because the volume is smaller)
-//!   are padded to it, so every patch has the same shape.
+//! * Patch shapes can be fixed or drawn per patch from weighted choices.
+//!   Patches smaller than their shape (because the volume is smaller) are
+//!   padded to it.
+//! * Patches can be centred on foreground voxels, taken from label maps or
+//!   from an intensity threshold, and volumes can be drawn with weights.
 //! * An optional [`Pipeline`] runs in the workers, with spatial transforms
 //!   applied identically to image and label.
 //!
@@ -41,9 +44,11 @@ use crate::nifti::io::Volume;
 use crate::nifti::NiftiImage;
 use crate::pipeline::Pipeline;
 use crate::transforms::geometry::split_shape;
-use crate::transforms::{crop_or_pad, random_region, sample_label_regions, Region};
+use crate::transforms::{crop, crop_or_pad, random_region, ForegroundSampler, Region};
+use rand::distr::weighted::WeightedIndex;
+use rand::distr::Distribution;
 use rand::seq::SliceRandom;
-use rand::SeedableRng;
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -56,14 +61,32 @@ use std::thread::JoinHandle;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct LoaderConfig {
-    /// Shape of every patch along the first three axes.
-    pub patch_shape: [usize; 3],
+    /// Patch shapes along the first three axes. Each patch takes one of them,
+    /// drawn with `patch_shape_weights`. Default: the shape given to
+    /// [`LoaderConfig::new`].
+    pub patch_shapes: Vec<[usize; 3]>,
+    /// Relative probabilities of `patch_shapes`. `None` weighs them equally.
+    pub patch_shape_weights: Option<Vec<f64>>,
     /// Patches drawn from each volume per epoch. Default 1.
     pub patches_per_volume: usize,
-    /// With labels: probability that a patch is centred on a foreground
-    /// (non-zero) label voxel rather than a background voxel. `None` draws
-    /// patch positions uniformly. Default `None`.
+    /// Probability that a patch is centred on a foreground voxel rather than
+    /// a background voxel. The foreground is given by `foreground_threshold`
+    /// if set, and otherwise by the label maps (non-zero voxels). `None`
+    /// draws patch positions uniformly. Default `None`.
     pub foreground_prob: Option<f64>,
+    /// Makes the foreground the image voxels whose scaled value is greater
+    /// than this, so `foreground_prob` works without label maps. Default
+    /// `None`.
+    pub foreground_threshold: Option<f64>,
+    /// Sampling weight of each volume. When set, each epoch draws
+    /// `volumes_per_epoch` volumes with replacement, in proportion to these
+    /// weights (`shuffle` then has no effect). Default `None`.
+    pub volume_weights: Option<Vec<f64>>,
+    /// Volumes drawn per epoch. `None` uses each volume once per epoch (or,
+    /// with `volume_weights`, draws as many volumes as there are). When set
+    /// without `volume_weights`, volumes are drawn uniformly with
+    /// replacement. Default `None`.
+    pub volumes_per_epoch: Option<usize>,
     /// Value for padding patches of volumes smaller than `patch_shape`
     /// (labels are padded with 0). Default 0.
     pub pad_value: f64,
@@ -87,9 +110,13 @@ impl LoaderConfig {
     pub fn new(patch_shape: [usize; 3]) -> Self {
         let workers = std::thread::available_parallelism().map_or(1, |n| n.get().min(8));
         Self {
-            patch_shape,
+            patch_shapes: vec![patch_shape],
+            patch_shape_weights: None,
             patches_per_volume: 1,
             foreground_prob: None,
+            foreground_threshold: None,
+            volume_weights: None,
+            volumes_per_epoch: None,
             pad_value: 0.0,
             pipeline: None,
             workers,
@@ -120,6 +147,29 @@ struct Shared {
     labels: Option<Vec<PathBuf>>,
     config: LoaderConfig,
     seed: u64,
+    shape_weights: Option<WeightedIndex<f64>>,
+    volume_weights: Option<WeightedIndex<f64>>,
+}
+
+/// Sampling weights for `n` choices, or an error naming `what`.
+fn weights(what: &str, weights: Option<&Vec<f64>>, n: usize) -> Result<Option<WeightedIndex<f64>>> {
+    let Some(w) = weights else {
+        return Ok(None);
+    };
+    if w.len() != n {
+        return Err(Error::InvalidArgument(format!(
+            "{what} needs {n} weights, got {}",
+            w.len()
+        )));
+    }
+    if w.iter().any(|v| !v.is_finite()) {
+        return Err(Error::InvalidArgument(format!("{what} must be finite")));
+    }
+    WeightedIndex::new(w).map(Some).map_err(|_| {
+        Error::InvalidArgument(format!(
+            "{what} must be non-negative with a positive sum, got {w:?}"
+        ))
+    })
 }
 
 /// Loads training patches in parallel. See the [module docs](self).
@@ -150,11 +200,30 @@ impl FastLoader {
                 )));
             }
         }
-        if config.patch_shape.contains(&0) {
+        if config.patch_shapes.is_empty() {
+            return Err(Error::InvalidArgument(
+                "at least one patch shape is needed".into(),
+            ));
+        }
+        if let Some(shape) = config.patch_shapes.iter().find(|s| s.contains(&0)) {
             return Err(Error::InvalidArgument(format!(
-                "patch shape must be positive, got {:?}",
-                config.patch_shape
+                "patch shape must be positive, got {shape:?}"
             )));
+        }
+        let shape_weights = weights(
+            "patch_shape_weights",
+            config.patch_shape_weights.as_ref(),
+            config.patch_shapes.len(),
+        )?;
+        let volume_weights = weights(
+            "volume_weights",
+            config.volume_weights.as_ref(),
+            images.len(),
+        )?;
+        if config.volumes_per_epoch == Some(0) {
+            return Err(Error::InvalidArgument(
+                "volumes_per_epoch must be at least 1".into(),
+            ));
         }
         if config.patches_per_volume == 0 {
             return Err(Error::InvalidArgument(
@@ -162,12 +231,17 @@ impl FastLoader {
             ));
         }
         if let Some(p) = config.foreground_prob {
-            if labels.is_none() {
+            if labels.is_none() && config.foreground_threshold.is_none() {
                 return Err(Error::InvalidArgument(
-                    "foreground_prob requires label maps".into(),
+                    "foreground_prob requires label maps or a foreground_threshold".into(),
                 ));
             }
             crate::transforms::check_probability(p)?;
+        }
+        if config.foreground_threshold.is_some_and(f64::is_nan) {
+            return Err(Error::InvalidArgument(
+                "foreground_threshold must not be NaN".into(),
+            ));
         }
         if !config.pad_value.is_finite() {
             return Err(Error::InvalidArgument(format!(
@@ -185,13 +259,15 @@ impl FastLoader {
                 labels,
                 config,
                 seed,
+                shape_weights,
+                volume_weights,
             }),
         })
     }
 
     /// Number of patches per epoch.
     pub fn len(&self) -> usize {
-        self.shared.images.len() * self.shared.config.patches_per_volume
+        self.shared.volumes_per_epoch() * self.shared.config.patches_per_volume
     }
 
     /// Always `false`: a loader has at least one volume.
@@ -219,34 +295,67 @@ impl FastLoader {
     }
 }
 
-/// Seeded RNG for one (epoch, volume) pair.
-fn volume_rng(seed: u64, epoch: u64, volume: usize) -> ChaCha8Rng {
-    let mut rng = ChaCha8Rng::seed_from_u64(seed ^ epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    rng.set_stream(volume as u64 + 1);
+impl Shared {
+    fn volumes_per_epoch(&self) -> usize {
+        self.config.volumes_per_epoch.unwrap_or(self.images.len())
+    }
+
+    /// The patch shape for the next patch.
+    fn patch_shape<R: Rng>(&self, rng: &mut R) -> [usize; 3] {
+        let shapes = &self.config.patch_shapes;
+        match (&self.shape_weights, shapes.len()) {
+            (_, 1) => shapes[0],
+            (Some(w), _) => shapes[w.sample(rng)],
+            (None, n) => shapes[rng.random_range(0..n)],
+        }
+    }
+}
+
+fn epoch_rng(seed: u64, epoch: u64) -> ChaCha8Rng {
+    ChaCha8Rng::seed_from_u64(seed ^ epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+}
+
+/// Seeded RNG for the volume at `position` in an epoch's order.
+fn unit_rng(seed: u64, epoch: u64, position: usize) -> ChaCha8Rng {
+    let mut rng = epoch_rng(seed, epoch);
+    rng.set_stream(position as u64 + 1);
     rng
 }
 
+/// The volumes of an epoch, in order.
 fn epoch_order(shared: &Shared, epoch: u64) -> Vec<usize> {
-    let mut order: Vec<usize> = (0..shared.images.len()).collect();
-    if shared.config.shuffle {
-        let mut rng =
-            ChaCha8Rng::seed_from_u64(shared.seed ^ epoch.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-        order.shuffle(&mut rng);
+    let mut rng = epoch_rng(shared.seed, epoch);
+    let n = shared.images.len();
+    let count = shared.volumes_per_epoch();
+    match (&shared.volume_weights, shared.config.volumes_per_epoch) {
+        (Some(w), _) => (0..count).map(|_| w.sample(&mut rng)).collect(),
+        (None, Some(_)) => (0..count).map(|_| rng.random_range(0..n)).collect(),
+        (None, None) => {
+            let mut order: Vec<usize> = (0..n).collect();
+            if shared.config.shuffle {
+                order.shuffle(&mut rng);
+            }
+            order
+        }
     }
-    order
 }
 
-/// Load all patches of one volume.
-fn load_volume(shared: &Shared, epoch: u64, volume: usize) -> Vec<Result<Patch>> {
-    match try_load_volume(shared, epoch, volume) {
+/// Load all patches of the volume at `position` in the epoch's order.
+fn load_volume(shared: &Shared, epoch: u64, position: usize, volume: usize) -> Vec<Result<Patch>> {
+    match try_load_volume(shared, epoch, position, volume) {
         Ok(patches) => patches.into_iter().map(Ok).collect(),
         Err(e) => vec![Err(e)],
     }
 }
 
-fn try_load_volume(shared: &Shared, epoch: u64, volume: usize) -> Result<Vec<Patch>> {
+fn try_load_volume(
+    shared: &Shared,
+    epoch: u64,
+    position: usize,
+    volume: usize,
+) -> Result<Vec<Patch>> {
     let config = &shared.config;
-    let mut rng = volume_rng(shared.seed, epoch, volume);
+    let mut rng = unit_rng(shared.seed, epoch, position);
     let image = Volume::open(&shared.images[volume], false)?;
     let label = match &shared.labels {
         Some(labels) => Some(Volume::open(&labels[volume], false)?),
@@ -265,25 +374,44 @@ fn try_load_volume(shared: &Shared, epoch: u64, volume: usize) -> Result<Vec<Pat
             )));
         }
     }
-    let patch = config.patch_shape;
-    let regions = match (config.foreground_prob, &label) {
-        (Some(p), Some(label)) => sample_label_regions(
-            &label.image()?,
-            patch,
-            config.patches_per_volume,
-            p,
-            &mut rng,
-        )?,
-        _ => (0..config.patches_per_volume)
-            .map(|_| random_region(spatial, patch, &mut rng))
-            .collect::<Result<_>>()?,
+    // Whole images already in memory (for foreground sampling); patches are
+    // cropped from them instead of being read again.
+    let (mut whole_image, mut whole_label) = (None, None);
+    let mut sampler = match (config.foreground_prob, config.foreground_threshold, &label) {
+        (Some(_), Some(threshold), _) => {
+            let full = image.image()?;
+            let sampler = ForegroundSampler::from_threshold(&full, threshold)?;
+            whole_image = Some(full);
+            Some(sampler)
+        }
+        (Some(_), None, Some(label)) => {
+            let full = label.image()?;
+            let sampler = ForegroundSampler::from_label(&full)?;
+            whole_label = Some(full);
+            Some(sampler)
+        }
+        _ => None,
     };
-    regions
+    let draws = (0..config.patches_per_volume)
+        .map(|_| {
+            let shape = shared.patch_shape(&mut rng);
+            let region = match (&mut sampler, config.foreground_prob) {
+                (Some(s), Some(p)) => s.sample(shape, p, &mut rng)?,
+                _ => random_region(spatial, shape, &mut rng)?,
+            };
+            Ok((shape, region))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let read = |volume: &Volume, whole: &Option<NiftiImage>, region: Region| match whole {
+        Some(full) => crop(full, region.offset, region.shape),
+        None => volume.region(region.offset, region.shape),
+    };
+    draws
         .into_iter()
-        .map(|region| {
-            let mut img = image.region(region.offset, region.shape)?;
+        .map(|(patch, region)| {
+            let mut img = read(&image, &whole_image, region)?;
             let mut lab = match &label {
-                Some(l) => Some(l.region(region.offset, region.shape)?),
+                Some(l) => Some(read(l, &whole_label, region)?),
                 None => None,
             };
             if region.shape != patch {
@@ -374,7 +502,7 @@ impl Epoch {
         let volume = *self.order.get(position)?;
         self.next += 1;
         let Some(w) = &mut self.workers else {
-            return Some(load_volume(&self.shared, self.number, volume));
+            return Some(load_volume(&self.shared, self.number, position, volume));
         };
         let patches = loop {
             if let Some(p) = w.pending.remove(&position) {
@@ -432,7 +560,7 @@ fn spawn_workers(shared: &Arc<Shared>, epoch: u64, order: &[usize]) -> Workers {
                             w = cvar.wait(w).unwrap_or_else(PoisonError::into_inner);
                         }
                     };
-                    let patches = load_volume(&shared, epoch, order[position]);
+                    let patches = load_volume(&shared, epoch, position, order[position]);
                     if sender.send((position, patches)).is_err() {
                         return;
                     }
@@ -625,6 +753,98 @@ mod tests {
     }
 
     #[test]
+    fn patch_shapes_are_drawn_with_their_weights() {
+        let dir = TempDir::new().unwrap();
+        let (images, _) = dataset(&dir, 3, [12, 10, 9]);
+        let make = |workers, weights: Option<Vec<f64>>| {
+            let mut c = LoaderConfig::new([4, 4, 4]);
+            c.patch_shapes = vec![[4, 4, 4], [8, 3, 2], [20, 20, 20]];
+            c.patch_shape_weights = weights;
+            c.patches_per_volume = 100;
+            c.workers = workers;
+            c.seed = Some(5);
+            FastLoader::new(images.clone(), None, c).unwrap()
+        };
+        let loader = make(0, Some(vec![3.0, 1.0, 0.0]));
+        let mut counts = HashMap::new();
+        for patch in loader.epoch(0) {
+            let shape = patch.unwrap().image.shape().to_vec();
+            *counts.entry(shape).or_insert(0) += 1;
+        }
+        let (small, flat) = (counts[&vec![4, 4, 4]], counts[&vec![8, 3, 2]]);
+        assert_eq!(small + flat, 300, "{counts:?}");
+        assert!((190..=260).contains(&small), "{counts:?}");
+        // Unweighted choices include the shape larger than the volume, padded.
+        let shapes: Vec<Vec<usize>> = make(2, None)
+            .epoch(0)
+            .map(|p| p.unwrap().image.shape().to_vec())
+            .collect();
+        assert!(shapes.contains(&vec![20, 20, 20]));
+        assert_eq!(collect(&make(0, None), 3), collect(&make(3, None), 3));
+    }
+
+    #[test]
+    fn volumes_are_drawn_with_replacement_by_weight() {
+        let dir = TempDir::new().unwrap();
+        let (images, _) = dataset(&dir, 3, [12, 12, 12]);
+        let make = |workers| {
+            let mut c = LoaderConfig::new([4, 4, 4]);
+            c.volume_weights = Some(vec![1.0, 0.0, 3.0]);
+            c.volumes_per_epoch = Some(80);
+            c.workers = workers;
+            c.seed = Some(9);
+            FastLoader::new(images.clone(), None, c).unwrap()
+        };
+        let loader = make(0);
+        assert_eq!(loader.len(), 80);
+        let patches = collect(&loader, 0);
+        assert_eq!(patches.len(), 80);
+        let from = |v| patches.iter().filter(|p| p.0 == v).count();
+        assert_eq!(from(1), 0);
+        assert!((40..=75).contains(&from(2)), "{}", from(2));
+        // Repeated draws of a volume get different patches.
+        let regions: std::collections::HashSet<_> =
+            patches.iter().filter(|p| p.0 == 2).map(|p| p.1).collect();
+        assert!(regions.len() > 10);
+        assert_eq!(collect(&make(4), 0), patches);
+
+        // Without weights, `volumes_per_epoch` draws uniformly.
+        let mut c = LoaderConfig::new([4, 4, 4]);
+        c.volumes_per_epoch = Some(7);
+        c.patches_per_volume = 2;
+        assert_eq!(
+            FastLoader::new(images, None, c).unwrap().epoch(0).count(),
+            14
+        );
+    }
+
+    #[test]
+    fn threshold_foreground_needs_no_labels() {
+        let dir = TempDir::new().unwrap();
+        let mut arr = ArrayD::<f32>::zeros(IxDyn(&[30, 30, 30]).f());
+        for x in 20..24 {
+            for y in 3..7 {
+                for z in 10..13 {
+                    arr[[x, y, z]] = 100.0;
+                }
+            }
+        }
+        let path = dir.path().join("bright.nii.gz");
+        crate::nifti::save(&NiftiImage::from_array(arr, EYE).unwrap(), &path).unwrap();
+        let mut c = LoaderConfig::new([6, 6, 6]);
+        c.foreground_prob = Some(1.0);
+        c.foreground_threshold = Some(50.0);
+        c.patches_per_volume = 20;
+        let loader = FastLoader::new(vec![path], None, c).unwrap();
+        for patch in loader.epoch(0) {
+            let patch = patch.unwrap();
+            assert!(patch.label.is_none());
+            let max = patch.image.to_f32().unwrap().fold(0.0f32, |m, &v| m.max(v));
+            assert_eq!(max, 100.0, "{:?}", patch.region);
+        }
+    }
+
+    #[test]
     fn invalid_configuration_is_rejected() {
         let path = vec![PathBuf::from("a.nii")];
         assert!(FastLoader::new(vec![], None, LoaderConfig::new([4, 4, 4])).is_err());
@@ -633,5 +853,21 @@ mod tests {
         c.foreground_prob = Some(0.5);
         assert!(FastLoader::new(path.clone(), None, c).is_err());
         assert!(FastLoader::new(path.clone(), Some(vec![]), LoaderConfig::new([4, 4, 4])).is_err());
+        let rejected = |f: &dyn Fn(&mut LoaderConfig)| {
+            let mut c = LoaderConfig::new([4, 4, 4]);
+            f(&mut c);
+            FastLoader::new(path.clone(), None, c).is_err()
+        };
+        assert!(rejected(&|c| c.patch_shapes.clear()));
+        assert!(rejected(&|c| c.patch_shape_weights = Some(vec![1.0, 1.0])));
+        assert!(rejected(&|c| c.volume_weights = Some(vec![0.0])));
+        assert!(rejected(&|c| c.volume_weights = Some(vec![-1.0])));
+        assert!(rejected(&|c| c.volume_weights = Some(vec![f64::NAN])));
+        assert!(rejected(&|c| c.volumes_per_epoch = Some(0)));
+        assert!(rejected(&|c| c.foreground_threshold = Some(f64::NAN)));
+        assert!(!rejected(&|c| {
+            c.foreground_prob = Some(0.5);
+            c.foreground_threshold = Some(0.0);
+        }));
     }
 }

@@ -142,6 +142,24 @@ impl PyPipeline {
         self.with("rescale", args, |p| p.rescale(out_min, out_max))
     }
 
+    /// Clip to the `lower` and `upper` percentiles (of the non-zero voxels,
+    /// if `nonzero`) and map that range linearly onto `[out_min, out_max]`.
+    #[pyo3(signature = (lower, upper, nonzero = false, out_min = 0.0, out_max = 1.0))]
+    fn rescale_percentiles(
+        &self,
+        py: Python<'_>,
+        lower: f64,
+        upper: f64,
+        nonzero: bool,
+        out_min: f64,
+        out_max: f64,
+    ) -> PyResult<Self> {
+        let args = (lower, upper, nonzero, out_min, out_max).into_pyobject(py)?;
+        self.with("rescale_percentiles", args, |p| {
+            p.rescale_percentiles(lower, upper, nonzero, out_min, out_max)
+        })
+    }
+
     /// Range-preserving gamma adjustment.
     fn adjust_gamma(&self, py: Python<'_>, gamma: f64) -> PyResult<Self> {
         let args = (gamma,).into_pyobject(py)?;

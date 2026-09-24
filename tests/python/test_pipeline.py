@@ -75,3 +75,15 @@ def test_pipelines_are_immutable_picklable_and_validated():
 def test_cast_to_half_precision(image):
     out = medrs.Pipeline().z_normalize().cast("float16").apply(image)
     assert out.dtype == "float16"
+
+
+def test_rescale_percentiles_step_matches_eager(image):
+    pipeline = medrs.Pipeline().crop((1, 1, 1), (10, 8, 6)).rescale_percentiles(2, 98, True)
+    eager = image.crop((1, 1, 1), (10, 8, 6)).rescale_percentiles(2, 98, nonzero=True)
+    np.testing.assert_allclose(pipeline.apply(image).to_numpy(), eager.to_numpy(), atol=1e-6)
+    restored = pickle.loads(pickle.dumps(pipeline))
+    np.testing.assert_array_equal(
+        restored.apply(image).to_numpy(), pipeline.apply(image).to_numpy()
+    )
+    with pytest.raises(ValueError, match="percentiles"):
+        medrs.Pipeline().rescale_percentiles(90, 10)

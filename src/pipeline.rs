@@ -42,7 +42,8 @@ use crate::transforms::geometry::{
     split_shape, with_spatial_shape, GridChange,
 };
 use crate::transforms::intensity::{
-    apply_map, check_range, rescale_map, z_normalize_map, PointMap,
+    apply_map, check_percentiles, check_range, percentile_map, rescale_map, z_normalize_map,
+    PointMap,
 };
 use crate::transforms::resample::{apply_grid_change, shape_plan, spacing_plan};
 use crate::transforms::{
@@ -64,6 +65,7 @@ enum Step {
     ZNormalize,
     ZNormalizeNonzero,
     Rescale(f64, f64),
+    RescalePercentiles([f64; 2], bool, [f64; 2]),
     Gamma(f64),
     Cast(DataType),
     RandomFlip(Vec<usize>, f64),
@@ -93,6 +95,7 @@ enum Op {
     ZNormalize,
     ZNormalizeNonzero,
     Rescale(f64, f64),
+    RescalePercentiles([f64; 2], bool, [f64; 2]),
     Gamma(f64),
     Noise(f64, u64),
     Cast(DataType),
@@ -178,6 +181,23 @@ impl Pipeline {
     #[must_use]
     pub fn rescale(self, out_min: f64, out_max: f64) -> Self {
         self.push(Step::Rescale(out_min, out_max))
+    }
+
+    /// See [`rescale_percentiles`](crate::transforms::rescale_percentiles).
+    #[must_use]
+    pub fn rescale_percentiles(
+        self,
+        lower: f64,
+        upper: f64,
+        nonzero: bool,
+        out_min: f64,
+        out_max: f64,
+    ) -> Self {
+        self.push(Step::RescalePercentiles(
+            [lower, upper],
+            nonzero,
+            [out_min, out_max],
+        ))
     }
 
     /// See [`adjust_gamma`].
@@ -306,6 +326,11 @@ impl Pipeline {
                         check_range("rescale", *lo, *hi)?;
                         Op::Rescale(*lo, *hi)
                     }
+                    Step::RescalePercentiles(bounds, nonzero, out) => {
+                        check_percentiles(bounds[0], bounds[1])?;
+                        check_range("rescale", out[0], out[1])?;
+                        Op::RescalePercentiles(*bounds, *nonzero, *out)
+                    }
                     Step::Gamma(g) => {
                         if !(g.is_finite() && *g > 0.0) {
                             return Err(Error::InvalidArgument(format!(
@@ -417,6 +442,10 @@ fn run(image: &NiftiImage, ops: &[Op]) -> Result<NiftiImage> {
             Op::Rescale(lo, hi) => {
                 x.flush_grid()?;
                 x.map = rescale_map(&x.image.f32_values()?, &x.map, *lo, *hi)?;
+            }
+            Op::RescalePercentiles(bounds, nonzero, out) => {
+                x.flush_grid()?;
+                x.map = percentile_map(&x.image.f32_values()?, &x.map, *bounds, *nonzero, *out)?;
             }
             Op::ZNormalizeNonzero => {
                 x.flush()?;

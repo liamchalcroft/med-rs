@@ -152,3 +152,39 @@ def test_four_d_images_transform_per_volume():
     np.testing.assert_array_equal(img.flip([0]).to_numpy(), data[::-1])
     assert img.resample_to_shape((3, 5, 2)).shape == (3, 5, 2, 3)
     np.testing.assert_array_equal(img.crop((1, 1, 1), (2, 2, 2)).to_numpy(), data[1:3, 1:3, 1:3])
+
+
+@pytest.mark.parametrize("nonzero", [False, True])
+def test_percentiles_match_numpy(nonzero):
+    rng = np.random.default_rng(0)
+    data = rng.gamma(2.0, 50.0, (31, 27, 19)).astype(np.float32)
+    data[:5] = 0
+    img = medrs.NiftiImage(data).with_header(scl_slope=0.5, scl_inter=3.0)
+    scaled = data * 0.5 + 3.0
+    # `nonzero` refers to scaled values: stored zeros are 3.0 here, so they count.
+    reference = scaled[scaled != 0] if nonzero else scaled
+    q = (0.0, 0.5, 25.0, 50.0, 99.5, 100.0)
+    ours = img.percentiles(q, nonzero=nonzero)
+    np.testing.assert_allclose(ours, np.percentile(reference, q), rtol=1e-6)
+
+    lo, hi = np.percentile(reference, (0.5, 99.5))
+    expected = np.clip((scaled - lo) / (hi - lo), 0, 1)
+    out = img.rescale_percentiles(0.5, 99.5, nonzero=nonzero)
+    assert out.dtype == "float32"
+    np.testing.assert_allclose(out.to_numpy(), expected, atol=1e-5)
+    out = img.rescale_percentiles(0.5, 99.5, nonzero=nonzero, out_min=-1, out_max=1)
+    np.testing.assert_allclose(out.to_numpy(), expected * 2 - 1, atol=1e-5)
+
+
+def test_percentiles_leave_out_zero_background():
+    data = np.zeros((10, 10, 10), np.float32)
+    data[2:8, 2:8, 2:8] = np.arange(216, dtype=np.float32).reshape(6, 6, 6) + 1
+    img = medrs.NiftiImage(data)
+    assert img.percentiles((0, 100), nonzero=True) == (1.0, 216.0)
+    assert img.percentiles((0, 100)) == (0.0, 216.0)
+    with pytest.raises(ValueError, match="between 0 and 100"):
+        img.percentiles((101,))
+    with pytest.raises(ValueError, match="no voxels"):
+        medrs.NiftiImage(np.zeros((2, 2, 2), np.float32)).percentiles((50,), nonzero=True)
+    with pytest.raises(ValueError, match="NaN"):
+        medrs.NiftiImage(np.full((2, 2, 2), np.nan, np.float32)).percentiles((50,))

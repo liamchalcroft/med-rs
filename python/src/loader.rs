@@ -10,17 +10,29 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-/// Streams fixed-size training patches from a list of volumes using worker
-/// threads.
+/// Streams training patches from a list of volumes using worker threads.
 ///
 /// Patches are read crop-first (only the patch is read from uncompressed
-/// files, and only the chunks it touches from `.jvol` files), padded to
-/// `patch_shape` when a volume is smaller, and transformed by `pipeline` in
-/// the workers. For a given seed the sequence of patches in an epoch does not
+/// files, and only the chunks it touches from `.jvol` files), padded to their
+/// shape when a volume is smaller, and transformed by `pipeline` in the
+/// workers. For a given seed the sequence of patches in an epoch does not
 /// depend on the number of workers.
+///
+/// `patch_shape` is one shape, or a list of shapes that each patch draws from
+/// (weighted by `patch_shape_weights`). `foreground_prob` centres patches on
+/// foreground voxels: non-zero label voxels, or image voxels above
+/// `foreground_threshold`. `weights` draws volumes with replacement,
+/// `volumes_per_epoch` of them per epoch.
 ///
 /// Iterating the loader runs the next epoch; `loader.epoch(n)` runs epoch `n`
 /// explicitly.
+/// One patch shape or a list of them.
+#[derive(FromPyObject)]
+enum PatchShapes {
+    One([usize; 3]),
+    Many(Vec<[usize; 3]>),
+}
+
 #[pyclass(name = "FastLoader", module = "medrs", frozen)]
 struct PyFastLoader {
     inner: FastLoader,
@@ -36,7 +48,11 @@ impl PyFastLoader {
         *,
         labels = None,
         patches_per_volume = 1,
+        patch_shape_weights = None,
         foreground_prob = None,
+        foreground_threshold = None,
+        weights = None,
+        volumes_per_epoch = None,
         pad_value = 0.0,
         pipeline = None,
         workers = None,
@@ -47,10 +63,14 @@ impl PyFastLoader {
     #[allow(clippy::too_many_arguments)]
     fn new(
         images: Vec<PathBuf>,
-        patch_shape: [usize; 3],
+        patch_shape: PatchShapes,
         labels: Option<Vec<PathBuf>>,
         patches_per_volume: usize,
+        patch_shape_weights: Option<Vec<f64>>,
         foreground_prob: Option<f64>,
+        foreground_threshold: Option<f64>,
+        weights: Option<Vec<f64>>,
+        volumes_per_epoch: Option<usize>,
         pad_value: f64,
         pipeline: Option<&PyPipeline>,
         workers: Option<usize>,
@@ -58,9 +78,18 @@ impl PyFastLoader {
         shuffle: bool,
         seed: Option<u64>,
     ) -> PyResult<Self> {
-        let mut config = LoaderConfig::new(patch_shape);
+        let shapes = match patch_shape {
+            PatchShapes::One(shape) => vec![shape],
+            PatchShapes::Many(shapes) => shapes,
+        };
+        let mut config = LoaderConfig::new([1; 3]);
+        config.patch_shapes = shapes;
+        config.patch_shape_weights = patch_shape_weights;
         config.patches_per_volume = patches_per_volume;
         config.foreground_prob = foreground_prob;
+        config.foreground_threshold = foreground_threshold;
+        config.volume_weights = weights;
+        config.volumes_per_epoch = volumes_per_epoch;
         config.pad_value = pad_value;
         config.pipeline = pipeline.map(|p| p.inner.clone());
         if let Some(w) = workers {
@@ -102,10 +131,13 @@ impl PyFastLoader {
 
     fn __repr__(&self) -> String {
         let c = self.inner.config();
+        let shapes = match c.patch_shapes.as_slice() {
+            [one] => format!("{one:?}"),
+            many => format!("{many:?}"),
+        };
         format!(
-            "FastLoader(patches={}, patch_shape={:?}, workers={}, seed={})",
+            "FastLoader(patches={}, patch_shape={shapes}, workers={}, seed={})",
             self.inner.len(),
-            c.patch_shape,
             c.workers,
             self.inner.seed()
         )

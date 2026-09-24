@@ -80,10 +80,8 @@ pub fn region_around(center: [usize; 3], volume: [usize; 3], patch: [usize; 3]) 
 /// random background voxel otherwise. If the label has no foreground (or no
 /// background), every region uses the class that exists.
 ///
-/// Voxels are drawn by rejection sampling when their class is common and from
-/// an index list when it is rare, so memory stays bounded by a small fraction
-/// of the volume. For 4D labels a voxel is foreground if it is non-zero in any
-/// volume.
+/// This is shorthand for [`ForegroundSampler::from_label`] followed by
+/// `count` calls to [`ForegroundSampler::sample`].
 pub fn sample_label_regions<R: Rng + ?Sized>(
     label: &NiftiImage,
     patch: [usize; 3],
@@ -92,87 +90,94 @@ pub fn sample_label_regions<R: Rng + ?Sized>(
     rng: &mut R,
 ) -> Result<Vec<Region>> {
     super::augment::check_probability(foreground_prob)?;
-    let (volume, _) = split_shape(label.shape());
-    clipped(volume, patch)?;
-    let mask = ForegroundMask::new(label)?;
-    let mut sampler = VoxelSampler::new(&mask);
-    let mut regions = Vec::with_capacity(count);
-    for _ in 0..count {
+    let mut sampler = ForegroundSampler::from_label(label)?;
+    (0..count)
+        .map(|_| sampler.sample(patch, foreground_prob, rng))
+        .collect()
+}
+
+/// Draws patch regions centred on foreground or background voxels.
+///
+/// The foreground is computed once, from a label map or from an intensity
+/// threshold, after which any number of regions of any shape can be drawn.
+/// Voxels are drawn by rejection sampling when their class is common and from
+/// an index list when it is rare, so memory stays bounded by a small fraction
+/// of the volume. For 4D images a voxel is foreground if it is foreground in
+/// any volume.
+pub struct ForegroundSampler {
+    mask: ForegroundMask,
+    volume: [usize; 3],
+    lists: [Option<Vec<u32>>; 2],
+}
+
+impl std::fmt::Debug for ForegroundSampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ForegroundSampler")
+            .field("volume", &self.volume)
+            .field("foreground", &self.mask.foreground)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ForegroundSampler {
+    /// Foreground voxels are those that are non-zero in `label` (after
+    /// scaling).
+    pub fn from_label(label: &NiftiImage) -> Result<Self> {
+        let (slope, inter) = label.header().scaling();
+        // The stored value that represents a scaled zero.
+        let zero = -inter / slope;
+        Self::new(label, move |stored| stored != zero)
+    }
+
+    /// Foreground voxels are those of `image` whose scaled value is greater
+    /// than `threshold`, for example to favour anatomy over air.
+    pub fn from_threshold(image: &NiftiImage, threshold: f64) -> Result<Self> {
+        if threshold.is_nan() {
+            return Err(Error::InvalidArgument(
+                "foreground threshold must not be NaN".into(),
+            ));
+        }
+        let (slope, inter) = image.header().scaling();
+        Self::new(image, move |stored| stored * slope + inter > threshold)
+    }
+
+    fn new(image: &NiftiImage, is_foreground: impl Fn(f64) -> bool + Sync) -> Result<Self> {
+        let (volume, _) = split_shape(image.shape());
+        Ok(Self {
+            mask: ForegroundMask::new(image, is_foreground)?,
+            volume,
+            lists: [None, None],
+        })
+    }
+
+    /// Number of foreground voxels.
+    pub fn foreground(&self) -> usize {
+        self.mask.foreground
+    }
+
+    /// A region of `patch` voxels (clipped to the volume) centred on a
+    /// foreground voxel with probability `foreground_prob`, and on a
+    /// background voxel otherwise. If one class is empty, the other is used.
+    pub fn sample<R: Rng + ?Sized>(
+        &mut self,
+        patch: [usize; 3],
+        foreground_prob: f64,
+        rng: &mut R,
+    ) -> Result<Region> {
+        super::augment::check_probability(foreground_prob)?;
+        let volume = self.volume;
+        clipped(volume, patch)?;
         let want_fg = rng.random_bool(foreground_prob);
-        let flat = sampler.sample(want_fg, rng);
+        let flat = self.voxel(want_fg, rng);
         let center = [
             flat % volume[0],
             (flat / volume[0]) % volume[1],
             flat / (volume[0] * volume[1]),
         ];
-        regions.push(region_around(center, volume, patch)?);
-    }
-    Ok(regions)
-}
-
-/// Per-voxel foreground test over the spatial grid of a label image.
-struct ForegroundMask {
-    bits: Vec<u64>,
-    spatial: usize,
-    foreground: usize,
-}
-
-impl ForegroundMask {
-    fn new(label: &NiftiImage) -> Result<Self> {
-        let (volume, volumes) = split_shape(label.shape());
-        let spatial: usize = volume.iter().product();
-        let words = spatial.div_ceil(64);
-        let (slope, inter) = label.header().scaling();
-        let mut bits = vec![0u64; words];
-        dispatch_dtype!(label.dtype(), T => {
-            let values = label.elements::<T>()?.as_cow();
-            // Stored value that represents a scaled zero (usually raw zero).
-            let zero = -inter / slope;
-            crate::parallel::install(|| {
-                bits.par_iter_mut().enumerate().for_each(|(w, word)| {
-                    let start = w * 64;
-                    let end = (start + 64).min(spatial);
-                    for i in start..end {
-                        let fg = (0..volumes).any(|v| {
-                            let x: T = values[v * spatial + i];
-                            crate::nifti::element::sealed::Sealed::to_f64(x) != zero
-                        });
-                        *word |= u64::from(fg) << (i - start);
-                    }
-                });
-            });
-        });
-        let foreground = bits.iter().map(|w| w.count_ones() as usize).sum();
-        Ok(Self {
-            bits,
-            spatial,
-            foreground,
-        })
+        region_around(center, volume, patch)
     }
 
-    fn get(&self, i: usize) -> bool {
-        self.bits[i / 64] >> (i % 64) & 1 == 1
-    }
-}
-
-/// Draws voxel indices of a class, by rejection or from an index list.
-struct VoxelSampler<'a> {
-    mask: &'a ForegroundMask,
-    lists: [Option<Vec<u32>>; 2],
-}
-
-/// Below this fraction a class is sampled from an explicit index list.
-const RARE: f64 = 1.0 / 64.0;
-
-impl<'a> VoxelSampler<'a> {
-    fn new(mask: &'a ForegroundMask) -> Self {
-        Self {
-            mask,
-            lists: [None, None],
-        }
-    }
-
-    fn sample<R: Rng + ?Sized>(&mut self, want_fg: bool, rng: &mut R) -> usize {
+    fn voxel<R: Rng + ?Sized>(&mut self, want_fg: bool, rng: &mut R) -> usize {
         let fg = self.mask.foreground;
         let total = self.mask.spatial;
         let class = match (fg, total - fg) {
@@ -189,7 +194,7 @@ impl<'a> VoxelSampler<'a> {
                 }
             }
         }
-        let mask = self.mask;
+        let mask = &self.mask;
         let list = self.lists[usize::from(class)].get_or_insert_with(|| {
             (0..total)
                 .filter(|&i| mask.get(i) == class)
@@ -197,6 +202,52 @@ impl<'a> VoxelSampler<'a> {
                 .collect()
         });
         list[rng.random_range(0..list.len())] as usize
+    }
+}
+
+/// Below this fraction a class is sampled from an explicit index list.
+const RARE: f64 = 1.0 / 64.0;
+
+/// Per-voxel foreground bits over the spatial grid of an image.
+struct ForegroundMask {
+    bits: Vec<u64>,
+    spatial: usize,
+    foreground: usize,
+}
+
+impl ForegroundMask {
+    /// `is_foreground` receives stored (unscaled) values.
+    fn new(image: &NiftiImage, is_foreground: impl Fn(f64) -> bool + Sync) -> Result<Self> {
+        let (_, volumes) = split_shape(image.shape());
+        let spatial: usize = split_shape(image.shape()).0.iter().product();
+        let words = spatial.div_ceil(64);
+        let mut bits = vec![0u64; words];
+        dispatch_dtype!(image.dtype(), T => {
+            let values = image.elements::<T>()?.as_cow();
+            crate::parallel::install(|| {
+                bits.par_iter_mut().enumerate().for_each(|(w, word)| {
+                    let start = w * 64;
+                    let end = (start + 64).min(spatial);
+                    for i in start..end {
+                        let fg = (0..volumes).any(|v| {
+                            let x: T = values[v * spatial + i];
+                            is_foreground(crate::nifti::element::sealed::Sealed::to_f64(x))
+                        });
+                        *word |= u64::from(fg) << (i - start);
+                    }
+                });
+            });
+        });
+        let foreground = bits.iter().map(|w| w.count_ones() as usize).sum();
+        Ok(Self {
+            bits,
+            spatial,
+            foreground,
+        })
+    }
+
+    fn get(&self, i: usize) -> bool {
+        self.bits[i / 64] >> (i % 64) & 1 == 1
     }
 }
 
@@ -272,5 +323,36 @@ mod tests {
                 .len(),
             5
         );
+    }
+
+    #[test]
+    fn threshold_sampler_centres_on_bright_voxels_with_any_shape() {
+        // A bright 4^3 block in a dark 40x40x30 image, stored scaled.
+        let mut arr = ArrayD::<i16>::zeros(IxDyn(&[40, 40, 30]).f());
+        for x in 30..34 {
+            for y in 5..9 {
+                for z in 10..14 {
+                    arr[[x, y, z]] = 500;
+                }
+            }
+        }
+        let mut image = NiftiImage::from_array(arr, EYE).unwrap();
+        image.header_mut().scl_slope = 0.5;
+        let mut rng = ChaCha8Rng::seed_from_u64(3);
+        // 500 * 0.5 = 250 is above 200 but not above 300.
+        let mut sampler = ForegroundSampler::from_threshold(&image, 200.0).unwrap();
+        assert_eq!(sampler.foreground(), 64);
+        for patch in [[8, 8, 8], [16, 4, 2], [40, 40, 40]] {
+            let r = sampler.sample(patch, 1.0, &mut rng).unwrap();
+            assert_eq!(
+                r.shape,
+                std::array::from_fn(|i| patch[i].min([40, 40, 30][i]))
+            );
+            assert!(r.offset[0] < 34 && r.end()[0] > 30, "{r:?}");
+            assert!(r.offset[2] < 14 && r.end()[2] > 10, "{r:?}");
+        }
+        let none = ForegroundSampler::from_threshold(&image, 300.0).unwrap();
+        assert_eq!(none.foreground(), 0);
+        assert!(ForegroundSampler::from_threshold(&image, f64::NAN).is_err());
     }
 }

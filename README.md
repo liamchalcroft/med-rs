@@ -21,10 +21,11 @@ Rust.
 - **Fused pipelines.** A `Pipeline` applies a chain of intensity transforms in
   one pass over the data and a chain of spatial transforms with a single
   interpolation.
-- **A training loader.** `FastLoader` streams fixed-size patches from worker
-  threads. It gives the same patch order with any number of workers, can centre
-  patches on label foreground, applies augmentation to image and label together,
-  and is safe to use in forked `DataLoader` workers.
+- **A training loader.** `FastLoader` streams patches from worker threads. It
+  gives the same patch order with any number of workers, can centre patches on
+  foreground (from labels or an intensity threshold), draws patch shapes and
+  volumes with weights, applies augmentation to image and label together, and
+  is safe to use in forked `DataLoader` workers.
 
 ## Install
 

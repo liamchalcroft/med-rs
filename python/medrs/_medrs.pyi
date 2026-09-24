@@ -114,6 +114,16 @@ class NiftiImage:
     def rotate_90(self, axes: tuple[int, int] = (0, 1), k: int = 1) -> NiftiImage: ...
     def z_normalize(self, *, nonzero: bool = False) -> NiftiImage: ...
     def rescale(self, out_min: float = 0.0, out_max: float = 1.0) -> NiftiImage: ...
+    def percentiles(self, q: Sequence[float], *, nonzero: bool = False) -> tuple[float, ...]: ...
+    def rescale_percentiles(
+        self,
+        lower: float,
+        upper: float,
+        *,
+        nonzero: bool = False,
+        out_min: float = 0.0,
+        out_max: float = 1.0,
+    ) -> NiftiImage: ...
     def clamp(self, min: float, max: float) -> NiftiImage: ...
     def adjust_gamma(self, gamma: float) -> NiftiImage: ...
     def with_dtype(self, dtype: _DType) -> NiftiImage: ...
@@ -142,6 +152,14 @@ class Pipeline:
     def clamp(self, min: float, max: float) -> Pipeline: ...
     def z_normalize(self, nonzero: bool = False) -> Pipeline: ...
     def rescale(self, out_min: float = 0.0, out_max: float = 1.0) -> Pipeline: ...
+    def rescale_percentiles(
+        self,
+        lower: float,
+        upper: float,
+        nonzero: bool = False,
+        out_min: float = 0.0,
+        out_max: float = 1.0,
+    ) -> Pipeline: ...
     def adjust_gamma(self, gamma: float) -> Pipeline: ...
     def cast(self, dtype: _DType) -> Pipeline: ...
     def random_flip(self, axes: Sequence[int] = (0, 1, 2), prob: float = 0.5) -> Pipeline: ...
@@ -188,16 +206,20 @@ class Epoch(Iterator[Patch]):
 
 @final
 class FastLoader:
-    """Streams fixed-size training patches from volumes using worker threads."""
+    """Streams training patches from volumes using worker threads."""
 
     def __new__(
         cls,
         images: Sequence[_StrPath],
-        patch_shape: _Shape3,
+        patch_shape: _Shape3 | Sequence[_Shape3],
         *,
         labels: Sequence[_StrPath] | None = None,
         patches_per_volume: int = 1,
+        patch_shape_weights: Sequence[float] | None = None,
         foreground_prob: float | None = None,
+        foreground_threshold: float | None = None,
+        weights: Sequence[float] | None = None,
+        volumes_per_epoch: int | None = None,
         pad_value: float = 0.0,
         pipeline: Pipeline | None = None,
         workers: int | None = None,

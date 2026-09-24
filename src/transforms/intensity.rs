@@ -222,6 +222,126 @@ pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Resu
     apply_map(image, &map)
 }
 
+/// Percentiles of the scaled values, computed exactly with NumPy's default
+/// (linear) interpolation. `q` holds percentages in `[0, 100]`.
+///
+/// With `nonzero`, zero voxels are left out (the usual choice for images
+/// with a zero background). Returns an error if the image contains NaN or has
+/// no voxels to measure.
+pub fn percentiles(image: &NiftiImage, q: &[f64], nonzero: bool) -> Result<Vec<f64>> {
+    percentiles_of(&image.f32_values()?, &PointMap::IDENTITY, q, nonzero)
+}
+
+/// Clip values to the `lower` and `upper` percentiles (see [`percentiles`])
+/// and map that range linearly onto `[out_min, out_max]`, like MONAI's
+/// `ScaleIntensityRangePercentiles` with clipping. With `nonzero`, the
+/// percentiles ignore zero voxels; every voxel is rescaled.
+pub fn rescale_percentiles(
+    image: &NiftiImage,
+    lower: f64,
+    upper: f64,
+    nonzero: bool,
+    out_min: f64,
+    out_max: f64,
+) -> Result<NiftiImage> {
+    let values = image.f32_values()?;
+    let map = percentile_map(
+        &values,
+        &PointMap::IDENTITY,
+        [lower, upper],
+        nonzero,
+        [out_min, out_max],
+    )?;
+    apply_map(image, &map)
+}
+
+pub(crate) fn check_percentiles(lower: f64, upper: f64) -> Result<()> {
+    if (0.0..=100.0).contains(&lower) && (0.0..=100.0).contains(&upper) && lower <= upper {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!(
+            "percentiles must satisfy 0 <= lower <= upper <= 100, got {lower} and {upper}"
+        )))
+    }
+}
+
+/// The map that clips `map(values)` to its `bounds` percentiles and rescales
+/// that range to `out`.
+pub(crate) fn percentile_map(
+    values: &[f32],
+    map: &PointMap,
+    bounds: [f64; 2],
+    nonzero: bool,
+    out: [f64; 2],
+) -> Result<PointMap> {
+    check_percentiles(bounds[0], bounds[1])?;
+    check_range("rescale", out[0], out[1])?;
+    let p = percentiles_of(values, map, &bounds, nonzero)?;
+    let (lo, hi) = (p[0], p[1]);
+    let scale = if hi > lo {
+        (out[1] - out[0]) / (hi - lo)
+    } else {
+        0.0
+    };
+    Ok(map
+        .then(&PointMap::linear(scale, out[0] - lo * scale))
+        .then(&PointMap::clamp(out[0], out[1])))
+}
+
+/// Percentiles of `map(values)`, optionally leaving out zeros.
+pub(crate) fn percentiles_of(
+    values: &[f32],
+    map: &PointMap,
+    q: &[f64],
+    nonzero: bool,
+) -> Result<Vec<f64>> {
+    if let Some(bad) = q.iter().find(|p| !(0.0..=100.0).contains(*p)) {
+        return Err(Error::InvalidArgument(format!(
+            "percentiles must be between 0 and 100, got {bad}"
+        )));
+    }
+    let f = map.kernel();
+    let mut v: Vec<f32> = crate::parallel::install(|| {
+        values
+            .par_chunks(CHUNK)
+            .flat_map_iter(|c| c.iter().map(|&x| f(x)).filter(|&x| !nonzero || x != 0.0))
+            .collect()
+    });
+    if v.iter().any(|x| x.is_nan()) {
+        return Err(Error::InvalidData(
+            "cannot compute percentiles: the image contains NaN".into(),
+        ));
+    }
+    if v.is_empty() {
+        return Err(Error::InvalidData(
+            "cannot compute percentiles: there are no voxels to measure".into(),
+        ));
+    }
+    let n = v.len();
+    Ok(q.iter()
+        .map(|&p| {
+            // NumPy's "linear" method: interpolate between the order
+            // statistics around the virtual index p/100 * (n - 1).
+            let index = p / 100.0 * (n - 1) as f64;
+            let k = (index.floor() as usize).min(n - 1);
+            let t = index - k as f64;
+            let (_, a, right) = v.select_nth_unstable_by(k, f32::total_cmp);
+            let a = f64::from(*a);
+            let b = right.iter().copied().fold(f32::INFINITY, f32::min);
+            if t == 0.0 || right.is_empty() {
+                return a;
+            }
+            let b = f64::from(b);
+            let d = b - a;
+            if t >= 0.5 {
+                b - d * (1.0 - t)
+            } else {
+                a + d * t
+            }
+        })
+        .collect())
+}
+
 /// Clamp values to `[min, max]`. NaN values stay NaN.
 pub fn clamp(image: &NiftiImage, min: f64, max: f64) -> Result<NiftiImage> {
     check_range("clamp", min, max)?;

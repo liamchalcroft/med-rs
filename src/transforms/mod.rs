@@ -31,13 +31,16 @@ pub use augment::{
     random_intensity_shift, random_rotate_90,
 };
 pub use intensity::{
-    adjust_gamma, clamp, rescale_intensity, z_normalization, z_normalization_nonzero,
+    adjust_gamma, clamp, percentiles, rescale_intensity, rescale_percentiles, z_normalization,
+    z_normalization_nonzero,
 };
 pub use orientation::{orientation_from_affine, reorient, AxisCode, Orientation};
 pub use resample::{
     resample_like, resample_to_grid, resample_to_shape, resample_to_spacing, Interpolation,
 };
-pub use sampling::{center_region, random_region, region_around, sample_label_regions, Region};
+pub use sampling::{
+    center_region, random_region, region_around, sample_label_regions, ForegroundSampler, Region,
+};
 pub use spatial::{crop, crop_or_pad, flip, rotate_90};
 
 pub(crate) use augment::{add_noise, check_probability, sample_gamma, scale_map, shift_map};

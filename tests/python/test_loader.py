@@ -116,3 +116,40 @@ def test_iteration_releases_the_gil(dataset):
     stop.set()
     thread.join()
     assert ticks > 100
+
+
+def test_patch_shape_choices_and_volume_weights(dataset):
+    images, _ = dataset
+    shapes = [(8, 8, 8), (12, 6, 4)]
+    loader = medrs.FastLoader(
+        images,
+        shapes,
+        patch_shape_weights=[1, 3],
+        weights=[0, 0, 1, 0, 0, 1],
+        volumes_per_epoch=40,
+        seed=2,
+    )
+    assert len(loader) == 40
+    patches = list(loader)
+    assert {p.volume for p in patches} == {2, 5}
+    counts = {s: sum(p.image.shape == s for p in patches) for s in shapes}
+    assert sum(counts.values()) == 40
+    assert counts[(12, 6, 4)] > counts[(8, 8, 8)]
+    assert "patch_shape=[[8, 8, 8], [12, 6, 4]]" in repr(loader)
+    with pytest.raises(ValueError, match="weights"):
+        medrs.FastLoader(images, (8, 8, 8), weights=[1, 2])
+
+
+def test_foreground_threshold_without_labels(tmp_path):
+    data = np.zeros((30, 30, 30), np.float32)
+    data[20:24, 3:7, 10:13] = 100
+    path = tmp_path / "bright.nii"
+    medrs.NiftiImage(data).save(path)
+    loader = medrs.FastLoader(
+        [path], (6, 6, 6), foreground_prob=1.0, foreground_threshold=50, patches_per_volume=10
+    )
+    for patch in loader:
+        assert patch.label is None
+        assert patch.image.to_numpy().max() == 100
+    with pytest.raises(ValueError, match="foreground_threshold"):
+        medrs.FastLoader([path], (6, 6, 6), foreground_prob=0.5)

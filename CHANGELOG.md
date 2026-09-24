@@ -45,6 +45,11 @@ under Fixes), so upgrading is strongly recommended.
   interpolation, and applies spatial randomness identically to image and label.
 - `FastLoader`: all formats, crop-first reads, deterministic order for any
   number of workers, label-aware sampling, padding, per-patch pipelines.
+  Patch shapes can be drawn per patch from weighted choices, volumes can be
+  drawn with weights (with replacement), and `foreground_threshold` centres
+  patches on bright voxels without labels.
+- `percentiles` and `rescale_percentiles` (also a pipeline step): exact,
+  NumPy-compatible percentiles, optionally over non-zero voxels only.
 - Python: any numeric array dtype in `NiftiImage(...)`, `numpy.asarray(img)`,
   bfloat16 for PyTorch and JAX, pickling, header dictionaries, type stubs,
   free-threaded CPython support, and a `medrs` command-line tool.
