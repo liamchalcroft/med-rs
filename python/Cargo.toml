@@ -17,7 +17,7 @@ ndarray = "0.16"
 numpy = { version = "0.29", features = ["half"] }
 pyo3 = { version = "0.29", features = ["abi3-py310"] }
 rand = "0.9"
-rand_chacha = "0.9"
+rand_chacha = "0.10"
 
 [lints]
 workspace = true
