@@ -1,384 +1,63 @@
-# Contributing to medrs
+# Contributing
 
-Thank you for your interest in contributing to medrs! This guide will help you get started.
+Thanks for helping improve medrs. Bug reports with a small reproducing script
+are especially valuable. If a file loads differently in medrs than in nibabel,
+please include the output of `medrs info` for it.
 
-## Quick Start
+## Layout
 
-### Development Setup
+| Path | Contents |
+|---|---|
+| `src/` | The `medrs` Rust crate: `nifti` (I/O), `transforms`, `pipeline`, `loader`, `jvol` |
+| `python/src/` | PyO3 bindings (the `medrs-python` crate, built by maturin) |
+| `python/medrs/` | The Python package: re-exports, type stubs, `monai.py`, `cli.py` |
+| `tests/*.rs` | Rust integration and property tests (unit tests live next to the code) |
+| `tests/python/` | Python tests, mostly checked against nibabel |
+| `benches/` | Criterion benchmarks |
+| `benchmarks/compare.py` | Cross-library comparison used for the README table |
+| `examples/` | Small runnable examples (run in CI) |
 
-1. **Fork and clone the repository**
-   ```bash
-   git clone https://github.com/your-username/med-rs.git
-   cd med-rs
-   ```
+## Setup
 
-2. **Set up the development environment**
-   ```bash
-   # Install Rust (if not already installed)
-   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-   # Install Python dependencies
-   pip install -e ".[dev]"
-
-   # Build the Python bindings
-   maturin develop --features python
-   ```
-
-3. **Run the test suite**
-   ```bash
-   # Rust tests
-   cargo test
-
-   # Python tests
-   pytest tests/
-   ```
-
-## Development Workflow
-
-### 1. Make Changes
-
-- **Rust code**: Make changes in `src/`
-- **Python code**: Make changes in `src/python/`
-- **Examples**: Add examples in `examples/`
-- **Tests**: Add tests in `tests/`
-- **Documentation**: Update docs in `docs/`
-
-### 2. Test Your Changes
+You need a Rust toolchain (1.83 or newer) and Python 3.10 or newer.
 
 ```bash
-# Run Rust tests
-cargo test
-
-# Run Rust tests with output
-cargo test -- --nocapture
-
-# Run specific Rust test
-cargo test test_name
-
-# Run Python tests
-pytest tests/
-
-# Run with coverage
-pytest tests/ --cov=medrs
-
-# Run benchmarks
-cargo bench
-python benchmarks/bench_medrs.py --quick
-
-# Test specific integrations
-pytest tests/test_monai_integration.py
-pytest tests/test_python_integration.py
+python -m venv .venv && source .venv/bin/activate
+pip install --group dev  # maturin, test and lint tools (pip 25.1 or newer)
+maturin develop          # builds the extension into the virtualenv
 ```
 
-### 3. Submit Pull Request
+## Checks
 
-1. **Create a feature branch**
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-
-2. **Commit your changes**
-   ```bash
-   git add .
-   git commit -m "feat: add your feature description"
-   ```
-
-3. **Push and create PR**
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-
-## Project Structure
-
-```
-medrs/
-+-- src/                     # Core Rust library
-|   +-- nifti/              # NIfTI file format support
-|   +-- transforms/         # High-performance transforms
-|   +-- pipeline/           # Transform pipeline composition
-|   +-- jvol/               # .jvol volumetric compression (feature = "jvol")
-|   +-- python/             # Python bindings (PyO3, feature = "python")
-|       +-- mod.rs           # Module entry point
-|       +-- medrs/           # Python-source package (__init__.py, exceptions.py, ...)
-+-- examples/               # Usage examples
-|   +-- basic/             # Getting started examples
-|   +-- integrations/      # Framework examples
-|   +-- advanced/          # Production patterns
-+-- tests/                 # Comprehensive test suite (Rust integration tests + pytest)
-|   +-- fixtures/          # Test data
-|   +-- conftest.py        # pytest configuration
-+-- benchmarks/            # Performance benchmarks
-+-- docs/                  # Sphinx documentation
-+-- paper/                 # Accompanying paper (paper/medrs.tex)
-+-- pyproject.toml         # Python project configuration
-+-- Cargo.toml             # Rust crate configuration
-```
-
-## Testing Guidelines
-
-### Writing Tests
-
-1. **Unit Tests**: Test individual functions and modules
-2. **Integration Tests**: Test cross-language functionality
-3. **Performance Tests**: Ensure no performance regressions
-4. **Property-Based Tests**: Use Hypothesis for edge cases
-
-### Test Categories
-
-```python
-import pytest
-
-@pytest.mark.unit
-def test_specific_function():
-    """Test a specific function."""
-    pass
-
-@pytest.mark.integration
-def test_rust_python_integration():
-    """Test Rust-Python integration."""
-    pass
-
-@pytest.mark.benchmark
-def test_performance_benchmark():
-    """Test performance critical path."""
-    pass
-
-@pytest.mark.slow
-def test_slow_operation():
-    """Test slow operation (marked as slow)."""
-    pass
-```
-
-### Adding New Features
-
-When adding new features:
-
-1. **Add tests** for the new functionality
-2. **Add examples** demonstrating usage
-3. **Update documentation** with API changes
-4. **Run benchmarks** to ensure performance
-5. **Test integrations** with PyTorch/JAX/MONAI
-
-## Code Style
-
-### Rust Code
-
-- Follow `rustfmt` formatting
-- Use `clippy` for linting
-- Write comprehensive doc comments
-- Use type hints and proper error handling
+CI runs the following; please run them before opening a pull request:
 
 ```bash
-# Format Rust code
-cargo fmt
-
-# Run linter
-cargo clippy -- -D warnings
+cargo fmt --all --check
+cargo clippy --workspace --all-features --all-targets -- -D warnings
+cargo test --workspace --all-features --exclude medrs-python
+maturin develop && pytest
+ruff check . && ruff format --check . && mypy
+python -m mypy.stubtest medrs._medrs --mypy-config-file pyproject.toml
 ```
 
-### Python Code
+Benchmarks: `cargo bench --all-features` and `python benchmarks/compare.py`.
 
-- Follow PEP 8 (use `black` formatter)
-- Use type hints throughout
-- Write comprehensive docstrings
-- Use proper exception handling
+## Guidelines
 
-```bash
-# Format Python code
-black src/python/ tests/ examples/
+- **Correctness first.** Every behaviour change needs a test. Where there is a
+  reference implementation (nibabel, scipy, numpy), test against it.
+- **Keep geometry consistent.** Spatial transforms must update the affine so
+  that every voxel keeps its world position; derive header updates from the
+  transform's `GridChange` (see `src/transforms/geometry.rs`).
+- **No panics in library code.** Return `medrs::Error`; the crate denies
+  `unwrap`, `expect`, and `panic!` outside tests.
+- **Release the GIL** in bindings around any work that touches voxel data.
+- Update `CHANGELOG.md` for user-visible changes.
 
-# Type checking
-mypy src/python/
-```
+## Releasing
 
-## Performance Guidelines
-
-### Critical Paths
-
-- **I/O Operations**: Must be as fast as possible
-- **Memory Usage**: Minimize allocations
-- **Transform Operations**: Use SIMD where possible
-
-### Benchmarking
-
-```bash
-# Rust benchmarks
-cargo bench
-
-# Python benchmarks
-pytest tests/ --benchmark-only
-
-# Compare with alternatives (nibabel, MONAI, TorchIO)
-python benchmarks/bench_medrs.py
-python benchmarks/compare_all.py
-```
-
-### Performance Checklist
-
-- [ ] Run benchmarks before and after changes
-- [ ] No regressions in critical paths
-- [ ] Memory usage remains optimal
-- [ ] SIMD optimizations maintained
-
-## Documentation
-
-### API Documentation
-
-- Document all public functions and classes
-- Include parameter descriptions and examples
-- Mention performance characteristics
-
-```rust
-/// Load a NIfTI file with crop-first optimization.
-///
-/// # Arguments
-///
-/// * `path` - Path to the NIfTI file
-/// * `offset` - Starting voxel offset [x, y, z]
-/// * `shape` - Desired output shape [x, y, z]
-///
-/// # Returns
-///
-/// `MedicalImage<T>` with loaded data
-///
-/// # Performance
-///
-/// This function reads only the required bytes from disk,
-/// reducing memory usage compared to loading the entire volume.
-///
-/// # Examples
-///
-/// ```rust
-/// let img = medrs::nifti::load_cropped(
-///     "volume.nii.gz",
-///     [32, 32, 16],
-///     [64, 64, 64]
-/// )?;
-/// ```
-pub fn load_cropped<T: DataType>(path: &str, offset: [usize; 3], shape: [usize; 3]) -> Result<MedicalImage<T>> {
-    // Implementation
-}
-```
-
-### Examples
-
-- Add examples for new features
-- Include performance benchmarks
-- Show integration with frameworks
-- Provide real-world use cases
-
-## Bug Reports
-
-When reporting bugs:
-
-1. **Use the bug report template**
-2. **Include minimal reproduction example**
-3. **Provide system information** (OS, Python version, Rust version)
-4. **Include performance benchmarks** if relevant
-5. **Attach test files** if possible
-
-## Feature Requests
-
-When requesting features:
-
-1. **Describe the use case** in detail
-2. **Explain why existing solutions don't work**
-3. **Propose API design** if you have ideas
-4. **Consider performance implications**
-
-## Review Process
-
-### Code Review Checklist
-
-- [ ] Code follows style guidelines
-- [ ] Tests are comprehensive
-- [ ] Documentation is updated
-- [ ] Performance is maintained
-- [ ] No breaking changes without version bump
-- [ ] Integration tests pass
-
-### Getting Reviews
-
-1. **Request review** from maintainers
-2. **Address feedback** promptly
-3. **Update tests** based on review
-4. **Re-request review** after changes
-
-## Version Management
-
-### Semantic Versioning
-
-- **Major**: Breaking changes
-- **Minor**: New features (backward compatible)
-- **Patch**: Bug fixes and improvements
-
-### Release Process
-
-1. **Update version numbers** in `Cargo.toml` and `pyproject.toml`
-2. **Update CHANGELOG.md**
-3. **Tag the release**
-4. **Build and publish to PyPI**
-
-## Getting Help
-
-- **GitHub Issues**: For bugs and feature requests
-- **Documentation**: https://medrs.readthedocs.io
-
-## Release Checklist
-
-Before releasing:
-
-- [ ] All tests pass
-- [ ] Documentation is updated
-- [ ] Performance benchmarks run
-- [ ] CHANGELOG.md updated
-- [ ] Version numbers updated
-- [ ] Examples tested
-- [ ] Integration tests pass
-- [ ] Security review (if applicable)
-
-## Development Tools
-
-### Useful Commands
-
-```bash
-# Development build
-maturin develop --features python
-
-# Release build
-maturin build --release
-
-# Run specific test
-pytest tests/test_specific.py::test_function
-
-# Run with specific marker
-pytest tests/ -m "not slow"
-
-# Coverage report
-pytest tests/ --cov=medrs --cov-report=html
-
-# Documentation build
-cd docs && make html
-
-# Performance profiling (Criterion, HTML reports under target/criterion/)
-cargo bench
-```
-
-### IDE Setup
-
-#### VSCode
-
-Recommended extensions:
-- **Rust Analyzer**: Rust language support
-- **Python**: Python language support
-- **CodeLLDB**: Debugging support
-
-#### PyCharm
-
-- Install Rust plugin
-- Configure Python interpreter
-- Set up pytest configuration
-
----
-
-Thank you for contributing to medrs! Your contributions help make medical imaging faster and more accessible for everyone. 
+1. Update the version in the root `Cargo.toml` (`[workspace.package]`) and add
+   a dated `CHANGELOG.md` entry.
+2. Merge to `main`, then publish a GitHub release tagged `vX.Y.Z`. The publish
+   workflow checks that the tag matches the version, builds wheels and the
+   sdist, and publishes to PyPI and crates.io.

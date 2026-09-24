@@ -1,5 +1,88 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+A rewrite focused on correctness, with a smaller, consistent API. The previous
+release silently produced wrong results in several common cases (listed
+under Fixes), so upgrading is strongly recommended.
+
+### Breaking changes and migration
+
+| 0.2 | 0.3 |
+|---|---|
+| `medrs.save_jvol(img, path, quality=q)` | `img.save("x.jvol", quality=q)` (lossless without `quality`) |
+| `medrs.convert_to_mgzip(path)`, `medrs.load_mgzip` | `medrs.load(path).save(out, mgzip=True)`; `load` detects Mgzip itself. CLI: `medrs convert --to mgzip` |
+| `TrainingDataLoader`, `CropLoader`, `BatchLoader` | `FastLoader(..., patches_per_volume=n, workers=0)` |
+| `FastLoader(...).build()` / one-shot iteration | `FastLoader(images, patch_shape, ...)`; each iteration is a new epoch and yields `Patch` objects |
+| `load_image_label_pair`, `load_multi(configs)` | `load_multi(paths, reference=0, interpolation=[...])`, which resamples onto the reference grid |
+| `load_label_aware_cropped`, `compute_*_crop*` | `FastLoader(labels=..., foreground_prob=p)`; Rust: `transforms::sample_label_regions` |
+| `TransformPipeline` (mutable) | `Pipeline` (immutable); `apply(image, label=None, seed=None)` |
+| `random_*` functions and `random_augment` | Pipeline steps (`Pipeline().random_flip(...)`) |
+| `load_to_torch(path)`, `load_cropped_to_torch`, ... | `medrs.load(path).to_torch()`, `medrs.load_cropped(...).to_torch()` |
+| `img.data`, `to_numpy_native()` | `img.to_numpy()` (one dtype rule, see the guide) |
+| `img.affine` as nested lists | `img.affine` as a float64 NumPy array; set with `img.with_affine(a)` |
+| `medrs.monai_compat`, `metatensor_support`, `dictionary_transforms` | `medrs.monai.MedrsReader` with MONAI's own `LoadImage(d)` |
+| `medrs.exceptions` classes | `medrs.FormatError` (a `ValueError`) and built-in exceptions |
+| `flip` left the affine unchanged | All spatial transforms update the affine (world-preserving) |
+| `.jvol` files written by 0.2 | Not readable; re-encode from the original images |
+| Rust: `medrs::pipeline::compose::TransformPipeline`, `LazyImage`, `simd_kernels` | `medrs::Pipeline` |
+| Rust: `python` Cargo feature | The bindings are a separate crate built by maturin |
+| Alternative spellings such as `"f32"`, `"linear"`, `"ras"` | One name each: NumPy dtype names, `"nearest"`/`"trilinear"`, upper-case orientation codes |
+
+### New
+
+- Full NIfTI header round trips: extensions, intent, slice timing, units,
+  calibration, and both transform codes. NIfTI-2, big-endian files, and
+  `.hdr`/`.img` pairs are read and written.
+- Parallel decompression of Mgzip/BGZF files in `load`; gzip is detected from
+  the file contents.
+- New `.jvol` container: chunked, checksummed, lossless for every datatype,
+  crop-first decoding, parallel encode and decode.
+- `resample_like`, `resample_to_grid`, `load_multi` onto a reference grid,
+  4D support in every transform, `z_normalize(nonzero=True)`, `adjust_gamma`,
+  `rotate_90`.
+- `Pipeline` fuses intensity steps into one pass and spatial steps into one
+  interpolation, and applies spatial randomness identically to image and label.
+- `FastLoader`: all formats, crop-first reads, deterministic order for any
+  number of workers, label-aware sampling, padding, per-patch pipelines.
+- Python: any numeric array dtype in `NiftiImage(...)`, `numpy.asarray(img)`,
+  bfloat16 for PyTorch and JAX, pickling, header dictionaries, type stubs,
+  free-threaded CPython support, and a `medrs` command-line tool.
+- `medrs.set_num_threads`; parallel work is safe in forked processes.
+
+### Fixes
+
+- Flipped, cropped, padded, and rotated images were stored in the wrong memory
+  order, so any later operation or save scrambled the voxels.
+- `to_numpy()` returned garbage for int32/uint32 images and byte-swapped
+  values for big-endian files.
+- In-place operations on tensors from `to_torch()` crashed the interpreter
+  (they wrote to read-only memory-mapped files).
+- Saving over the file an image was loaded from crashed with SIGBUS; saving to
+  a bare file name failed.
+- The pipeline reordered and dropped intensity operations and did not update
+  the affine when resampling.
+- Nearest-neighbour resampling and reorientation converted label maps to
+  float32. `clamp` ignored `scl_slope`/`scl_inter`. `reorient` accepted
+  invalid codes such as `"RRR"` and could panic.
+- `sform_code`, `qform_code`, and `pixdim` were reset by transforms; qforms
+  were wrong for 180-degree rotations and left-handed affines.
+- Patch sampling used a fixed default seed, had the positive/negative ratio
+  inverted, and returned truncated patches at the border.
+- `FastLoader` rejected `.nii` files and hung the interpreter when dropped
+  mid-epoch; forked `DataLoader` workers hung after the parent used medrs.
+- `.jvol` lossless mode was lossy for scaled images and 64-bit integers, lost
+  most header fields, and could be crashed or made to exhaust memory by
+  crafted files.
+- `is_mgzip` missed Mgzip files, and `convert_to_mgzip` wrote files that
+  `load` could not read.
+
+### Removed
+
+- The Sphinx documentation site (replaced by `docs/guide.md` and docs.rs),
+  the `benchmark` and `docs` workflows, and the profiling and compatibility
+  helper modules.
+
 ## 0.2.0 (2026-07-02)
 
 - Added optional `.jvol` volumetric compression (wavelet + Rice coding), vendored from
@@ -25,6 +108,10 @@
 - Fixed potential panic when patch size exceeds volume dimensions in `CropLoader` and `TrainingDataLoader`.
 - Added dimension overflow validation in `crop_or_pad` and `rotate_90` transforms.
 - Added regression tests for boundary condition handling and for the corrected resample/reorient affine math.
+
+## 0.1.2 (2025-12-29)
+
+- Documentation and benchmark updates.
 
 ## 0.1.1
 
