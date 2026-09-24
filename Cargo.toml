@@ -1,160 +1,90 @@
 [package]
 name = "medrs"
-version = "0.2.0"
-edition = "2021"
-rust-version = "1.81"
-description = "Ultra-high-performance medical imaging I/O for deep learning"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/liamchalcroft/med-rs"
-homepage = "https://github.com/liamchalcroft/med-rs"
-documentation = "https://medrs.readthedocs.io"
-authors = ["Liam Chalcroft <liam.chalcroft.20@ucl.ac.uk>"]
-keywords = ["medical-imaging", "nifti", "neuroimaging", "deep-learning", "pytorch"]
-categories = ["science", "multimedia::images", "api-bindings"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "Fast medical image I/O, transforms, and training patch loading (NIfTI, crop-first reads, parallel gzip)"
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/medrs"
+authors.workspace = true
+keywords = ["medical-imaging", "nifti", "neuroimaging", "deep-learning", "mri"]
+categories = ["science", "encoding", "multimedia::images"]
 readme = "README.md"
-exclude = [
-    "docs/*",
-    "tests/*",
-    "benchmarks/*",
-    "examples/*",
-    ".github/*",
-    "*.nii",
-    "*.nii.gz",
-]
-
-[lib]
-name = "medrs"
-crate-type = ["cdylib", "rlib"]
+include = ["/src", "/benches", "/README.md", "/CHANGELOG.md", "/LICENSE-MIT", "/LICENSE-APACHE"]
 
 [dependencies]
-# Core
-ndarray = { version = "0.16", features = ["rayon"] }
-num-traits = "0.2"
+bytemuck = { version = "1.19", features = ["extern_crate_alloc"] }
 byteorder = "1.5"
-thiserror = "2.0"
-half = { version = "2.4", features = ["bytemuck", "num-traits"] }
-bytemuck = { version = "1.14", features = ["derive"] }
-
-# Compression
-flate2 = { version = "1.0", features = ["zlib-ng"], default-features = false }
-gzp = { version = "2.0", default-features = false, features = ["deflate_zlib_ng"] }
-
-# Parallelism
+flate2 = { version = "1.1", default-features = false, features = ["zlib-ng"] }
+gzp = { version = "2.0.4", default-features = false, features = ["deflate_zlib_ng"] }
+half = { version = "2.4", features = ["bytemuck"] }
+libdeflater = "1.25"
+memmap2 = "0.9.11"
+ndarray = "0.16"
+rand = "0.9"
+rand_chacha = "0.9"
+rand_distr = "0.5"
 rayon = "1.10"
-
-# SIMD
-wide = "0.7"
-
-# Randomization for training pipelines
-rand = "0.8"
-rand_chacha = "0.3"
-
-# Memory mapping
-memmap2 = "0.9"
-libdeflater = "0.14"
-
-# Python bindings (optional)
-pyo3 = { version = "0.24", features = ["extension-module"], optional = true }
-numpy = { version = "0.24", optional = true }
-
-# Volumetric compression (jvol, optional)
-serde = { version = "1.0", features = ["derive"], optional = true }
-bincode = { version = "1", optional = true }
+thiserror = "2.0"
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = "0.7"
+proptest = "1.5"
 tempfile = "3.14"
 
 [features]
-default = []
-jvol = ["dep:serde", "dep:bincode", "dep:zstd"]
-python = ["pyo3", "numpy", "jvol"]
+jvol = ["dep:zstd"]
 
+[package.metadata.docs.rs]
+all-features = true
 
-[profile.release]
-lto = true
-codegen-units = 1
-opt-level = 3
-debug = true
-panic = "abort"
-strip = true
+[[bench]]
+name = "io"
+harness = false
 
-[profile.dev]
-debug = true
-opt-level = 0
-
-[profile.bench]
-debug = true
-lto = true
-codegen-units = 1
-
-[profile.test]
-debug = true
-opt-level = 1
-
-[workspace]
-resolver = "2"
-
-[workspace.lints.rust]
-missing_docs = "warn"
-unsafe_code = "warn"
-
-[workspace.lints.clippy]
-all = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
-nursery = { level = "warn", priority = -1 }
-cargo = { level = "warn", priority = -1 }
-# Allowances for a numeric/scientific codebase. Applied workspace-wide (lib,
-# tests, benches) so all crate roots share the same policy.
-cast_possible_truncation = "allow"
-cast_precision_loss = "allow"
-cast_sign_loss = "allow"
-cast_lossless = "allow"
-cast_possible_wrap = "allow"
-cast_ptr_alignment = "allow"
-ptr_as_ptr = "allow"
-similar_names = "allow"
-many_single_char_names = "allow"
-too_many_lines = "allow"
-module_name_repetitions = "allow"
-must_use_candidate = "allow"
-return_self_not_must_use = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-suboptimal_flops = "allow"
-redundant_pub_crate = "allow"
-missing_const_for_fn = "allow"
-doc_markdown = "allow"
-uninlined_format_args = "allow"
-use_self = "allow"
-redundant_closure_for_method_calls = "allow"
-manual_is_multiple_of = "allow"
-option_map_or_none = "allow"
-map_unwrap_or = "allow"
-needless_pass_by_value = "allow"
-# Style and nursery lints that flap between clippy versions. Allowing them keeps
-# CI stable regardless of which stable clippy runs (the nursery group in
-# particular is explicitly unstable).
-cognitive_complexity = "allow"
-comparison_chain = "allow"
-manual_is_finite = "allow"
-redundant_clone = "allow"
-unnested_or_patterns = "allow"
-float_cmp = "allow"
-wildcard_enum_match_arm = "allow"
-explicit_iter_loop = "allow"
-needless_borrow = "allow"
-manual_memcpy = "allow"
-# Test and benchmark code writes literal arrays and scratch data freely.
-approx_constant = "allow"
-unreadable_literal = "allow"
-manual_range_contains = "allow"
-needless_range_loop = "allow"
+[[bench]]
+name = "transforms"
+harness = false
 
 [lints]
 workspace = true
 
-[[bench]]
-name = "nifti_io"
-harness = false
+[workspace]
+members = [".", "python"]
+resolver = "2"
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/liamchalcroft/med-rs"
+authors = ["Liam Chalcroft <liam.chalcroft.20@ucl.ac.uk>"]
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+# Numeric code converts between integer and float types on purpose.
+cast_possible_truncation = "allow"
+cast_possible_wrap = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+# Exact float comparisons are intentional (sentinels such as a zero slope).
+float_cmp = "allow"
+many_single_char_names = "allow"
+missing_errors_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+similar_names = "allow"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 1

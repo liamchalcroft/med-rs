@@ -2,163 +2,142 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  # Rust tests
-  rust-test:
-    name: Rust Tests
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      # mypy checks against the running Python; use the oldest supported one.
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      # Pinned so that new lints arrive in deliberate toolchain bumps.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.94.1"
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
+      - run: cargo doc --workspace --all-features --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - run: |
+          python -m pip install --upgrade pip
+          python -m pip install --group lint --group docs
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy
+      - name: Build the documentation site
+        run: mkdocs build
+
+  rust:
+    name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-features --exclude medrs-python --locked
+      - run: cargo test --lib --locked
+      - name: Run the example
+        run: cargo run --example preprocess --locked -- tests/fixtures/mprage_img.nii.gz "$RUNNER_TEMP/out.nii.gz"
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run cargo fmt
-        run: cargo fmt --check
-
-      - name: Run cargo clippy (no Python)
-        run: cargo clippy -- -D warnings
-
-      - name: Run cargo clippy (jvol feature)
-        run: cargo clippy --features jvol -- -D warnings
-
-      - name: Run cargo test (no Python)
-        run: cargo test
-
-      - name: Run cargo test (jvol feature)
-        run: cargo test --features jvol
-
-  # MSRV check: the minimum Rust version declared in Cargo.toml must build and test.
   msrv:
-    name: MSRV (Rust 1.81)
+    name: Rust 1.83 (MSRV)
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features --locked
 
-      - name: Install Rust 1.81
-        uses: dtolnay/rust-toolchain@1.81.0
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build at MSRV
-        run: cargo build --features jvol
-
-      - name: Test at MSRV
-        run: cargo test --features jvol
-
-  # Clippy for the Python-feature surface, pinned to a fixed toolchain so
-  # newly-stabilized nursery/pedantic lints on a rolling `stable` don't cause
-  # unrelated CI breaks (see repo history for the churn this caused).
-  clippy-python:
-    name: Clippy (python feature)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Install pinned Rust toolchain
-        uses: dtolnay/rust-toolchain@1.83.0
-        with:
-          components: clippy
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Run cargo clippy (python feature)
-        run: cargo clippy --features python -- -D warnings
-
-  # Python tests across versions and platforms
-  python-test:
-    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+  python:
+    name: Python ${{ matrix.python }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          - { os: ubuntu-latest, python: "3.10" }
+          - { os: ubuntu-latest, python: "3.14" }
+          - { os: ubuntu-latest, python: "3.14t" }
+          - { os: macos-latest, python: "3.14" }
+          - { os: windows-latest, python: "3.14" }
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python }}
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Build medrs wheel
-        run: maturin build --release --features python
-
-      - name: Install medrs and test dependencies
-        shell: bash
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python-${{ matrix.python }}
+      - name: Install test dependencies
         run: |
-          pip install target/wheels/*.whl
-          pip install pytest numpy nibabel psutil
+          python -m pip install --upgrade pip
+          python -m pip install maturin --group test
+      - name: Build and install medrs
+        run: |
+          maturin build --locked --out dist -i python
+          python -m pip install --no-index --find-links dist medrs
+      - run: pytest
+      - name: Check the type stubs against the extension
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.14'
+        run: |
+          python -m pip install --group lint
+          python -m mypy.stubtest medrs._medrs --mypy-config-file pyproject.toml
+      - name: Run the examples
+        run: |
+          python examples/quick_start.py
+          python examples/training_loader.py
 
-      - name: Run Python tests
-        run: pytest tests/ -v --ignore=tests/test_monai_integration.py --ignore=tests/test_python_integration.py --ignore=tests/test_integration_comparison.py
-
-  # MONAI integration tests (subset of platforms)
-  monai-test:
-    name: MONAI Integration (Python ${{ matrix.python }})
+  integrations:
+    name: PyTorch, MONAI, and JAX
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ["3.10", "3.12"]
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python }}
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: ${{ matrix.python }}
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Build medrs wheel
-        run: maturin build --release --features python
-
-      - name: Install medrs and MONAI dependencies
-        shell: bash
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install dependencies
         run: |
-          pip install target/wheels/*.whl
-          pip install numpy nibabel pytest psutil
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install monai jax jaxlib
-
-      - name: Run MONAI and Python integration tests
-        run: pytest tests/test_monai_integration.py tests/test_python_integration.py tests/test_integration_comparison.py -v
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install maturin monai jax ml_dtypes --group test
+      - name: Build and install medrs
+        run: |
+          maturin build --locked --out dist -i python
+          python -m pip install --no-index --find-links dist medrs
+      - run: pytest
+      - run: python examples/training_loader.py

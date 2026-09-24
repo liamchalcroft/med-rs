@@ -1,528 +1,327 @@
+//! Exact spatial transforms: crop, pad, flip, and 90-degree rotation.
+//!
+//! These rearrange voxels without interpolation, so they keep the datatype and
+//! scaling of the input. All of them are *world-preserving*: the affine is
+//! updated so every voxel keeps its position in scanner space, which is what
+//! prevents left/right mix-ups when a transformed image is saved and viewed.
+//! Axes beyond the third are carried through.
+
+use super::geometry::{
+    crop_or_pad_plan, crop_plan, flip_axes, flip_plan, rotate_plan, rotation_args, spatial_rank,
+    split_shape, with_spatial_shape,
+};
 use crate::error::{Error, Result};
-use crate::nifti::image::ArrayData;
+use crate::nifti::element::{dispatch_dtype, map_array, to_fortran, NiftiElement};
 use crate::nifti::NiftiImage;
-use ndarray::{ArrayD, Axis, Slice};
+use ndarray::{ArrayD, Axis, IxDyn, ShapeBuilder, Slice};
 
-/// Crop or pad the image to a target shape, centered.
-///
-/// If the target dimension is smaller, it crops the center.
-/// If the target dimension is larger, it pads with zeros.
+/// Crop `shape` voxels starting at `offset` along the first three axes.
 ///
 /// # Errors
-///
-/// Returns an error if `target_shape` dimensions don't match the image dimensions.
-#[must_use = "this function returns a new image and does not modify the original"]
-#[allow(clippy::comparison_chain)]
-pub fn crop_or_pad(image: &NiftiImage, target_shape: &[usize]) -> Result<NiftiImage> {
-    let current_shape = image.shape();
-    let ndim = current_shape.len();
+/// [`Error::InvalidCropRegion`] if the region is empty or extends past the
+/// image.
+pub fn crop(image: &NiftiImage, offset: [usize; 3], shape: [usize; 3]) -> Result<NiftiImage> {
+    let (spatial, _) = split_shape(image.shape());
+    let change = crop_plan(spatial, offset, shape)?;
+    let rank = spatial_rank(image.shape());
+    let data = image.raw_data()?;
+    let data = map_array!(data.as_ref(), |a| {
+        let mut view = a.view();
+        for axis in 0..rank {
+            view.slice_axis_inplace(
+                Axis(axis),
+                Slice::from(offset[axis]..offset[axis] + shape[axis]),
+            );
+        }
+        to_fortran(&view)
+    });
+    let mut header = image.header().clone();
+    header.transform_voxels(&change.map);
+    Ok(NiftiImage::from_parts(header, data))
+}
 
-    if target_shape.len() != ndim {
+/// Centre-crop or pad the first three axes to `target`.
+///
+/// Where an axis shrinks, the central region is kept (the extra voxel is
+/// dropped from the far side when the difference is odd); where it grows, the
+/// image is centred in the new grid. New voxels get `pad_value`, in scaled
+/// units. If `pad_value` cannot be stored exactly in the image's datatype (for
+/// example `-1` in a `u8` image), the output is converted to `f32`.
+pub fn crop_or_pad(image: &NiftiImage, target: [usize; 3], pad_value: f64) -> Result<NiftiImage> {
+    if !pad_value.is_finite() {
+        return Err(Error::InvalidArgument(format!(
+            "pad value must be finite, got {pad_value}"
+        )));
+    }
+    let (spatial, _) = split_shape(image.shape());
+    let (change, pads) = crop_or_pad_plan(spatial, target)?;
+    let out_shape = with_spatial_shape(image.shape(), target);
+    if out_shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .is_none()
+    {
         return Err(Error::InvalidDimensions(format!(
-            "Target shape dimensions {} must match image dimensions {}",
-            target_shape.len(),
-            ndim
+            "target shape {target:?} is too large"
         )));
     }
 
-    // Validate no zero dimensions
-    for (i, &dim) in target_shape.iter().enumerate() {
-        if dim == 0 {
-            return Err(Error::InvalidDimensions(format!(
-                "Target shape dimension {} cannot be 0",
-                i
-            )));
-        }
-    }
-
-    // Calculate crop/pad slices
-    let mut slices = Vec::with_capacity(ndim);
-    let mut pad_width = Vec::with_capacity(ndim);
-    let mut needs_padding = false;
-
-    for i in 0..ndim {
-        let curr = current_shape[i];
-        let target = target_shape[i];
-
-        if target < curr {
-            // Crop
-            let diff = curr - target;
-            let start = diff / 2;
-            slices.push(start..start + target);
-            pad_width.push((0, 0));
-        } else if target > curr {
-            // Pad
-            let diff = target - curr;
-            let before = diff / 2;
-            let after = diff - before;
-            slices.push(0..curr);
-            pad_width.push((before, after));
-            needs_padding = true;
+    let mut src_start = [0usize; 3];
+    let mut dst_start = [0usize; 3];
+    let mut len = [0usize; 3];
+    for axis in 0..3 {
+        let (n, t) = (spatial[axis], target[axis]);
+        if t <= n {
+            src_start[axis] = (n - t) / 2;
+            len[axis] = t;
         } else {
-            // Same
-            slices.push(0..curr);
-            pad_width.push((0, 0));
+            dst_start[axis] = (t - n) / 2;
+            len[axis] = n;
         }
     }
 
-    macro_rules! process_array_ref {
-        ($arr:expr, $ty:ty) => {{
-            // First crop if needed (view) - works on reference, no clone
-            let mut view = $arr.view();
-            for (i, slice) in slices.iter().enumerate() {
-                view.slice_axis_inplace(Axis(i), Slice::from(slice.clone()));
-            }
-
-            if !needs_padding {
-                // If only cropping, copy only the cropped region (much smaller!)
-                view.to_owned().into_dyn()
-            } else {
-                // If padding needed, allocate new array
-                let mut out = ArrayD::<$ty>::from_elem(target_shape, <$ty>::default());
-
-                // Calculate where to place the view in the new array
-                let mut out_slice_info = Vec::new();
-                for i in 0..ndim {
-                    let (before, _) = pad_width[i];
-                    let len = view.shape()[i];
-                    out_slice_info.push(Slice::from(before..before + len));
-                }
-
-                // Slice the output array and assign the view
-                let mut out_view = out.view_mut();
-                for (i, slice) in out_slice_info.iter().enumerate() {
-                    out_view.slice_axis_inplace(Axis(i), *slice);
-                }
-                out_view.assign(&view);
-
-                out
-            }
-        }};
-    }
-
-    // Use data_cow() to avoid cloning if data is already owned
-    let data = image.data_cow()?;
-    let new_data = match data.as_ref() {
-        ArrayData::U8(a) => ArrayData::U8(process_array_ref!(a, u8)),
-        ArrayData::I8(a) => ArrayData::I8(process_array_ref!(a, i8)),
-        ArrayData::I16(a) => ArrayData::I16(process_array_ref!(a, i16)),
-        ArrayData::U16(a) => ArrayData::U16(process_array_ref!(a, u16)),
-        ArrayData::I32(a) => ArrayData::I32(process_array_ref!(a, i32)),
-        ArrayData::U32(a) => ArrayData::U32(process_array_ref!(a, u32)),
-        ArrayData::I64(a) => ArrayData::I64(process_array_ref!(a, i64)),
-        ArrayData::U64(a) => ArrayData::U64(process_array_ref!(a, u64)),
-        ArrayData::F16(a) => ArrayData::F16(process_array_ref!(a, half::f16)),
-        ArrayData::BF16(a) => ArrayData::BF16(process_array_ref!(a, half::bf16)),
-        ArrayData::F32(a) => ArrayData::F32(process_array_ref!(a, f32)),
-        ArrayData::F64(a) => ArrayData::F64(process_array_ref!(a, f64)),
+    let (slope, inter) = image.header().scaling();
+    let raw_pad = (pad_value - inter) / slope;
+    let fits =
+        !pads || dispatch_dtype!(image.dtype(), T => T::from_f64(raw_pad).to_f64() == raw_pad);
+    let (source, fill) = if fits {
+        (image.clone(), raw_pad)
+    } else {
+        (image.with_data(image.to_f32()?)?, pad_value)
     };
 
-    // Update header dimensions (reset unused dims to 1)
-    let mut header = image.header().clone();
-    header.ndim = target_shape.len() as u8;
-    header.dim = [1i64; 7];
-    for (i, &s) in target_shape.iter().enumerate() {
-        header.dim[i] = s as i64;
-    }
-
-    // Update origin for crop/pad offset
-    let affine = image.affine();
-    let mut new_affine = affine;
-
-    for i in 0..ndim.min(3) {
-        let curr = current_shape[i];
-        let target = target_shape[i];
-
-        // Use the same integer start/before offsets the data path uses, so an
-        // odd size difference shifts the origin by whole voxels, not a half.
-        let shift = if target < curr {
-            // Cropped: origin moves to the first retained voxel.
-            ((curr - target) / 2) as f32
-        } else if target > curr {
-            // Padded: origin moves back by the leading pad width.
-            -(((target - curr) / 2) as f32)
-        } else {
-            0.0
-        };
-
-        if shift != 0.0 {
-            new_affine[0][3] += affine[0][i] * shift;
-            new_affine[1][3] += affine[1][i] * shift;
-            new_affine[2][3] += affine[2][i] * shift;
-        }
-    }
-
-    header.set_affine(new_affine);
-
-    Ok(NiftiImage::from_parts(header, new_data))
+    let data = source.raw_data()?;
+    let data = map_array!(data.as_ref(), |a| {
+        paste(a, &out_shape, src_start, dst_start, len, fill)
+    });
+    let mut header = source.header().clone();
+    header.transform_voxels(&change.map);
+    Ok(NiftiImage::from_parts(header, data))
 }
 
-/// Crop the image to a specified region.
-///
-/// # Arguments
-///
-/// * `image` - The input image
-/// * `start` - Start coordinates [d, h, w]
-/// * `end` - End coordinates (exclusive) [d, h, w]
-///
-/// # Errors
-///
-/// Returns `Error::InvalidDimensions` if the image is not 3D, or an error if the
-/// data cannot be accessed.
-pub fn crop(image: &NiftiImage, start: [usize; 3], end: [usize; 3]) -> Result<NiftiImage> {
-    let shape = image.shape();
-
-    // The 3-axis slice below indexes shape[0..3] directly.
-    if shape.len() != 3 {
-        return Err(Error::InvalidDimensions(format!(
-            "crop requires a 3D image, got {} dimensions",
-            shape.len()
-        )));
+/// Copy `len` voxels from `a` at `src_start` into a new array of `out_shape`
+/// at `dst_start`, filling the rest with `fill`.
+fn paste<T: NiftiElement>(
+    a: &ArrayD<T>,
+    out_shape: &[usize],
+    src_start: [usize; 3],
+    dst_start: [usize; 3],
+    len: [usize; 3],
+    fill: f64,
+) -> ArrayD<T> {
+    let rank = a.ndim().min(3);
+    let mut out = ArrayD::from_elem(IxDyn(out_shape).f(), T::from_f64(fill));
+    let mut src = a.view();
+    let mut dst = out.view_mut();
+    // A 1D/2D image that gained spatial axes: append them to the source view.
+    while src.ndim() < dst.ndim() {
+        let n = src.ndim();
+        src = src.insert_axis(Axis(n));
     }
-
-    // Clamp to valid bounds
-    let start = [
-        start[0].min(shape[0]),
-        start[1].min(shape[1]),
-        start[2].min(shape[2]),
-    ];
-    let end = [
-        end[0].min(shape[0]).max(start[0]),
-        end[1].min(shape[1]).max(start[1]),
-        end[2].min(shape[2]).max(start[2]),
-    ];
-
-    let crop_size = [end[0] - start[0], end[1] - start[1], end[2] - start[2]];
-
-    macro_rules! crop_array_ref {
-        ($arr:expr, $variant:ident) => {{
-            let view = $arr.slice(ndarray::s![
-                start[0]..end[0],
-                start[1]..end[1],
-                start[2]..end[2]
-            ]);
-            ArrayData::$variant(view.to_owned().into_dyn())
-        }};
+    for axis in 0..rank.max(dst.ndim().min(3)) {
+        src.slice_axis_inplace(
+            Axis(axis),
+            Slice::from(src_start[axis]..src_start[axis] + len[axis]),
+        );
+        dst.slice_axis_inplace(
+            Axis(axis),
+            Slice::from(dst_start[axis]..dst_start[axis] + len[axis]),
+        );
     }
-
-    let data = image.data_cow()?;
-    let new_data = match data.as_ref() {
-        ArrayData::U8(a) => crop_array_ref!(a, U8),
-        ArrayData::I8(a) => crop_array_ref!(a, I8),
-        ArrayData::I16(a) => crop_array_ref!(a, I16),
-        ArrayData::U16(a) => crop_array_ref!(a, U16),
-        ArrayData::I32(a) => crop_array_ref!(a, I32),
-        ArrayData::U32(a) => crop_array_ref!(a, U32),
-        ArrayData::I64(a) => crop_array_ref!(a, I64),
-        ArrayData::U64(a) => crop_array_ref!(a, U64),
-        ArrayData::F16(a) => crop_array_ref!(a, F16),
-        ArrayData::BF16(a) => crop_array_ref!(a, BF16),
-        ArrayData::F32(a) => crop_array_ref!(a, F32),
-        ArrayData::F64(a) => crop_array_ref!(a, F64),
-    };
-
-    // Update header dimensions
-    let mut header = image.header().clone();
-    header.ndim = 3;
-    header.dim = [1i64; 7];
-    header.dim[0] = crop_size[0] as i64;
-    header.dim[1] = crop_size[1] as i64;
-    header.dim[2] = crop_size[2] as i64;
-
-    // Update affine to reflect new origin
-    let affine = image.affine();
-    let mut new_affine = affine;
-
-    // Shift origin by start offset
-    new_affine[0][3] += affine[0][0] * start[0] as f32
-        + affine[0][1] * start[1] as f32
-        + affine[0][2] * start[2] as f32;
-    new_affine[1][3] += affine[1][0] * start[0] as f32
-        + affine[1][1] * start[1] as f32
-        + affine[1][2] * start[2] as f32;
-    new_affine[2][3] += affine[2][0] * start[0] as f32
-        + affine[2][1] * start[1] as f32
-        + affine[2][2] * start[2] as f32;
-
-    header.set_affine(new_affine);
-
-    Ok(NiftiImage::from_parts(header, new_data))
+    dst.assign(&src);
+    out
 }
 
-/// Flip the image along specified axes.
+/// Reverse the voxel order along the given spatial axes (0, 1, 2).
 ///
-/// # Arguments
-///
-/// * `image` - The input image
-/// * `axes` - Slice of axis indices to flip (0=depth, 1=height, 2=width)
-///
-/// # Errors
-///
-/// Returns an error if any axis index is out of bounds.
-#[must_use = "this function returns a new image and does not modify the original"]
+/// World-preserving: the affine is updated so the anatomy stays where it
+/// was (like MONAI's `Flip` on a `MetaTensor`). Duplicate axes flip once.
 pub fn flip(image: &NiftiImage, axes: &[usize]) -> Result<NiftiImage> {
-    let ndim = image.ndim();
-    for &axis in axes {
-        if axis >= ndim {
-            return Err(Error::InvalidDimensions(format!(
-                "Axis {} out of bounds for image with {} dimensions",
-                axis, ndim
-            )));
-        }
+    let selected = flip_axes(spatial_rank(image.shape()), axes)?;
+    if !selected.contains(&true) {
+        return Ok(image.clone());
     }
-
-    let header = image.header().clone();
-
-    // Flip using view - invert_axis just changes strides (O(1))
-    // Then copy to contiguous layout
-    macro_rules! flip_array_ref {
-        ($arr:expr, $variant:ident) => {{
-            let mut view = $arr.view();
-            for &axis in axes {
+    let (spatial, _) = split_shape(image.shape());
+    let change = flip_plan(spatial, selected);
+    let data = image.raw_data()?;
+    let data = map_array!(data.as_ref(), |a| {
+        let mut view = a.view();
+        for (axis, &s) in selected.iter().enumerate() {
+            if s {
                 view.invert_axis(Axis(axis));
             }
-            // Copy to contiguous layout - this is the actual data copy
-            ArrayData::$variant(view.to_owned())
-        }};
+        }
+        to_fortran(&view)
+    });
+    let mut header = image.header().clone();
+    header.transform_voxels(&change.map);
+    Ok(NiftiImage::from_parts(header, data))
+}
+
+/// Rotate by `k` × 90 degrees in the plane of two spatial axes.
+///
+/// Follows `numpy.rot90(a, k, axes)`: the rotation goes from the first axis
+/// towards the second. World-preserving: the affine is updated so the anatomy
+/// stays in place (anisotropic voxel sizes follow their axes).
+pub fn rotate_90(image: &NiftiImage, axes: (usize, usize), k: i32) -> Result<NiftiImage> {
+    let k = rotation_args(spatial_rank(image.shape()), axes, k)?;
+    if k == 0 {
+        return Ok(image.clone());
     }
-
-    // Use data_cow() to avoid cloning if data is already owned
-    let data = image.data_cow()?;
-    let new_data = match data.as_ref() {
-        ArrayData::U8(a) => flip_array_ref!(a, U8),
-        ArrayData::I8(a) => flip_array_ref!(a, I8),
-        ArrayData::I16(a) => flip_array_ref!(a, I16),
-        ArrayData::U16(a) => flip_array_ref!(a, U16),
-        ArrayData::I32(a) => flip_array_ref!(a, I32),
-        ArrayData::U32(a) => flip_array_ref!(a, U32),
-        ArrayData::I64(a) => flip_array_ref!(a, I64),
-        ArrayData::U64(a) => flip_array_ref!(a, U64),
-        ArrayData::F16(a) => flip_array_ref!(a, F16),
-        ArrayData::BF16(a) => flip_array_ref!(a, BF16),
-        ArrayData::F32(a) => flip_array_ref!(a, F32),
-        ArrayData::F64(a) => flip_array_ref!(a, F64),
-    };
-
-    Ok(NiftiImage::from_parts(header, new_data))
+    let (a, b) = axes;
+    let (spatial, _) = split_shape(image.shape());
+    let change = rotate_plan(spatial, axes, k);
+    let data = image.raw_data()?;
+    let data = map_array!(data.as_ref(), |arr| {
+        let mut view = arr.view();
+        match k {
+            1 => {
+                view.invert_axis(Axis(b));
+                view.swap_axes(a, b);
+            }
+            2 => {
+                view.invert_axis(Axis(a));
+                view.invert_axis(Axis(b));
+            }
+            _ => {
+                view.swap_axes(a, b);
+                view.invert_axis(Axis(b));
+            }
+        }
+        to_fortran(&view)
+    });
+    let mut header = image.header().clone();
+    header.transform_voxels(&change.map);
+    Ok(NiftiImage::from_parts(header, data))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{ArrayD, IxDyn, ShapeBuilder};
+    use crate::nifti::header::Affine;
+    use crate::nifti::DataType;
+    use ndarray::{s, ArrayD, IxDyn, ShapeBuilder};
 
-    fn create_test_image(data: Vec<f32>, shape: [usize; 3]) -> NiftiImage {
-        // Create F-order array to match NIfTI convention
-        let c_order = ArrayD::from_shape_vec(shape.to_vec(), data).unwrap();
-        let mut f_order = ArrayD::zeros(IxDyn(&shape).f());
-        f_order.assign(&c_order);
-        let affine = [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
+    fn affine() -> Affine {
+        [
+            [0.9, 0.1, 0.0, 10.0],
+            [-0.1, 1.9, 0.0, -20.0],
+            [0.0, 0.0, 3.0, 30.0],
             [0.0, 0.0, 0.0, 1.0],
-        ];
-        NiftiImage::from_array(f_order, affine)
+        ]
     }
 
-    #[test]
-    fn test_crop_or_pad_crop() {
-        // Create a 4x4x4 volume with known values
-        let data: Vec<f32> = (0..64).map(|i| i as f32).collect();
-        let img = create_test_image(data, [4, 4, 4]);
-
-        // Crop to 2x2x2 (centered)
-        let cropped = crop_or_pad(&img, &[2, 2, 2]).unwrap();
-        assert_eq!(cropped.shape(), &[2, 2, 2]);
-
-        // Verify we got the center region
-        let result = cropped.to_f32().unwrap();
-        assert_eq!(result.len(), 8);
+    fn image(shape: &[usize]) -> (ArrayD<i32>, NiftiImage) {
+        let n: usize = shape.iter().product();
+        let arr = ArrayD::from_shape_vec(IxDyn(shape).f(), (0..n as i32).collect()).unwrap();
+        (arr.clone(), NiftiImage::from_array(arr, affine()).unwrap())
     }
 
-    #[test]
-    fn test_crop_or_pad_pad() {
-        // Create a 2x2x2 volume
-        let data: Vec<f32> = (1..=8).map(|i| i as f32).collect();
-        let img = create_test_image(data, [2, 2, 2]);
-
-        // Pad to 4x4x4 (centered)
-        let padded = crop_or_pad(&img, &[4, 4, 4]).unwrap();
-        assert_eq!(padded.shape(), &[4, 4, 4]);
-
-        // The outer voxels should be 0 (padding)
-        let result = padded.to_f32().unwrap();
-        let slice = result.as_slice_memory_order().unwrap();
-
-        // With F-order, first element in memory is still [0,0,0]
-        assert!((slice[0] - 0.0).abs() < 1e-5);
+    fn world(a: &Affine, v: [f64; 3]) -> [f64; 3] {
+        crate::transforms::geometry::apply(a, v)
     }
 
-    #[test]
-    fn test_crop_or_pad_same_size() {
-        let data: Vec<f32> = (1..=8).map(|i| i as f32).collect();
-        let img = create_test_image(data, [2, 2, 2]);
-
-        // Same size - should be identity
-        let result = crop_or_pad(&img, &[2, 2, 2]).unwrap();
-        assert_eq!(result.shape(), &[2, 2, 2]);
-
-        let result_data = result.to_f32().unwrap();
-        let result_slice = result_data.as_slice_memory_order().unwrap();
-
-        // Compare against original in same memory order
-        let orig = img.to_f32().unwrap();
-        let orig_slice = orig.as_slice_memory_order().unwrap();
-
-        for i in 0..result_slice.len() {
-            assert!(
-                (result_slice[i] - orig_slice[i]).abs() < 1e-5,
-                "Value mismatch at index {}: expected {}, got {}",
-                i,
-                orig_slice[i],
-                result_slice[i]
-            );
+    /// Assert that each output voxel sits at the same world position as the
+    /// input voxel with the same value (values are unique voxel ids).
+    fn assert_world_preserving(before: &NiftiImage, after: &NiftiImage) {
+        let (a_in, a_out) = (before.affine(), after.affine());
+        let src = before.to_scaled::<i32>().unwrap();
+        let out = after.as_array::<i32>().unwrap();
+        for (idx, &v) in out.indexed_iter() {
+            let (old_idx, _) = src.indexed_iter().find(|&(_, &x)| x == v).unwrap();
+            let old = [old_idx[0] as f64, old_idx[1] as f64, old_idx[2] as f64];
+            let new = [idx[0] as f64, idx[1] as f64, idx[2] as f64];
+            let (p, q) = (world(&a_in, old), world(&a_out, new));
+            for r in 0..3 {
+                assert!((p[r] - q[r]).abs() < 1e-9, "voxel {v}: {p:?} vs {q:?}");
+            }
         }
     }
 
     #[test]
-    fn test_crop_or_pad_mixed() {
-        // Test with different crop/pad per dimension
-        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
-        let img = create_test_image(data, [2, 3, 4]);
-
-        // 2x3x4 -> 4x2x4 (pad depth, crop height, same width)
-        let result = crop_or_pad(&img, &[4, 2, 4]).unwrap();
-        assert_eq!(result.shape(), &[4, 2, 4]);
+    fn crop_matches_slicing_and_world() {
+        let (arr, img) = image(&[6, 7, 8]);
+        let c = crop(&img, [1, 2, 3], [3, 4, 2]).unwrap();
+        assert_eq!(
+            c.as_array::<i32>().unwrap(),
+            &arr.slice(s![1..4, 2..6, 3..5]).to_owned().into_dyn()
+        );
+        assert_world_preserving(&img, &c);
+        assert!(crop(&img, [5, 0, 0], [2, 1, 1]).is_err());
+        assert!(crop(&img, [usize::MAX, 0, 0], [2, 1, 1]).is_err());
     }
 
     #[test]
-    fn test_crop_or_pad_dimension_mismatch() {
-        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
-        let img = create_test_image(data, [2, 2, 2]);
-
-        // Wrong number of dimensions
-        let result = crop_or_pad(&img, &[2, 2]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_flip_single_axis() {
-        // Create a 2x2x2 volume with distinct values
-        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        // Flip along axis 0 (depth)
-        let flipped = flip(&img, &[0]).unwrap();
-        let result = flipped.to_f32().unwrap();
-
-        // After flipping axis 0:
-        // Original: [[[1,2],[3,4]], [[5,6],[7,8]]]
-        // Flipped:  [[[5,6],[7,8]], [[1,2],[3,4]]]
-        // Check using indexing
-        assert!((result[[0, 0, 0]] - 5.0).abs() < 1e-5);
-        assert!((result[[1, 0, 0]] - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_flip_multiple_axes() {
-        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        // Flip along axes 0 and 2
-        let flipped = flip(&img, &[0, 2]).unwrap();
-        assert_eq!(flipped.shape(), &[2, 2, 2]);
-    }
-
-    #[test]
-    fn test_flip_all_axes() {
-        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        // Flip along all axes
-        let flipped = flip(&img, &[0, 1, 2]).unwrap();
-        let result = flipped.to_f32().unwrap();
-
-        // Flipping all axes reverses the data
-        // [0,0,0] should have what was at [1,1,1]
-        assert!((result[[0, 0, 0]] - 8.0).abs() < 1e-5);
-        // [1,1,1] should have what was at [0,0,0]
-        assert!((result[[1, 1, 1]] - 1.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_flip_empty_axes() {
-        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        // No flip - should be identity
-        let flipped = flip(&img, &[]).unwrap();
-        let result = flipped.to_f32().unwrap();
-
-        // Check all positions match original
-        assert!((result[[0, 0, 0]] - 1.0).abs() < 1e-5);
-        assert!((result[[0, 0, 1]] - 2.0).abs() < 1e-5);
-        assert!((result[[1, 1, 1]] - 8.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_flip_out_of_bounds() {
-        let data = vec![1.0; 8];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        // Axis 3 is out of bounds for 3D image
-        let result = flip(&img, &[3]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_crop_or_pad_rejects_zero_dimension() {
-        let data: Vec<f32> = (0..8).map(|i| i as f32).collect();
-        let img = create_test_image(data, [2, 2, 2]);
-
-        // Zero dimension should be rejected
-        let result = crop_or_pad(&img, &[0, 2, 2]);
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert!(e.to_string().contains("cannot be 0"));
+    fn flip_is_world_preserving_and_involutive() {
+        let (_, img) = image(&[4, 5, 6]);
+        for axes in [vec![0], vec![1, 2], vec![0, 1, 2], vec![2, 2]] {
+            let f = flip(&img, &axes).unwrap();
+            assert_world_preserving(&img, &f);
+            let back = flip(&f, &axes).unwrap();
+            assert_eq!(back.as_array::<i32>(), img.as_array::<i32>());
         }
+        assert!(flip(&img, &[3]).is_err());
     }
 
     #[test]
-    fn test_flip_preserves_shape() {
-        let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
-        let img = create_test_image(data, [2, 3, 4]);
-
-        let flipped = flip(&img, &[1]).unwrap();
-        assert_eq!(flipped.shape(), &[2, 3, 4]);
+    fn rotate_matches_numpy_rot90_and_world() {
+        let (arr, img) = image(&[3, 4, 2]);
+        let r = rotate_90(&img, (0, 1), 1).unwrap();
+        assert_eq!(r.shape(), &[4, 3, 2]);
+        // numpy.rot90(a, 1, (0, 1))[i, j] == a[j, n1 - 1 - i]
+        let out = r.as_array::<i32>().unwrap();
+        for i in 0..4 {
+            for j in 0..3 {
+                assert_eq!(out[[i, j, 1]], arr[[j, 3 - i, 1]]);
+            }
+        }
+        for k in [-1, 1, 2, 3, 5] {
+            let r = rotate_90(&img, (2, 0), k).unwrap();
+            assert_world_preserving(&img, &r);
+        }
+        let four = rotate_90(&rotate_90(&img, (0, 1), 3).unwrap(), (0, 1), 1).unwrap();
+        assert_eq!(four.as_array::<i32>(), img.as_array::<i32>());
+        assert!(rotate_90(&img, (0, 0), 1).is_err());
     }
 
     #[test]
-    fn test_flip_double_flip_identity() {
-        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let img = create_test_image(data, [2, 2, 2]);
+    fn crop_or_pad_centres_and_pads_in_scaled_units() {
+        let (_, img) = image(&[4, 5, 6]);
+        let p = crop_or_pad(&img, [6, 3, 6], -7.0).unwrap();
+        assert_eq!(p.shape(), &[6, 3, 6]);
+        assert_eq!(p.dtype(), DataType::Int32);
+        assert_eq!(p.as_array::<i32>().unwrap()[[0, 0, 0]], -7);
+        assert_world_preserving(&img, &crop(&p, [1, 0, 0], [4, 3, 6]).unwrap());
 
-        // Flip twice along same axis should be identity
-        let flipped1 = flip(&img, &[0]).unwrap();
-        let flipped2 = flip(&flipped1, &[0]).unwrap();
+        // u8 cannot store -1: converted to f32.
+        let u = img.with_dtype(DataType::UInt8).unwrap();
+        let p = crop_or_pad(&u, [6, 5, 6], -1.0).unwrap();
+        assert_eq!(p.dtype(), DataType::Float32);
+        assert_eq!(p.to_f32().unwrap()[[0, 0, 0]], -1.0);
 
-        let result = flipped2.to_f32().unwrap();
+        // Scaled int16: pad value 0 in physical units is raw 1024.
+        let mut ct = img.with_dtype(DataType::Int16).unwrap();
+        ct.header_mut().scl_inter = -1024.0;
+        let p = crop_or_pad(&ct, [5, 5, 6], 0.0).unwrap();
+        assert_eq!(p.dtype(), DataType::Int16);
+        assert_eq!(p.to_f32().unwrap()[[4, 0, 0]], 0.0);
+    }
 
-        // Double flip should be identity - check key positions
-        assert!(
-            (result[[0, 0, 0]] - 1.0).abs() < 1e-5,
-            "Double flip should be identity at [0,0,0]: expected 1.0, got {}",
-            result[[0, 0, 0]]
+    #[test]
+    fn four_d_and_two_d_images() {
+        let (arr, img) = image(&[4, 5, 3, 2]);
+        let c = crop(&img, [1, 1, 0], [2, 3, 3]).unwrap();
+        assert_eq!(c.shape(), &[2, 3, 3, 2]);
+        assert_eq!(
+            c.as_array::<i32>().unwrap(),
+            &arr.slice(s![1..3, 1..4, .., ..]).to_owned().into_dyn()
         );
-        assert!(
-            (result[[0, 0, 1]] - 2.0).abs() < 1e-5,
-            "Double flip should be identity at [0,0,1]: expected 2.0, got {}",
-            result[[0, 0, 1]]
-        );
-        assert!(
-            (result[[1, 1, 1]] - 8.0).abs() < 1e-5,
-            "Double flip should be identity at [1,1,1]: expected 8.0, got {}",
-            result[[1, 1, 1]]
-        );
+        let f = flip(&img, &[0]).unwrap();
+        assert_eq!(f.shape(), img.shape());
+        let (_, flat) = image(&[4, 5]);
+        let r = rotate_90(&flat, (0, 1), 1).unwrap();
+        assert_eq!(r.shape(), &[5, 4]);
+        let p = crop_or_pad(&flat, [2, 2, 3], 0.0).unwrap();
+        assert_eq!(p.shape(), &[2, 2, 3]);
     }
 }
