@@ -14,7 +14,7 @@ please include the output of `medrs info` for it.
 | `tests/*.rs` | Rust integration and property tests (unit tests live next to the code) |
 | `tests/python/` | Python tests, mostly checked against nibabel |
 | `benches/` | Criterion benchmarks |
-| `benchmarks/compare.py` | Cross-library comparison used for the README table |
+| `benchmarks/` | `compare.py` (the README comparison) and `jvol_chunks.py` (the guide's chunk-shape table) |
 | `examples/` | Small runnable examples (run in CI) |
 
 ## Setup

@@ -31,7 +31,11 @@ def make_dataset(root: Path, count: int = 6) -> tuple[list[Path], list[Path]]:
 
 
 def main() -> None:
-    images, labels = make_dataset(Path(tempfile.mkdtemp()))
+    with tempfile.TemporaryDirectory() as tmp:
+        run(*make_dataset(Path(tmp)))
+
+
+def run(images: list[Path], labels: list[Path]) -> None:
     pipeline = (
         medrs.Pipeline()
         .z_normalize()

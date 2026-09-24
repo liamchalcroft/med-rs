@@ -241,6 +241,26 @@ LoadImaged(keys=["image", "label"], reader=MedrsReader())
 - **Threads.** medrs uses one thread per CPU by default;
   `medrs.set_num_threads(n)` changes it for the whole process.
 
+### Choosing a `.jvol` chunk shape
+
+A crop decodes every chunk it overlaps, so for random crops smaller chunks
+waste less work. The table shows the MPRAGE test image (197×233×189,
+float32), saved with each chunk shape and read with one thread (roughly the
+cost per loader worker). Times are medians over random positions, from
+`python benchmarks/jvol_chunks.py`:
+
+| Chunk | Lossless size | 64³ crop | 128³ crop | Lossy (60) size | 64³ crop | 128³ crop |
+|---|---:|---:|---:|---:|---:|---:|
+| 32³ | 12.2 MB | 6.7 ms | 34 ms | 1.3 MB | 29 ms | 142 ms |
+| 48³ | 13.5 MB | 6.1 ms | 34 ms | 1.2 MB | 32 ms | 138 ms |
+| 64³ (default) | 13.3 MB | 10.0 ms | 50 ms | 1.2 MB | 67 ms | 242 ms |
+| 128³ | 13.4 MB | 18.8 ms | 63 ms | 1.2 MB | 108 ms | 302 ms |
+
+For random crops up to 128³, 32³ or 48³ chunks read crops 1.5–2 times faster
+than the default, for at most a few percent more space, with the same
+compression error. Full loads take about the same time with any of these
+shapes. Run the script on one of your own images to check.
+
 ## Errors
 
 | Exception | When |
