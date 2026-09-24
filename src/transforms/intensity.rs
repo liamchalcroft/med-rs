@@ -1,618 +1,367 @@
+//! Intensity transforms.
+//!
+//! Intensity transforms work on scaled values (`scl_slope`/`scl_inter`
+//! applied) and return `f32` images with identity scaling. Statistics are
+//! accumulated in double precision.
+//!
+//! Chains of linear maps and clamps are represented in closed form by
+//! [`PointMap`], which lets the pipeline apply any sequence of them in a
+//! single pass over the data.
+
+use super::stats::{min_max, moments};
 use crate::error::{Error, Result};
-use crate::nifti::image::ArrayData;
-use crate::nifti::{DataType, NiftiImage};
-use crate::pipeline::simd_kernels::{parallel_linear_transform_f32, parallel_sum_and_sum_sq_f32};
-use ndarray::{ArrayD, IxDyn, ShapeBuilder};
+use crate::nifti::element::{fortran_from_vec, ArrayData};
+use crate::nifti::NiftiImage;
 use rayon::prelude::*;
 
-const NORMALIZE_CHUNK_SIZE: usize = 4096;
+const CHUNK: usize = 1 << 16;
 
-/// Normalize image intensity to zero mean and unit variance.
-///
-/// Formula: output = (input - mean) / std
-///
-/// # Errors
-///
-/// Returns an error if the underlying array is not contiguous in memory or
-/// if the image data cannot be materialized.
-#[must_use = "this function returns a Result and does not modify the original"]
-pub fn z_normalization(image: &NiftiImage) -> Result<NiftiImage> {
-    let mut header = image.header().clone();
+/// `y = clamp(scale · x + offset, lo, hi)`, the closed form of any chain of
+/// linear maps and clamps. NaN inputs stay NaN.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PointMap {
+    scale: f64,
+    offset: f64,
+    lo: f64,
+    hi: f64,
+}
 
-    // Use data_cow() to avoid cloning if already owned
-    let data = image.data_cow()?;
+impl PointMap {
+    pub const IDENTITY: Self = Self {
+        scale: 1.0,
+        offset: 0.0,
+        lo: f64::NEG_INFINITY,
+        hi: f64::INFINITY,
+    };
 
-    // Fast path for f32 (most common case) - SIMD + parallel
-    if let ArrayData::F32(a) = data.as_ref() {
-        let slice = a.as_slice_memory_order().ok_or_else(|| {
-            Error::NonContiguousArray("Array must be contiguous for z-normalization".to_string())
-        })?;
-        let len = slice.len();
-
-        // Pass one: mean (reuses the SIMD sum kernel).
-        let (sum, _, _) = parallel_sum_and_sum_sq_f32(slice);
-        let mean = sum / len as f64;
-
-        // Pass two: sum of squared deviations about the mean, which avoids the
-        // catastrophic cancellation of the E[x^2] - E[x]^2 form.
-        let sum_sq_dev: f64 = slice
-            .par_chunks(NORMALIZE_CHUNK_SIZE)
-            .map(|chunk| {
-                chunk
-                    .iter()
-                    .map(|&v| {
-                        let d = v as f64 - mean;
-                        d * d
-                    })
-                    .sum::<f64>()
-            })
-            .sum();
-        let variance = sum_sq_dev / len as f64;
-
-        if !mean.is_finite() || !variance.is_finite() {
-            return Err(Error::Configuration(
-                "z-normalization statistics are not finite (input contains NaN or infinity)"
-                    .to_string(),
-            ));
+    pub fn linear(scale: f64, offset: f64) -> Self {
+        Self {
+            scale,
+            offset,
+            ..Self::IDENTITY
         }
+    }
 
-        let mean = mean as f32;
-        let inv_std = if variance <= 0.0 {
-            1.0f32
+    /// Clamp to `[lo, hi]`; callers ensure `lo <= hi` and neither is NaN.
+    pub fn clamp(lo: f64, hi: f64) -> Self {
+        Self {
+            lo,
+            hi,
+            ..Self::IDENTITY
+        }
+    }
+
+    const fn constant(value: f64) -> Self {
+        Self {
+            scale: 0.0,
+            offset: value,
+            lo: f64::NEG_INFINITY,
+            hi: f64::INFINITY,
+        }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        *self == Self::IDENTITY
+    }
+
+    pub fn has_clamp(&self) -> bool {
+        self.lo > f64::NEG_INFINITY || self.hi < f64::INFINITY
+    }
+
+    /// `next ∘ self`: apply `self`, then `next`.
+    pub fn then(&self, next: &Self) -> Self {
+        // next(clamp(u, lo, hi)) with u = scale·x + offset.
+        let s = next.scale;
+        let (lo, hi) = if s > 0.0 {
+            (s * self.lo + next.offset, s * self.hi + next.offset)
+        } else if s < 0.0 {
+            (s * self.hi + next.offset, s * self.lo + next.offset)
         } else {
-            1.0 / (variance.sqrt() as f32)
+            return Self::constant(next.offset.clamp(next.lo, next.hi));
         };
-
-        // output = (input - mean) * inv_std = input * inv_std - mean * inv_std
-        let mut output = vec![0.0f32; len];
-        let offset = -mean * inv_std;
-        parallel_linear_transform_f32(slice, &mut output, inv_std, offset);
-
-        // Return result in F-order to match NIfTI convention
-        let shape = a.shape();
-        let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
-            Error::MemoryAllocation(format!("Failed to create output array: {}", e))
-        })?;
-        header.datatype = DataType::Float32;
-        header.scl_slope = 1.0;
-        header.scl_inter = 0.0;
-        return Ok(NiftiImage::from_parts(header, ArrayData::F32(out_array)));
-    }
-
-    macro_rules! normalize {
-        ($array:expr, $to_f64:expr, $from_f32:expr) => {{
-            let slice = $array.as_slice_memory_order().ok_or_else(|| {
-                Error::NonContiguousArray(
-                    "Array must be contiguous for z-normalization".to_string(),
-                )
-            })?;
-            let len = slice.len();
-
-            // Pass one: mean.
-            let sum: f64 = slice
-                .par_chunks(NORMALIZE_CHUNK_SIZE)
-                .map(|chunk| chunk.iter().map(|&v| $to_f64(v)).sum::<f64>())
-                .sum();
-            let mean = sum / len as f64;
-
-            // Pass two: sum of squared deviations (numerically stable).
-            let sum_sq_dev: f64 = slice
-                .par_chunks(NORMALIZE_CHUNK_SIZE)
-                .map(|chunk| {
-                    chunk
-                        .iter()
-                        .map(|&v| {
-                            let d = $to_f64(v) - mean;
-                            d * d
-                        })
-                        .sum::<f64>()
-                })
-                .sum();
-            let variance = sum_sq_dev / len as f64;
-
-            if !mean.is_finite() || !variance.is_finite() {
-                return Err(Error::Configuration(
-                    "z-normalization statistics are not finite (input contains NaN or infinity)"
-                        .to_string(),
-                ));
-            }
-
-            let inv_std = if variance <= 0.0 {
-                1.0
-            } else {
-                1.0 / variance.sqrt()
-            };
-
-            let mut output = vec![0.0f32; len];
-            output
-                .par_chunks_mut(NORMALIZE_CHUNK_SIZE)
-                .zip(slice.par_chunks(NORMALIZE_CHUNK_SIZE))
-                .for_each(|(out_chunk, in_chunk)| {
-                    for (out, &v) in out_chunk.iter_mut().zip(in_chunk.iter()) {
-                        let val = $to_f64(v);
-                        *out = $from_f32((val - mean) * inv_std);
-                    }
-                });
-
-            let shape = $array.shape();
-            let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
-                Error::MemoryAllocation(format!("Failed to create output array: {}", e))
-            })?;
-            header.datatype = DataType::Float32;
-            ArrayData::F32(out_array)
-        }};
-    }
-
-    let new_data = match data.as_ref() {
-        ArrayData::U8(a) => normalize!(a, |v: u8| v as f64, |v: f64| v as f32),
-        ArrayData::I8(a) => normalize!(a, |v: i8| v as f64, |v: f64| v as f32),
-        ArrayData::I16(a) => normalize!(a, |v: i16| v as f64, |v: f64| v as f32),
-        ArrayData::U16(a) => normalize!(a, |v: u16| v as f64, |v: f64| v as f32),
-        ArrayData::I32(a) => normalize!(a, |v: i32| v as f64, |v: f64| v as f32),
-        ArrayData::U32(a) => normalize!(a, |v: u32| v as f64, |v: f64| v as f32),
-        ArrayData::I64(a) => normalize!(a, |v: i64| v as f64, |v: f64| v as f32),
-        ArrayData::U64(a) => normalize!(a, |v: u64| v as f64, |v: f64| v as f32),
-        ArrayData::F16(a) => normalize!(a, |v: half::f16| v.to_f64(), |v: f64| v as f32),
-        ArrayData::BF16(a) => normalize!(a, |v: half::bf16| v.to_f64(), |v: f64| v as f32),
-        ArrayData::F32(_) => unreachable!(), // Handled above
-        ArrayData::F64(a) => {
-            let slice = a.as_slice_memory_order().ok_or_else(|| {
-                Error::NonContiguousArray(
-                    "Array must be contiguous for z-normalization".to_string(),
-                )
-            })?;
-            let len = slice.len();
-
-            // Pass one: mean.
-            let sum: f64 = slice.par_iter().sum();
-            let mean = sum / len as f64;
-
-            // Pass two: sum of squared deviations (numerically stable).
-            let sum_sq_dev: f64 = slice
-                .par_iter()
-                .map(|&v| {
-                    let d = v - mean;
-                    d * d
-                })
-                .sum();
-            let variance = sum_sq_dev / len as f64;
-
-            if !mean.is_finite() || !variance.is_finite() {
-                return Err(Error::Configuration(
-                    "z-normalization statistics are not finite (input contains NaN or infinity)"
-                        .to_string(),
-                ));
-            }
-
-            let inv_std = if variance <= 0.0 {
-                1.0
-            } else {
-                1.0 / variance.sqrt()
-            };
-
-            let mut output = vec![0.0f64; len];
-            output
-                .par_iter_mut()
-                .zip(slice.par_iter())
-                .for_each(|(out, &v)| {
-                    *out = (v - mean) * inv_std;
-                });
-
-            // F-order to match NIfTI convention
-            let shape = a.shape();
-            let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
-                Error::MemoryAllocation(format!("Failed to create output array: {}", e))
-            })?;
-            header.datatype = DataType::Float64;
-            ArrayData::F64(out_array)
+        let (lo, hi) = (lo.max(next.lo), hi.min(next.hi));
+        if lo > hi {
+            // The two clamp ranges do not overlap: every value lands on the
+            // edge of `next`'s range that faces the previous range.
+            let value = if hi == next.hi { next.hi } else { next.lo };
+            return Self::constant(value);
         }
-    };
+        Self {
+            scale: s * self.scale,
+            offset: s * self.offset + next.offset,
+            lo,
+            hi,
+        }
+    }
 
-    header.scl_slope = 1.0;
-    header.scl_inter = 0.0;
-
-    Ok(NiftiImage::from_parts(header, new_data))
+    /// The map as an `f32` function.
+    pub fn kernel(&self) -> impl Fn(f32) -> f32 + Copy + Send + Sync {
+        let (s, o) = (self.scale as f32, self.offset as f32);
+        let (lo, hi) = (self.lo as f32, self.hi as f32);
+        let clamp = self.has_clamp();
+        move |x: f32| {
+            let y = x * s + o;
+            if clamp {
+                y.clamp(lo, hi)
+            } else {
+                y
+            }
+        }
+    }
 }
 
-/// Rescale image intensity to a specific range.
-///
-/// Formula: output = (input - min) / (max - min) * (out_max - out_min) + out_min
-///
-/// # Errors
-///
-/// Returns an error if the underlying array is not contiguous in memory or
-/// if the image data cannot be materialized.
-#[must_use = "this function returns a Result and does not modify the original"]
-pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Result<NiftiImage> {
-    use crate::pipeline::simd_kernels::parallel_minmax_f32;
-
-    let mut header = image.header().clone();
-
-    // Use data_cow() to avoid cloning if already owned
-    let data = image.data_cow()?;
-
-    // Fast path for f32 - SIMD + parallel
-    if let ArrayData::F32(a) = data.as_ref() {
-        let slice = a.as_slice_memory_order().ok_or_else(|| {
-            Error::NonContiguousArray("Array must be contiguous for rescale".to_string())
-        })?;
-
-        // SIMD-accelerated min/max
-        let (min, max) = parallel_minmax_f32(slice);
-
-        // Precompute scale and offset: out = (v - min) * scale + out_min = v * scale + offset
-        let range = if max - min == 0.0 { 1.0 } else { max - min };
-        let scale = ((out_max - out_min) / range as f64) as f32;
-        let offset = out_min as f32 - min * scale;
-
-        let mut output = vec![0.0f32; slice.len()];
-        parallel_linear_transform_f32(slice, &mut output, scale, offset);
-
-        // F-order to match NIfTI convention
-        let shape = a.shape();
-        let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
-            Error::MemoryAllocation(format!("Failed to create output array: {}", e))
-        })?;
-        header.datatype = DataType::Float32;
-        header.scl_slope = 1.0;
-        header.scl_inter = 0.0;
-        return Ok(NiftiImage::from_parts(header, ArrayData::F32(out_array)));
-    }
-
-    // Generic path for other types
-    macro_rules! rescale {
-        ($array:expr, $to_f64:expr) => {{
-            let slice = $array.as_slice_memory_order().ok_or_else(|| {
-                Error::NonContiguousArray("Array must be contiguous for rescale".to_string())
-            })?;
-            let len = slice.len();
-
-            let (min, max) = slice
-                .par_iter()
-                .map(|&v| {
-                    let val = $to_f64(v);
-                    (val, val)
-                })
-                .reduce(
-                    || (f64::INFINITY, f64::NEG_INFINITY),
-                    |a, b| (a.0.min(b.0), a.1.max(b.1)),
-                );
-
-            // Precompute scale and offset
-            let range = if max - min == 0.0 { 1.0 } else { max - min };
-            let scale = ((out_max - out_min) / range) as f32;
-            let offset = (out_min - min * (out_max - out_min) / range) as f32;
-
-            let mut output = vec![0.0f32; len];
-            output
-                .par_iter_mut()
-                .zip(slice.par_iter())
-                .for_each(|(out, &v)| {
-                    let val = $to_f64(v) as f32;
-                    *out = val * scale + offset;
-                });
-
-            // F-order to match NIfTI convention
-            let shape = $array.shape();
-            let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
-                Error::MemoryAllocation(format!("Failed to create output array: {}", e))
-            })?;
-            header.datatype = DataType::Float32;
-            ArrayData::F32(out_array)
-        }};
-    }
-
-    let new_data = match data.as_ref() {
-        ArrayData::U8(a) => rescale!(a, |v: u8| v as f64),
-        ArrayData::I8(a) => rescale!(a, |v: i8| v as f64),
-        ArrayData::I16(a) => rescale!(a, |v: i16| v as f64),
-        ArrayData::U16(a) => rescale!(a, |v: u16| v as f64),
-        ArrayData::I32(a) => rescale!(a, |v: i32| v as f64),
-        ArrayData::U32(a) => rescale!(a, |v: u32| v as f64),
-        ArrayData::I64(a) => rescale!(a, |v: i64| v as f64),
-        ArrayData::U64(a) => rescale!(a, |v: u64| v as f64),
-        ArrayData::F16(a) => rescale!(a, |v: half::f16| v.to_f64()),
-        ArrayData::BF16(a) => rescale!(a, |v: half::bf16| v.to_f64()),
-        ArrayData::F32(_) => unreachable!(), // Handled above
-        ArrayData::F64(a) => {
-            let slice = a.as_slice_memory_order().ok_or_else(|| {
-                Error::NonContiguousArray("Array must be contiguous for rescale".to_string())
-            })?;
-            let len = slice.len();
-
-            let (min, max) = slice.par_iter().map(|&v| (v, v)).reduce(
-                || (f64::INFINITY, f64::NEG_INFINITY),
-                |a, b| (a.0.min(b.0), a.1.max(b.1)),
-            );
-
-            let range = if max - min == 0.0 { 1.0 } else { max - min };
-            let scale = (out_max - out_min) / range;
-            let offset = out_min - min * scale;
-
-            let mut output = vec![0.0f64; len];
-            output
-                .par_iter_mut()
-                .zip(slice.par_iter())
-                .for_each(|(out, &v)| {
-                    *out = v * scale + offset;
-                });
-
-            // F-order to match NIfTI convention
-            let shape = a.shape();
-            let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
-                Error::MemoryAllocation(format!("Failed to create output array: {}", e))
-            })?;
-            header.datatype = DataType::Float64;
-            ArrayData::F64(out_array)
-        }
-    };
-
-    header.scl_slope = 1.0;
-    header.scl_inter = 0.0;
-
-    Ok(NiftiImage::from_parts(header, new_data))
+/// Apply `f` to every scaled value, producing an `f32` image.
+pub(crate) fn map_values<F>(image: &NiftiImage, f: F) -> Result<NiftiImage>
+where
+    F: Fn(f32) -> f32 + Sync + Send,
+{
+    let src = image.f32_values()?;
+    let mut out = vec![0f32; src.len()];
+    crate::parallel::install(|| {
+        out.par_chunks_mut(CHUNK)
+            .zip(src.par_chunks(CHUNK))
+            .for_each(|(o, s)| {
+                for (d, &v) in o.iter_mut().zip(s) {
+                    *d = f(v);
+                }
+            });
+    });
+    Ok(image.with_array_data(ArrayData::F32(fortran_from_vec(image.shape(), out)), true))
 }
 
-/// Clamp image intensity to a specific range.
-///
-/// For non-float storage types the bounds are cast to the storage type with
-/// saturating float-to-int conversion (Rust `as` semantics).
-///
-/// # Errors
-///
-/// Returns `Error::Configuration` if `min > max` or either bound is NaN.
-/// Returns an error if the underlying array is not contiguous in memory or
-/// if the image data cannot be materialized.
-#[must_use = "this function returns a Result and does not modify the original"]
-pub fn clamp(image: &NiftiImage, min: f64, max: f64) -> Result<NiftiImage> {
-    use crate::pipeline::simd_kernels::parallel_linear_transform_clamp_f32;
+/// Apply a [`PointMap`], producing an `f32` image.
+pub(crate) fn apply_map(image: &NiftiImage, map: &PointMap) -> Result<NiftiImage> {
+    map_values(image, map.kernel())
+}
 
-    if min.is_nan() || max.is_nan() || min > max {
-        return Err(Error::Configuration(format!(
-            "clamp requires min <= max, got min = {}, max = {}",
-            min, max
+/// The map that z-normalizes `map(values)`.
+pub(crate) fn z_normalize_map(values: &[f32], map: &PointMap) -> Result<PointMap> {
+    let f = map.kernel();
+    let m = moments(values, |v| Some(f(v)));
+    let std = m.std();
+    if !(m.mean.is_finite() && std.is_finite()) {
+        return Err(Error::InvalidData(
+            "cannot z-normalize: the image contains NaN or infinite values".into(),
+        ));
+    }
+    let inv = if std > 0.0 { 1.0 / std } else { 1.0 };
+    Ok(map.then(&PointMap::linear(inv, -m.mean * inv)))
+}
+
+/// The map that rescales `map(values)` from its range to `[out_min, out_max]`.
+pub(crate) fn rescale_map(
+    values: &[f32],
+    map: &PointMap,
+    out_min: f64,
+    out_max: f64,
+) -> Result<PointMap> {
+    check_range("rescale", out_min, out_max)?;
+    let f = map.kernel();
+    let Some((lo, hi)) = min_max(values, f) else {
+        // Every value is NaN: nothing to rescale.
+        return Ok(*map);
+    };
+    let (lo, hi) = (f64::from(lo), f64::from(hi));
+    let scale = if hi > lo {
+        (out_max - out_min) / (hi - lo)
+    } else {
+        0.0
+    };
+    Ok(map.then(&PointMap::linear(scale, out_min - lo * scale)))
+}
+
+pub(crate) fn check_range(what: &str, lo: f64, hi: f64) -> Result<()> {
+    if lo.is_nan() || hi.is_nan() || lo > hi || lo == f64::INFINITY || hi == f64::NEG_INFINITY {
+        return Err(Error::InvalidArgument(format!(
+            "{what} requires min <= max, got [{lo}, {hi}]"
         )));
     }
+    Ok(())
+}
 
-    let header = image.header().clone();
+/// Normalize to zero mean and unit (population) standard deviation.
+///
+/// A constant image becomes all zeros. Returns an error if the image contains
+/// NaN or infinity.
+pub fn z_normalization(image: &NiftiImage) -> Result<NiftiImage> {
+    let values = image.f32_values()?;
+    let map = z_normalize_map(&values, &PointMap::IDENTITY)?;
+    apply_map(image, &map)
+}
 
-    // Use data_cow() to avoid cloning if already owned
-    let data = image.data_cow()?;
-
-    // Fast path for f32 - SIMD + parallel
-    if let ArrayData::F32(a) = data.as_ref() {
-        let slice = a.as_slice_memory_order().ok_or_else(|| {
-            Error::NonContiguousArray("Array must be contiguous for clamp".to_string())
-        })?;
-        let (min_f, max_f) = (min as f32, max as f32);
-
-        let mut output = vec![0.0f32; slice.len()];
-        parallel_linear_transform_clamp_f32(slice, &mut output, 1.0, 0.0, min_f, max_f);
-
-        // F-order to match NIfTI convention
-        let shape = a.shape();
-        let out_array = ArrayD::from_shape_vec(IxDyn(shape).f(), output).map_err(|e| {
-            Error::MemoryAllocation(format!("Failed to create output array: {}", e))
-        })?;
-        return Ok(NiftiImage::from_parts(header, ArrayData::F32(out_array)));
+/// Like [`z_normalization`], but statistics use only non-zero voxels and zero
+/// voxels stay zero (MONAI's `NormalizeIntensity(nonzero=True)`), the usual
+/// choice for skull-stripped images.
+pub fn z_normalization_nonzero(image: &NiftiImage) -> Result<NiftiImage> {
+    let values = image.f32_values()?;
+    let m = moments(&values, |v| (v != 0.0).then_some(v));
+    if m.n == 0.0 {
+        return map_values(image, |v| v);
     }
+    let std = m.std();
+    if !(m.mean.is_finite() && std.is_finite()) {
+        return Err(Error::InvalidData(
+            "cannot z-normalize: the image contains NaN or infinite values".into(),
+        ));
+    }
+    let inv = if std > 0.0 { 1.0 / std } else { 1.0 };
+    let (mean, inv) = (m.mean as f32, inv as f32);
+    map_values(
+        image,
+        move |v| if v == 0.0 { 0.0 } else { (v - mean) * inv },
+    )
+}
 
-    // Generic path - use mapv for simplicity (less common types)
-    let new_data = match data.into_owned() {
-        ArrayData::U8(a) => {
-            let (min, max) = (min as u8, max as u8);
-            ArrayData::U8(a.mapv(|v| v.clamp(min, max)))
-        }
-        ArrayData::I8(a) => {
-            let (min, max) = (min as i8, max as i8);
-            ArrayData::I8(a.mapv(|v| v.clamp(min, max)))
-        }
-        ArrayData::I16(a) => {
-            let (min, max) = (min as i16, max as i16);
-            ArrayData::I16(a.mapv(|v| v.clamp(min, max)))
-        }
-        ArrayData::U16(a) => {
-            let (min, max) = (min as u16, max as u16);
-            ArrayData::U16(a.mapv(|v| v.clamp(min, max)))
-        }
-        ArrayData::I32(a) => {
-            let (min, max) = (min as i32, max as i32);
-            ArrayData::I32(a.mapv(|v| v.clamp(min, max)))
-        }
-        ArrayData::U32(a) => {
-            let (min, max) = (min as u32, max as u32);
-            ArrayData::U32(a.mapv(|v| v.clamp(min, max)))
-        }
-        ArrayData::I64(a) => {
-            let (min, max) = (min as i64, max as i64);
-            ArrayData::I64(a.mapv(|v| v.clamp(min, max)))
-        }
-        ArrayData::U64(a) => {
-            let (min, max) = (min as u64, max as u64);
-            ArrayData::U64(a.mapv(|v| v.clamp(min, max)))
-        }
-        ArrayData::F16(a) => {
-            let (min, max) = (half::f16::from_f64(min), half::f16::from_f64(max));
-            ArrayData::F16(a.mapv(|v| v.clamp(min, max)))
-        }
-        ArrayData::BF16(a) => {
-            let (min, max) = (half::bf16::from_f64(min), half::bf16::from_f64(max));
-            ArrayData::BF16(a.mapv(|v| v.clamp(min, max)))
-        }
-        ArrayData::F32(_) => unreachable!(), // Handled above
-        ArrayData::F64(a) => ArrayData::F64(a.mapv(|v| v.clamp(min, max))),
+/// Linearly map the data range `[min, max]` onto `[out_min, out_max]`.
+///
+/// NaN values are ignored when finding the range and stay NaN. A constant
+/// image maps to `out_min`.
+pub fn rescale_intensity(image: &NiftiImage, out_min: f64, out_max: f64) -> Result<NiftiImage> {
+    let values = image.f32_values()?;
+    let map = rescale_map(&values, &PointMap::IDENTITY, out_min, out_max)?;
+    apply_map(image, &map)
+}
+
+/// Clamp values to `[min, max]`. NaN values stay NaN.
+pub fn clamp(image: &NiftiImage, min: f64, max: f64) -> Result<NiftiImage> {
+    check_range("clamp", min, max)?;
+    apply_map(image, &PointMap::clamp(min, max))
+}
+
+/// Gamma contrast adjustment that preserves the value range (MONAI's
+/// `AdjustContrast`): values are mapped to `[0, 1]`, raised to `gamma`, and
+/// mapped back.
+pub fn adjust_gamma(image: &NiftiImage, gamma: f64) -> Result<NiftiImage> {
+    if !(gamma.is_finite() && gamma > 0.0) {
+        return Err(Error::InvalidArgument(format!(
+            "gamma must be finite and positive, got {gamma}"
+        )));
+    }
+    let values = image.f32_values()?;
+    let Some((lo, hi)) = min_max(&values, |v| v) else {
+        return map_values(image, |v| v);
     };
-
-    Ok(NiftiImage::from_parts(header, new_data))
+    let range = hi - lo;
+    if range <= 0.0 {
+        return map_values(image, |v| v);
+    }
+    let g = gamma as f32;
+    map_values(image, move |v| ((v - lo) / range).powf(g) * range + lo)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::ArrayD;
+    use crate::nifti::element::NiftiElement;
+    use crate::nifti::header::Affine;
+    use crate::nifti::DataType;
+    use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 
-    fn create_test_image(data: Vec<f32>, shape: [usize; 3]) -> NiftiImage {
-        // Create F-order array to match NIfTI convention
-        let c_order = ArrayD::from_shape_vec(shape.to_vec(), data).unwrap();
-        let mut f_order = ArrayD::zeros(IxDyn(&shape).f());
-        f_order.assign(&c_order);
-        let affine = [
-            [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
+    const EYE: Affine = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ];
+
+    fn img<T: NiftiElement>(values: Vec<T>) -> NiftiImage {
+        let n = values.len();
+        NiftiImage::from_array(
+            ArrayD::from_shape_vec(IxDyn(&[n, 1, 1]).f(), values).unwrap(),
+            EYE,
+        )
+        .unwrap()
+    }
+
+    fn values(i: &NiftiImage) -> Vec<f32> {
+        i.to_f32().unwrap().iter().copied().collect()
+    }
+
+    fn eval(m: &PointMap, x: f64) -> f64 {
+        f64::from(m.kernel()(x as f32))
+    }
+
+    #[test]
+    fn point_map_composition_matches_sequential_application() {
+        let maps = [
+            PointMap::linear(2.0, -1.0),
+            PointMap::clamp(-0.5, 3.0),
+            PointMap::linear(-1.5, 0.25),
+            PointMap::clamp(0.0, 1.0),
+            PointMap::clamp(5.0, 6.0),
+            PointMap::linear(0.0, 7.0),
+            PointMap::clamp(-2.0, -1.0),
+            PointMap::linear(1.0, 10.0),
         ];
-        NiftiImage::from_array(f_order, affine)
-    }
-
-    #[test]
-    fn test_z_normalization_basic() {
-        // Create a simple 2x2x2 volume
-        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        let normalized = z_normalization(&img).unwrap();
-        let result = normalized.to_f32().unwrap();
-        let result_slice = result.as_slice_memory_order().unwrap();
-
-        // After z-normalization, mean should be ~0 and std should be ~1
-        let mean: f32 = result_slice.iter().sum::<f32>() / result_slice.len() as f32;
-        let variance: f32 = result_slice.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
-            / result_slice.len() as f32;
-        let std = variance.sqrt();
-
-        assert!(mean.abs() < 1e-5, "Mean should be ~0, got {}", mean);
-        assert!((std - 1.0).abs() < 1e-5, "Std should be ~1, got {}", std);
-    }
-
-    #[test]
-    fn test_z_normalization_constant_value() {
-        // All same values - should not produce NaN
-        let data = vec![5.0; 8];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        let normalized = z_normalization(&img).unwrap();
-        let result = normalized.to_f32().unwrap();
-        let result_slice = result.as_slice_memory_order().unwrap();
-
-        // With zero variance, should handle gracefully (no NaN)
-        for &v in result_slice {
-            assert!(!v.is_nan(), "Should not produce NaN");
+        for x in [-10.0, -1.0, -0.3, 0.0, 0.4, 1.0, 2.5, 100.0] {
+            for start in 0..maps.len() {
+                for end in start..=maps.len() {
+                    let mut composed = PointMap::IDENTITY;
+                    let mut seq = x;
+                    for m in &maps[start..end] {
+                        composed = composed.then(m);
+                        seq = eval(m, seq);
+                    }
+                    let got = eval(&composed, x);
+                    assert!(
+                        (got - seq).abs() <= 1e-5 * (1.0 + seq.abs()),
+                        "{start}..{end} at {x}: {got} vs {seq}"
+                    );
+                }
+            }
         }
+        assert!(eval(&PointMap::clamp(0.0, 1.0), f64::NAN).is_nan());
     }
 
     #[test]
-    fn test_rescale_intensity_basic() {
-        let data = vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        let rescaled = rescale_intensity(&img, 0.0, 1.0).unwrap();
-        let result = rescaled.to_f32().unwrap();
-        let result_slice = result.as_slice_memory_order().unwrap();
-
-        // After rescaling to [0, 1], min should be 0 and max should be 1
-        let min = result_slice.iter().copied().fold(f32::INFINITY, f32::min);
-        let max = result_slice
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-
-        assert!((min - 0.0).abs() < 1e-5, "Min should be 0, got {}", min);
-        assert!((max - 1.0).abs() < 1e-5, "Max should be 1, got {}", max);
+    fn znorm_basic_constant_and_nan() {
+        let z = values(&z_normalization(&img(vec![1.0f32, 2.0, 3.0, 4.0])).unwrap());
+        let mean: f32 = z.iter().sum::<f32>() / 4.0;
+        let var: f32 = z.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / 4.0;
+        assert!(mean.abs() < 1e-6 && (var - 1.0).abs() < 1e-5);
+        assert_eq!(
+            values(&z_normalization(&img(vec![5.0f32; 4])).unwrap()),
+            vec![0.0; 4]
+        );
+        assert!(z_normalization(&img(vec![1.0f32, f32::NAN])).is_err());
     }
 
     #[test]
-    fn test_rescale_intensity_custom_range() {
-        let data = vec![0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        let rescaled = rescale_intensity(&img, -1.0, 1.0).unwrap();
-        let result = rescaled.to_f32().unwrap();
-        let result_slice = result.as_slice_memory_order().unwrap();
-
-        let min = result_slice.iter().copied().fold(f32::INFINITY, f32::min);
-        let max = result_slice
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
-
-        assert!((min - (-1.0)).abs() < 1e-5, "Min should be -1, got {}", min);
-        assert!((max - 1.0).abs() < 1e-5, "Max should be 1, got {}", max);
+    fn znorm_nonzero_keeps_background() {
+        let z = values(&z_normalization_nonzero(&img(vec![0.0f32, 2.0, 4.0, 0.0])).unwrap());
+        assert_eq!(z, vec![0.0, -1.0, 1.0, 0.0]);
     }
 
     #[test]
-    fn test_rescale_intensity_constant() {
-        // All same values - should handle gracefully
-        let data = vec![5.0; 8];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        let rescaled = rescale_intensity(&img, 0.0, 1.0).unwrap();
-        let result = rescaled.to_f32().unwrap();
-        let result_slice = result.as_slice_memory_order().unwrap();
-
-        // With zero range, should not produce NaN
-        for &v in result_slice {
-            assert!(!v.is_nan(), "Should not produce NaN");
-        }
+    fn rescale_ignores_nan_and_handles_constant() {
+        let r =
+            values(&rescale_intensity(&img(vec![0.0f32, 5.0, 10.0, f32::NAN]), -1.0, 1.0).unwrap());
+        assert_eq!(&r[..3], &[-1.0, 0.0, 1.0]);
+        assert!(r[3].is_nan());
+        assert_eq!(
+            values(&rescale_intensity(&img(vec![3.0f32; 3]), 0.0, 1.0).unwrap()),
+            vec![0.0; 3]
+        );
+        assert!(rescale_intensity(&img(vec![1.0f32]), 1.0, 0.0).is_err());
     }
 
     #[test]
-    fn test_clamp_basic() {
-        let data = vec![-10.0, 0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        let clamped = clamp(&img, 0.0, 20.0).unwrap();
-        let result = clamped.to_f32().unwrap();
-        let result_slice = result.as_slice_memory_order().unwrap();
-
-        for &v in result_slice {
-            assert!(v >= 0.0, "Value {} should be >= 0", v);
-            assert!(v <= 20.0, "Value {} should be <= 20", v);
-        }
-
-        // Check that values are properly clamped (don't rely on specific indices
-        // since F-order changes the memory layout)
-        let orig = img.to_f32().unwrap();
-        let orig_slice = orig.as_slice_memory_order().unwrap();
-        for i in 0..result_slice.len() {
-            let expected = orig_slice[i].clamp(0.0, 20.0);
-            assert!(
-                (result_slice[i] - expected).abs() < 1e-5,
-                "Value at {} should be clamped: expected {}, got {}",
-                i,
-                expected,
-                result_slice[i]
-            );
-        }
+    fn clamp_uses_scaled_units() {
+        // CT-style scaling: raw 0..4000 with intercept -1024.
+        let mut ct = img(vec![0i16, 500, 1500, 4000]);
+        ct.header_mut().scl_inter = -1024.0;
+        let c = clamp(&ct, -500.0, 500.0).unwrap();
+        assert_eq!(c.dtype(), DataType::Float32);
+        assert_eq!(c.header().scl_inter, 0.0);
+        assert_eq!(values(&c), vec![-500.0, -500.0, 476.0, 500.0]);
+        assert!(clamp(&ct, 1.0, 0.0).is_err());
+        assert!(clamp(&ct, f64::NAN, 0.0).is_err());
     }
 
     #[test]
-    fn test_clamp_negative_range() {
-        let data = vec![-10.0, -5.0, 0.0, 5.0, 10.0, 15.0, 20.0, 25.0];
-        let img = create_test_image(data, [2, 2, 2]);
-
-        let clamped = clamp(&img, -3.0, 3.0).unwrap();
-        let result = clamped.to_f32().unwrap();
-        let result_slice = result.as_slice_memory_order().unwrap();
-
-        for &v in result_slice {
-            assert!(v >= -3.0, "Value {} should be >= -3", v);
-            assert!(v <= 3.0, "Value {} should be <= 3", v);
-        }
-    }
-
-    #[test]
-    fn test_intensity_preserves_shape() {
-        let data = vec![1.0; 24]; // 2x3x4 = 24
-        let img = create_test_image(data, [2, 3, 4]);
-
-        let z_norm = z_normalization(&img).unwrap();
-        assert_eq!(z_norm.shape(), &[2, 3, 4]);
-
-        let rescaled = rescale_intensity(&img, 0.0, 1.0).unwrap();
-        assert_eq!(rescaled.shape(), &[2, 3, 4]);
-
-        let clamped = clamp(&img, 0.0, 2.0).unwrap();
-        assert_eq!(clamped.shape(), &[2, 3, 4]);
+    fn gamma_preserves_range() {
+        let g = values(&adjust_gamma(&img(vec![-1.0f32, 0.0, 1.0]), 2.0).unwrap());
+        assert_eq!(g, vec![-1.0, -0.5, 1.0]);
+        assert!(adjust_gamma(&img(vec![1.0f32]), 0.0).is_err());
     }
 }

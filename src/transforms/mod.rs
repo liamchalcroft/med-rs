@@ -1,75 +1,44 @@
-//! Image transformation operations for medical imaging.
+//! Image transforms.
 //!
-//! This module provides high-performance transforms commonly used in medical image
-//! processing and deep learning pipelines. All transforms operate on [`NiftiImage`]
-//! and return new images (immutable design).
+//! Every transform takes a [`NiftiImage`](crate::NiftiImage) and returns a new
+//! one. The conventions are the same throughout:
 //!
-//! # Categories
+//! * **Spatial transforms are world-preserving.** Crops, flips, rotations,
+//!   reorientation, and resampling update the affine so each voxel keeps its
+//!   position in scanner space. Saved results overlay the input correctly in
+//!   any viewer.
+//! * **Exact transforms keep the datatype.** Crops, flips, rotations,
+//!   reorientation, and nearest-neighbour resampling copy stored values, so a
+//!   `u8` label map stays a `u8` label map. Trilinear resampling produces
+//!   `f32`.
+//! * **Intensity transforms produce `f32`** in scaled units
+//!   (`scl_slope`/`scl_inter` applied).
+//! * **4D images** are transformed volume by volume along the first three axes.
 //!
-//! ## Resampling
-//! - [`resample_to_spacing`] - Resample to target voxel spacing
-//! - [`resample_to_shape`] - Resample to target dimensions
-//!
-//! ## Orientation
-//! - [`reorient`] - Reorient to standard orientation (RAS, LPS, etc.)
-//! - [`orientation_from_affine`] - Detect orientation from affine matrix
-//!
-//! ## Intensity
-//! - [`z_normalization`] - Zero mean, unit variance normalization
-//! - [`rescale_intensity`] - Scale to [min, max] range
-//! - [`clamp`] - Clamp values to range
-//!
-//! ## Spatial
-//! - [`crop_or_pad`] - Crop or pad to target shape (centered)
-//! - [`flip`] - Flip along specified axes
-//!
-//! ## Random Augmentation
-//! - [`random_flip`] - Probabilistic axis flipping
-//! - [`random_gaussian_noise`] - Additive Gaussian noise
-//! - [`random_intensity_scale`] - Random intensity scaling
-//! - [`random_intensity_shift`] - Random intensity offset
-//! - [`rotate_90`] - Deterministic k*90-degree rotation
-//! - [`random_rotate_90`] - Random 90-degree rotations
-//! - [`random_gamma`] - Random gamma correction
-//! - [`random_augment`] - Combined augmentation pipeline
-//!
-//! ## Crop-First Loading
-//! - [`CropRegion`] - Region specification for crop operations
-//! - [`compute_label_aware_crop_regions`] - MONAI-style positive/negative sampling
-//! - [`compute_random_spatial_crop_regions`] - Random spatial crops
-//! - [`compute_center_crop_regions`] - Center crop computation
-//!
-//! # Example
-//!
-//! ```ignore
-//! use medrs::transforms::{resample_to_spacing, z_normalization, Interpolation};
-//!
-//! let img = medrs::load("brain.nii.gz")?;
-//! let resampled = resample_to_spacing(&img, [1.0, 1.0, 1.0], Interpolation::Trilinear);
-//! let normalized = z_normalization(&resampled);
-//! ```
-//!
-//! [`NiftiImage`]: crate::nifti::NiftiImage
+//! To run several transforms efficiently, use a [`Pipeline`](crate::Pipeline).
 
 mod augment;
-pub mod common;
-pub mod crop;
-mod intensity;
+pub(crate) mod geometry;
+pub(crate) mod intensity;
 mod orientation;
-mod resample;
+pub(crate) mod resample;
+mod sampling;
 mod spatial;
+mod stats;
 
 pub use augment::{
-    random_augment, random_flip, random_gamma, random_gaussian_noise, random_intensity_scale,
-    random_intensity_shift, random_rotate_90, rotate_90, RandomAugmentBuilder,
+    random_flip, random_gamma, random_gaussian_noise, random_intensity_scale,
+    random_intensity_shift, random_rotate_90,
 };
-pub use intensity::{clamp, rescale_intensity, z_normalization};
+pub use intensity::{
+    adjust_gamma, clamp, rescale_intensity, z_normalization, z_normalization_nonzero,
+};
 pub use orientation::{orientation_from_affine, reorient, AxisCode, Orientation};
-pub use resample::{resample_to_shape, resample_to_spacing, Interpolation};
-pub use spatial::{crop, crop_or_pad, flip};
-
-pub use crop::{
-    compute_center_crop_regions, compute_label_aware_crop_regions,
-    compute_random_spatial_crop_regions, CropRegion, ForegroundDetector,
-    RandCropByPosNegLabelConfig, SpatialCropConfig,
+pub use resample::{
+    resample_like, resample_to_grid, resample_to_shape, resample_to_spacing, Interpolation,
 };
+pub use sampling::{center_region, random_region, region_around, sample_label_regions, Region};
+pub use spatial::{crop, crop_or_pad, flip, rotate_90};
+
+pub(crate) use augment::{add_noise, check_probability, sample_gamma, scale_map, shift_map};
+pub(crate) use orientation::reorient_plan;

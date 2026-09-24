@@ -1,529 +1,386 @@
-//! Image orientation and reorientation.
+//! Anatomical orientation and reorientation.
 //!
-//! Medical images can be stored in various orientations. This module provides
-//! tools to detect orientation and reorient to standard coordinate systems.
+//! An orientation such as `RAS` names, for each voxel axis, the anatomical
+//! direction in which that axis *increases*: `R`ight/`L`eft,
+//! `A`nterior/`P`osterior, `S`uperior/`I`nferior.
 
+use super::geometry::{split_shape, with_spatial_shape, GridChange};
+use crate::error::{Error, Result};
+use crate::nifti::element::{map_array, to_fortran};
+use crate::nifti::header::{polar, Affine};
+use crate::nifti::NiftiImage;
+use ndarray::{Axis, Order};
 use std::str::FromStr;
 
-use crate::error::Error;
-use crate::nifti::image::ArrayData;
-use crate::nifti::{DataType, NiftiImage};
-use ndarray::{ArrayD, IxDyn, ShapeBuilder};
-
-/// Standard anatomical orientation codes.
-///
-/// Each axis is labeled by which direction increases along that axis:
-/// - R/L: Right/Left
-/// - A/P: Anterior/Posterior
-/// - S/I: Superior/Inferior
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Direction in which a voxel axis increases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AxisCode {
-    /// Increasing axis moves to the subject's right.
+    /// Towards the subject's right.
     R,
-    /// Increasing axis moves to the subject's left.
-    L, // Right, Left
-    /// Increasing axis moves toward the anterior direction.
+    /// Towards the subject's left.
+    L,
+    /// Towards anterior.
     A,
-    /// Increasing axis moves toward the posterior direction.
-    P, // Anterior, Posterior
-    /// Increasing axis moves toward the superior direction.
+    /// Towards posterior.
+    P,
+    /// Towards superior.
     S,
-    /// Increasing axis moves toward the inferior direction.
-    I, // Superior, Inferior
+    /// Towards inferior.
+    I,
 }
 
 impl AxisCode {
-    fn axis_index(self) -> usize {
+    /// World axis (0 = x/left-right, 1 = y/anterior-posterior, 2 = z/superior-inferior).
+    pub const fn world_axis(self) -> usize {
         match self {
             Self::R | Self::L => 0,
             Self::A | Self::P => 1,
             Self::S | Self::I => 2,
         }
     }
+
+    /// Whether the code points along the positive RAS world axis.
+    pub const fn is_positive(self) -> bool {
+        matches!(self, Self::R | Self::A | Self::S)
+    }
+
+    const fn from_axis(axis: usize, positive: bool) -> Self {
+        match (axis, positive) {
+            (0, true) => Self::R,
+            (0, false) => Self::L,
+            (1, true) => Self::A,
+            (1, false) => Self::P,
+            (_, true) => Self::S,
+            (_, false) => Self::I,
+        }
+    }
+
+    const fn as_char(self) -> char {
+        match self {
+            Self::R => 'R',
+            Self::L => 'L',
+            Self::A => 'A',
+            Self::P => 'P',
+            Self::S => 'S',
+            Self::I => 'I',
+        }
+    }
 }
 
-/// Orientation as a tuple of three axis codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Orientation(pub AxisCode, pub AxisCode, pub AxisCode);
+/// Orientation of the three voxel axes, e.g. `RAS`. Always a valid
+/// permutation: each world axis appears exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Orientation([AxisCode; 3]);
 
 impl Orientation {
-    /// RAS (Right-Anterior-Superior) - standard neuroimaging orientation.
-    pub const RAS: Self = Self(AxisCode::R, AxisCode::A, AxisCode::S);
-    /// LAS (Left-Anterior-Superior) - radiological convention.
-    pub const LAS: Self = Self(AxisCode::L, AxisCode::A, AxisCode::S);
-    /// LPS (Left-Posterior-Superior) - DICOM convention.
-    pub const LPS: Self = Self(AxisCode::L, AxisCode::P, AxisCode::S);
+    /// Right-Anterior-Superior (nibabel / MNI convention).
+    pub const RAS: Self = Self([AxisCode::R, AxisCode::A, AxisCode::S]);
+    /// Left-Posterior-Superior (DICOM / ITK convention).
+    pub const LPS: Self = Self([AxisCode::L, AxisCode::P, AxisCode::S]);
+    /// Left-Anterior-Superior (radiological).
+    pub const LAS: Self = Self([AxisCode::L, AxisCode::A, AxisCode::S]);
 
-    /// Parse from 3-character string like "RAS", "LPS", etc.
-    ///
-    /// Returns `None` if the string is not a valid orientation code.
-    /// Prefer using `FromStr::from_str` which returns a descriptive error.
-    fn parse_orientation(s: &str) -> Option<Self> {
-        let chars: Vec<char> = s.chars().collect();
-        if chars.len() != 3 {
-            return None;
-        }
-
-        let parse_code = |c: char| -> Option<AxisCode> {
-            match c.to_ascii_uppercase() {
-                'R' => Some(AxisCode::R),
-                'L' => Some(AxisCode::L),
-                'A' => Some(AxisCode::A),
-                'P' => Some(AxisCode::P),
-                'S' => Some(AxisCode::S),
-                'I' => Some(AxisCode::I),
-                _ => None,
+    /// Build an orientation, rejecting codes that repeat a world axis.
+    pub fn new(codes: [AxisCode; 3]) -> Result<Self> {
+        let mut seen = [false; 3];
+        for code in codes {
+            let axis = code.world_axis();
+            if seen[axis] {
+                return Err(Error::InvalidOrientation(format!(
+                    "{} uses the same anatomical axis twice",
+                    codes.iter().map(|c| c.as_char()).collect::<String>()
+                )));
             }
-        };
+            seen[axis] = true;
+        }
+        Ok(Self(codes))
+    }
 
-        Some(Self(
-            parse_code(chars[0])?,
-            parse_code(chars[1])?,
-            parse_code(chars[2])?,
-        ))
+    /// The three axis codes.
+    pub const fn codes(&self) -> [AxisCode; 3] {
+        self.0
     }
 }
 
 impl FromStr for Orientation {
     type Err = Error;
 
-    /// Parse from 3-character string like "RAS", "LPS", etc.
-    ///
-    /// # Errors
-    /// Returns `InvalidOrientation` if the string is not exactly 3 characters
-    /// or contains invalid axis codes.
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Self::parse_orientation(s).ok_or_else(|| {
+    /// Parse a three-letter code such as `"RAS"` or `"lps"`.
+    fn from_str(s: &str) -> Result<Self> {
+        let bad = || {
             Error::InvalidOrientation(format!(
-                "Invalid orientation code '{}'. Expected 3-letter code like 'RAS' or 'LPS' \
-                 using R/L (right/left), A/P (anterior/posterior), S/I (superior/inferior).",
-                s
+                "invalid orientation '{s}': expected three letters from R/L, A/P, S/I \
+                 using each pair once (e.g. 'RAS', 'LPS')"
             ))
-        })
-    }
-}
-
-impl Orientation {
-    /// Get codes as array.
-    pub fn codes(&self) -> [AxisCode; 3] {
-        [self.0, self.1, self.2]
+        };
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() != 3 {
+            return Err(bad());
+        }
+        let mut codes = [AxisCode::R; 3];
+        for (code, c) in codes.iter_mut().zip(chars) {
+            *code = match c.to_ascii_uppercase() {
+                'R' => AxisCode::R,
+                'L' => AxisCode::L,
+                'A' => AxisCode::A,
+                'P' => AxisCode::P,
+                'S' => AxisCode::S,
+                'I' => AxisCode::I,
+                _ => return Err(bad()),
+            };
+        }
+        Self::new(codes).map_err(|_| bad())
     }
 }
 
 impl std::fmt::Display for Orientation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let code_char = |c: AxisCode| -> char {
-            match c {
-                AxisCode::R => 'R',
-                AxisCode::L => 'L',
-                AxisCode::A => 'A',
-                AxisCode::P => 'P',
-                AxisCode::S => 'S',
-                AxisCode::I => 'I',
-            }
-        };
-        write!(
-            f,
-            "{}{}{}",
-            code_char(self.0),
-            code_char(self.1),
-            code_char(self.2)
-        )
+        for c in self.0 {
+            write!(f, "{}", c.as_char())?;
+        }
+        Ok(())
     }
 }
 
-/// Detect the orientation of an image from its affine matrix.
+/// Orientation of the voxel axes of an affine (nibabel's `io_orientation`).
 ///
-/// Handles degenerate affines (zero columns) gracefully by using default axis codes.
-pub fn orientation_from_affine(affine: &[[f32; 4]; 4]) -> Orientation {
-    // Extract rotation/scaling part
+/// The rotation part is orthogonalised first, and axes are assigned greedily,
+/// so every non-degenerate affine yields a valid orientation even when it is
+/// oblique. Degenerate axes (zero columns) keep their `RAS` default.
+pub fn orientation_from_affine(affine: &Affine) -> Orientation {
+    let mut rs = [[0.0f64; 3]; 3];
+    for j in 0..3 {
+        let norm = (0..3)
+            .map(|i| affine[i][j] * affine[i][j])
+            .sum::<f64>()
+            .sqrt();
+        let norm = if norm > 0.0 { norm } else { 1.0 };
+        for i in 0..3 {
+            rs[i][j] = affine[i][j] / norm;
+        }
+    }
+    let mut r = polar(&rs);
     let mut codes = [AxisCode::R, AxisCode::A, AxisCode::S];
-
-    for i in 0..3 {
-        // Find which anatomical axis this image axis corresponds to
-        let col = [affine[0][i], affine[1][i], affine[2][i]];
-        let abs_col = [col[0].abs(), col[1].abs(), col[2].abs()];
-
-        // Check for degenerate affine (zero or near-zero column)
-        let col_magnitude = abs_col[0] + abs_col[1] + abs_col[2];
-        if col_magnitude < f32::EPSILON {
-            // Degenerate column - keep default axis code
-            continue;
+    let mut assigned = [false; 3];
+    for (in_axis, code) in codes.iter_mut().enumerate() {
+        let best = (0..3)
+            .filter(|&row| !assigned[row])
+            .max_by(|&a, &b| r[a][in_axis].abs().total_cmp(&r[b][in_axis].abs()));
+        if let Some(row) = best.filter(|&row| r[row][in_axis].abs() > 1e-12) {
+            *code = AxisCode::from_axis(row, r[row][in_axis] > 0.0);
+            assigned[row] = true;
+            r[row] = [0.0; 3];
         }
-
-        // Find dominant axis (use strict > to handle ties deterministically)
-        let max_idx = if abs_col[0] > abs_col[1] && abs_col[0] > abs_col[2] {
-            0
-        } else if abs_col[1] > abs_col[2] {
-            1
-        } else {
-            2
-        };
-
-        let positive = col[max_idx] > 0.0;
-
-        codes[i] = match max_idx {
-            0 => {
-                if positive {
-                    AxisCode::R
-                } else {
-                    AxisCode::L
-                }
-            }
-            1 => {
-                if positive {
-                    AxisCode::A
-                } else {
-                    AxisCode::P
-                }
-            }
-            2 => {
-                if positive {
-                    AxisCode::S
-                } else {
-                    AxisCode::I
-                }
-            }
-            _ => unreachable!(),
-        };
     }
-
-    Orientation(codes[0], codes[1], codes[2])
+    // Degenerate columns may leave a duplicate default; fill with unused axes.
+    let mut used = [false; 3];
+    for code in &codes {
+        used[code.world_axis()] = true;
+    }
+    if used.iter().any(|u| !u) {
+        let mut free = (0..3).filter(|&a| !used[a]);
+        let mut seen = [false; 3];
+        for code in &mut codes {
+            let axis = code.world_axis();
+            if seen[axis] {
+                if let Some(a) = free.next() {
+                    *code = AxisCode::from_axis(a, true);
+                }
+            }
+            seen[code.world_axis()] = true;
+        }
+    }
+    Orientation(codes)
 }
 
-/// Reorient an image to target orientation.
-///
-/// # Errors
-/// Returns `Error::InvalidDimensions` if the image is not exactly 3-dimensional.
-/// Returns `Error::InvalidAffine` if the affine does not define three distinct spatial axes.
-/// Returns `Error::ShapeMismatch` if axis mapping fails (should not happen with valid NIfTI).
-///
-/// # Example
-/// ```ignore
-/// use medrs::transforms::{Orientation, reorient};
-///
-/// // Reorient to standard RAS orientation
-/// let ras_img = reorient(&img, Orientation::RAS)?;
-/// ```
-#[allow(clippy::needless_range_loop)]
-pub fn reorient(image: &NiftiImage, target: Orientation) -> Result<NiftiImage, Error> {
-    let shape = image.shape();
+/// How to reach `target` from `current`: for each new axis, the old axis it
+/// reads and whether it is reversed.
+pub(crate) struct Reorientation {
+    pub perm: [usize; 3],
+    pub flip: [bool; 3],
+    pub change: GridChange,
+}
 
-    // permute_axes computes 3D strides; 4D+ would scramble the data silently.
-    if shape.len() != 3 {
-        return Err(Error::InvalidDimensions(format!(
-            "reorient requires a 3D image, got {} dimensions",
-            shape.len()
-        )));
+pub(crate) fn reorient_plan(
+    current: Orientation,
+    target: Orientation,
+    spatial: [usize; 3],
+) -> Reorientation {
+    let cur = current.codes();
+    let mut perm = [0usize; 3];
+    let mut flip = [false; 3];
+    for (i, want) in target.codes().iter().enumerate() {
+        // Both orientations are permutations, so the axis always exists.
+        let j = (0..3)
+            .find(|&j| cur[j].world_axis() == want.world_axis())
+            .unwrap_or(i);
+        perm[i] = j;
+        flip[i] = cur[j] != *want;
     }
-
-    let current = orientation_from_affine(&image.affine());
-
-    // A degenerate affine can map two axes to the same anatomical direction,
-    // which is not a valid permutation and would scramble data.
-    let mut seen = [false; 3];
-    for code in current.codes() {
-        let ax = code.axis_index();
-        if seen[ax] {
-            return Err(Error::InvalidAffine(format!(
-                "cannot reorient: affine does not define three distinct spatial axes (detected {})",
-                current
-            )));
-        }
-        seen[ax] = true;
+    // New index v -> old index u with u[perm[i]] = v[i] or n - 1 - v[i].
+    let mut map = [[0.0; 4]; 4];
+    map[3][3] = 1.0;
+    for i in 0..3 {
+        let j = perm[i];
+        map[j][i] = if flip[i] { -1.0 } else { 1.0 };
+        map[j][3] = if flip[i] {
+            (spatial[j] - 1) as f64
+        } else {
+            0.0
+        };
     }
+    Reorientation {
+        perm,
+        flip,
+        change: GridChange {
+            map,
+            shape: [spatial[perm[0]], spatial[perm[1]], spatial[perm[2]]],
+        },
+    }
+}
 
+/// Reorient an image so its voxel axes follow `target`.
+///
+/// This only permutes and flips axes, so it is exact: the datatype, scaling,
+/// and values are unchanged and world coordinates are preserved (both the
+/// sform and qform are updated). Axes beyond the third are kept.
+pub fn reorient(image: &NiftiImage, target: Orientation) -> Result<NiftiImage> {
+    let current = image.orientation();
     if current == target {
         return Ok(image.clone());
     }
-
-    let data = image.to_f32()?;
-    let affine = image.affine();
-
-    // Compute axis permutation and flips
-    let current_codes = current.codes();
-    let target_codes = target.codes();
-
-    let mut perm = [0usize; 3];
-    let mut flip = [false; 3];
-
-    for (i, &target_code) in target_codes.iter().enumerate() {
-        // Find which current axis maps to this target axis
-        let mut found = false;
-        for (j, &current_code) in current_codes.iter().enumerate() {
-            if current_code.axis_index() == target_code.axis_index() {
-                perm[i] = j;
-                flip[i] = current_code != target_code;
-                found = true;
-                break;
+    let (spatial, _) = split_shape(image.shape());
+    let Reorientation { perm, flip, change } = reorient_plan(current, target, spatial);
+    let ndim = image.ndim();
+    let out_shape = with_spatial_shape(image.shape(), change.shape);
+    let data = image.raw_data()?;
+    let data = map_array!(data.as_ref(), |a| {
+        // Work on at least three axes (1D/2D images are padded with 1s).
+        let mut padded = a.shape().to_vec();
+        padded.resize(ndim.max(3), 1);
+        let view = a
+            .view()
+            .into_shape_with_order((padded, Order::ColumnMajor))
+            .map_err(|e| Error::Internal(format!("cannot pad axes for reorient: {e}")))?;
+        let mut axes: Vec<usize> = (0..ndim.max(3)).collect();
+        axes[..3].copy_from_slice(&perm);
+        let mut view = view.permuted_axes(axes);
+        for (i, &f) in flip.iter().enumerate() {
+            if f {
+                view.invert_axis(Axis(i));
             }
         }
-        if !found {
-            return Err(Error::ShapeMismatch(format!(
-                "Could not map axis {} in orientation transformation",
-                i
-            )));
-        }
-    }
-
-    // Apply permutation and flips
-    let new_shape: Vec<usize> = perm.iter().map(|&p| shape[p]).collect();
-    let mut new_data = permute_axes(&data, &perm, &new_shape)?;
-
-    // Apply flips
-    for (i, &should_flip) in flip.iter().enumerate() {
-        if should_flip {
-            new_data = flip_axis(&new_data, i)?;
-        }
-    }
-
-    // Update affine matrix
-    let mut new_affine = [[0.0f32; 4]; 4];
-    new_affine[3][3] = 1.0;
-
-    for i in 0..3 {
-        let src_axis = perm[i];
-        let flip_sign = if flip[i] { -1.0 } else { 1.0 };
-
-        for j in 0..3 {
-            new_affine[j][i] = affine[j][src_axis] * flip_sign;
-        }
-
-        // Adjust origin if flipping. new_affine[j][i] is the already-negated
-        // column, so the pre-flip column times the extent is subtracted.
-        if flip[i] {
-            let extent = (new_shape[i] - 1) as f32;
-            for j in 0..3 {
-                new_affine[j][3] -= new_affine[j][i] * extent;
-            }
-        }
-    }
-
-    // Copy origin
-    for j in 0..3 {
-        new_affine[j][3] += affine[j][3];
-    }
-
-    // Build output header while preserving metadata
+        to_fortran(&view)
+            .into_shape_with_order((out_shape.clone(), Order::ColumnMajor))
+            .map_err(|e| Error::Internal(format!("cannot restore axes after reorient: {e}")))?
+    });
     let mut header = image.header().clone();
-    header.ndim = new_shape.len() as u8;
-    header.datatype = DataType::Float32;
-    header.scl_slope = 1.0;
-    header.scl_inter = 0.0;
-    header.dim = [1i64; 7];
-    for (i, &d) in new_shape.iter().enumerate() {
-        header.dim[i] = d as i64;
-    }
-    header.pixdim = [1.0f64; 8];
-    let spacing = image.spacing();
-    for i in 0..3 {
-        header.pixdim[i + 1] = spacing[perm[i]] as f64;
-    }
-    header.set_affine(new_affine);
-
-    Ok(NiftiImage::from_parts(header, ArrayData::F32(new_data)))
-}
-
-#[allow(clippy::expect_used)]
-fn permute_axes(
-    data: &ArrayD<f32>,
-    perm: &[usize; 3],
-    new_shape: &[usize],
-) -> Result<ArrayD<f32>, Error> {
-    let old_shape = data.shape();
-
-    // Convert F-order to C-order for processing if needed
-    let data_c: std::borrow::Cow<'_, ArrayD<f32>> = if data.is_standard_layout() {
-        std::borrow::Cow::Borrowed(data)
-    } else {
-        let mut c_order = ArrayD::zeros(IxDyn(old_shape));
-        c_order.assign(data);
-        std::borrow::Cow::Owned(c_order)
-    };
-
-    let src = data_c
-        .as_slice()
-        .expect("C-order array should have contiguous slice");
-    let mut output = vec![0.0f32; new_shape.iter().product()];
-    let (nd, nh, nw) = (new_shape[0], new_shape[1], new_shape[2]);
-    let old_strides = [old_shape[1] * old_shape[2], old_shape[2], 1];
-
-    let inv_perm = {
-        let mut inv = [0usize; 3];
-        for (i, &p) in perm.iter().enumerate() {
-            inv[p] = i;
-        }
-        inv
-    };
-
-    for d in 0..nd {
-        for h in 0..nh {
-            for w in 0..nw {
-                let new_coords = [d, h, w];
-                let old_coords = [
-                    new_coords[inv_perm[0]],
-                    new_coords[inv_perm[1]],
-                    new_coords[inv_perm[2]],
-                ];
-
-                let old_idx = old_coords[0] * old_strides[0]
-                    + old_coords[1] * old_strides[1]
-                    + old_coords[2] * old_strides[2];
-                let new_idx = d * nh * nw + h * nw + w;
-
-                output[new_idx] = src[old_idx];
-            }
-        }
-    }
-
-    // Output is in C-order. Convert to F-order to match NIfTI convention.
-    let c_order = ArrayD::from_shape_vec(IxDyn(new_shape), output)
-        .map_err(|e| Error::MemoryAllocation(format!("Failed to create permuted array: {}", e)))?;
-    let mut f_order = ArrayD::zeros(IxDyn(new_shape).f());
-    f_order.assign(&c_order);
-    Ok(f_order)
-}
-
-#[allow(clippy::expect_used)]
-fn flip_axis(data: &ArrayD<f32>, axis: usize) -> Result<ArrayD<f32>, Error> {
-    let shape = data.shape();
-
-    // Convert F-order to C-order for processing if needed
-    let data_c: std::borrow::Cow<'_, ArrayD<f32>> = if data.is_standard_layout() {
-        std::borrow::Cow::Borrowed(data)
-    } else {
-        let mut c_order = ArrayD::zeros(IxDyn(shape));
-        c_order.assign(data);
-        std::borrow::Cow::Owned(c_order)
-    };
-
-    let src = data_c
-        .as_slice()
-        .expect("C-order array should have contiguous slice");
-    let mut output = vec![0.0f32; src.len()];
-    let (d, h, w) = (shape[0], shape[1], shape[2]);
-
-    for di in 0..d {
-        for hi in 0..h {
-            for wi in 0..w {
-                let (new_d, new_h, new_w) = match axis {
-                    0 => (d - 1 - di, hi, wi),
-                    1 => (di, h - 1 - hi, wi),
-                    2 => (di, hi, w - 1 - wi),
-                    _ => unreachable!(),
-                };
-
-                let old_idx = di * h * w + hi * w + wi;
-                let new_idx = new_d * h * w + new_h * w + new_w;
-                output[new_idx] = src[old_idx];
-            }
-        }
-    }
-
-    // Output is in C-order. Convert to F-order to match NIfTI convention.
-    let c_order = ArrayD::from_shape_vec(IxDyn(shape), output)
-        .map_err(|e| Error::MemoryAllocation(format!("Failed to create flipped array: {}", e)))?;
-    let mut f_order = ArrayD::zeros(IxDyn(shape).f());
-    f_order.assign(&c_order);
-    Ok(f_order)
+    header.transform_voxels(&change.map);
+    Ok(NiftiImage::from_parts(header, data))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::{ArrayD, IxDyn, ShapeBuilder};
 
-    #[test]
-    fn test_orientation_parse() {
-        // Test valid orientations via FromStr trait
-        assert_eq!("RAS".parse::<Orientation>().unwrap(), Orientation::RAS);
-        assert_eq!("LPS".parse::<Orientation>().unwrap(), Orientation::LPS);
-        assert_eq!("ras".parse::<Orientation>().unwrap(), Orientation::RAS); // case insensitive
-
-        // Test invalid orientations return descriptive errors
-        let err = "XYZ".parse::<Orientation>().unwrap_err();
-        assert!(format!("{}", err).contains("Invalid orientation"));
-
-        let err = "RA".parse::<Orientation>().unwrap_err(); // too short
-        assert!(format!("{}", err).contains("Invalid orientation"));
+    fn diag(d: [f64; 3]) -> Affine {
+        [
+            [d[0], 0.0, 0.0, 1.0],
+            [0.0, d[1], 0.0, 2.0],
+            [0.0, 0.0, d[2], 3.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
     }
 
     #[test]
-    fn test_orientation_display() {
-        assert_eq!(format!("{}", Orientation::RAS), "RAS");
-        assert_eq!(format!("{}", Orientation::LPS), "LPS");
+    fn parse_validates_axes() {
+        assert_eq!("ras".parse::<Orientation>().unwrap(), Orientation::RAS);
+        assert_eq!("LPS".parse::<Orientation>().unwrap().to_string(), "LPS");
+        for bad in ["RRR", "RLA", "XYZ", "RA", "RASS"] {
+            assert!(bad.parse::<Orientation>().is_err(), "{bad}");
+        }
+        // All 48 valid orientations parse.
+        let mut n = 0;
+        for a in "RLAPSI".chars() {
+            for b in "RLAPSI".chars() {
+                for c in "RLAPSI".chars() {
+                    n += usize::from(format!("{a}{b}{c}").parse::<Orientation>().is_ok());
+                }
+            }
+        }
+        assert_eq!(n, 48);
     }
 
     #[test]
-    fn test_orientation_from_identity_affine() {
-        // Identity affine should give RAS orientation
-        let affine = [
-            [1.0, 0.0, 0.0, 0.0],
+    fn orientation_of_oblique_and_permuted_affines() {
+        assert_eq!(
+            orientation_from_affine(&diag([1.0, 1.0, 1.0])),
+            Orientation::RAS
+        );
+        assert_eq!(
+            orientation_from_affine(&diag([-1.0, -1.0, 1.0])),
+            Orientation::LPS
+        );
+        // 45 degrees exactly: greedy assignment still gives a permutation.
+        let s = std::f64::consts::FRAC_1_SQRT_2;
+        let tie = [
+            [s, -s, 0.0, 0.0],
+            [s, s, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let o = orientation_from_affine(&tie);
+        assert!(Orientation::new(o.codes()).is_ok());
+        // Axis permutation: voxel x runs along world z.
+        let perm = [
             [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-        assert_eq!(orientation_from_affine(&affine), Orientation::RAS);
-    }
-
-    #[test]
-    fn test_orientation_from_lps_affine() {
-        // LPS affine: negative x, negative y, positive z
-        let affine = [
-            [-1.0, 0.0, 0.0, 0.0],
-            [0.0, -1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-        assert_eq!(orientation_from_affine(&affine), Orientation::LPS);
-    }
-
-    #[test]
-    fn test_orientation_from_degenerate_affine() {
-        // Degenerate affine with zero columns should use default (RAS)
-        let affine = [
-            [0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 0.0],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-        // Should not panic, returns default RAS
-        let orientation = orientation_from_affine(&affine);
-        assert_eq!(orientation, Orientation::RAS);
-    }
-
-    #[test]
-    fn test_orientation_from_partial_degenerate_affine() {
-        // Affine with one zero column
-        let affine = [
-            [1.0, 0.0, 0.0, 0.0], // X axis valid (R)
-            [0.0, 0.0, 0.0, 0.0], // Y axis zero - use default (A)
-            [0.0, 0.0, 1.0, 0.0], // Z axis valid (S)
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-        let orientation = orientation_from_affine(&affine);
-        // Should handle gracefully
-        assert_eq!(orientation.0, AxisCode::R);
-        assert_eq!(orientation.2, AxisCode::S);
-    }
-
-    #[test]
-    fn test_reorient_result_type() {
-        // Test that reorient returns Result type
-        let affine = [
+            [0.0, 0.0, -1.0, 0.0],
             [1.0, 0.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        let img =
-            NiftiImage::from_array::<f32>(ndarray::ArrayD::zeros(IxDyn(&[2, 2, 2]).f()), affine);
+        assert_eq!(orientation_from_affine(&perm).to_string(), "SRP");
+        // Degenerate affine does not panic and gives a valid permutation.
+        let o = orientation_from_affine(&[[0.0; 4]; 4]);
+        assert!(Orientation::new(o.codes()).is_ok());
+    }
 
-        // This should work without panicking
-        let result = reorient(&img, Orientation::RAS);
-        assert!(result.is_ok());
+    #[test]
+    fn reorient_is_exact_and_world_preserving() {
+        let shape = [4usize, 5, 6, 2];
+        let n: usize = shape.iter().product();
+        let arr =
+            ArrayD::from_shape_vec(IxDyn(&shape).f(), (0..n).map(|v| v as i16).collect()).unwrap();
+        let img = NiftiImage::from_array(arr, diag([-1.0, 2.0, 3.0])).unwrap();
+        assert_eq!(img.orientation().to_string(), "LAS");
+        for target in ["RAS", "LPS", "SPR", "IAL"] {
+            let t: Orientation = target.parse().unwrap();
+            let r = reorient(&img, t).unwrap();
+            assert_eq!(r.orientation(), t);
+            assert_eq!(r.dtype(), img.dtype());
+            assert_eq!(r.ndim(), 4);
+            // Every voxel keeps its world position: compare via a round trip
+            // back to the original orientation.
+            let back = reorient(&r, img.orientation()).unwrap();
+            assert_eq!(back.to_f32().unwrap(), img.to_f32().unwrap());
+            let (a, b) = (back.affine(), img.affine());
+            for i in 0..3 {
+                for j in 0..4 {
+                    assert!((a[i][j] - b[i][j]).abs() < 1e-9, "{target}: {a:?} vs {b:?}");
+                }
+            }
+        }
+    }
 
-        // Test that identical orientation returns Ok with cloned image
-        let same_result = reorient(&result.unwrap(), Orientation::RAS);
-        assert!(same_result.is_ok());
+    #[test]
+    fn reorient_value_at_world_point() {
+        let arr = ArrayD::from_shape_vec(IxDyn(&[3, 1, 1]).f(), vec![10.0f32, 20.0, 30.0]).unwrap();
+        let img = NiftiImage::from_array(arr, diag([-1.0, 1.0, 1.0])).unwrap();
+        let r = reorient(&img, Orientation::RAS).unwrap();
+        // x reversed; first RAS voxel is the old last voxel.
+        let a = r.as_array::<f32>().unwrap();
+        assert_eq!(a[[0, 0, 0]], 30.0);
+        // Its world x equals the old last voxel's world x: 1 - 2 = -1.
+        assert!((r.affine()[0][3] - -1.0).abs() < 1e-12);
     }
 }

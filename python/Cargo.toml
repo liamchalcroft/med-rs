@@ -1,0 +1,16 @@
+[package]
+name = "medrs-python"
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.83"
+publish = false
+
+[lib]
+name = "_medrs"
+crate-type = ["cdylib"]
+
+[dependencies]
+medrs = { path = "..", features = ["jvol"] }
+
+[lints]
+workspace = true

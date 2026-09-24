@@ -1,163 +1,102 @@
-//! `NIfTI` header parsing and representation.
+//! `NIfTI` header parsing, validation, and serialization.
 //!
-//! Supports both NIfTI-1 (348-byte header) and NIfTI-2 (540-byte header) formats
-//! with automatic version detection and endianness handling.
+//! Supports NIfTI-1 (348-byte header) and NIfTI-2 (540-byte header), both the
+//! single-file (`.nii`) and two-file (`.hdr`/`.img`) layouts, either byte
+//! order, and header extensions. Every field defined by the standard survives a
+//! load/save round trip; only the unused Analyze 7.5 legacy fields are dropped.
+//!
+//! Geometry follows the NIfTI-1 reference implementation (`nifti1_io.c`):
+//! the sform is preferred over the qform, non-positive voxel sizes are treated
+//! as 1 when building a qform matrix, and a matrix is converted back to a
+//! quaternion through its closest orthogonal matrix (polar decomposition).
 
 use crate::error::{Error, Result};
 use byteorder::{BigEndian, ByteOrder, LittleEndian};
 
-/// NIfTI format version.
+/// A 4x4 homogeneous affine matrix in row-major order.
+pub type Affine = [[f64; 4]; 4];
+
+/// `NIfTI` format version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NiftiVersion {
-    /// NIfTI-1 format (348-byte header, 16-bit dimensions)
+    /// NIfTI-1: 348-byte header, 16-bit dimensions, 32-bit floats.
     #[default]
     Nifti1,
-    /// NIfTI-2 format (540-byte header, 64-bit dimensions)
+    /// NIfTI-2: 540-byte header, 64-bit dimensions, 64-bit floats.
     Nifti2,
 }
 
 impl NiftiVersion {
-    /// Header size in bytes for this version.
+    /// Size of the fixed header in bytes.
     pub const fn header_size(self) -> usize {
         match self {
             Self::Nifti1 => 348,
             Self::Nifti2 => 540,
         }
     }
-
-    /// Default vox_offset for this version (header size + padding).
-    pub const fn default_vox_offset(self) -> i64 {
-        match self {
-            Self::Nifti1 => 352,
-            Self::Nifti2 => 544,
-        }
-    }
 }
 
-/// NIfTI-1 header field byte offsets.
-mod offsets_v1 {
-    pub const SIZEOF_HDR: usize = 0;
-    pub const DIM: usize = 40;
-    pub const INTENT_CODE: usize = 68;
-    pub const DATATYPE: usize = 70;
-    pub const BITPIX: usize = 72;
-    pub const PIXDIM: usize = 76;
-    pub const VOX_OFFSET: usize = 108;
-    pub const SCL_SLOPE: usize = 112;
-    pub const SCL_INTER: usize = 116;
-    pub const XYZT_UNITS: usize = 123;
-    pub const DESCRIP: usize = 148;
-    pub const AUX_FILE: usize = 228;
-    pub const QFORM_CODE: usize = 252;
-    pub const SFORM_CODE: usize = 254;
-    pub const QUATERN_B: usize = 256;
-    pub const QUATERN_C: usize = 260;
-    pub const QUATERN_D: usize = 264;
-    pub const QOFFSET_X: usize = 268;
-    pub const QOFFSET_Y: usize = 272;
-    pub const QOFFSET_Z: usize = 276;
-    pub const SROW_X: usize = 280;
-    pub const SROW_Y: usize = 296;
-    pub const SROW_Z: usize = 312;
-    pub const MAGIC: usize = 344;
-}
-
-/// NIfTI-2 header field byte offsets.
+/// `NIfTI` datatype codes supported by medrs.
 ///
-/// Note: Some constants (INTENT_P1-P3, CAL_MAX/MIN, SLICE_*, etc.) are defined
-/// for NIfTI-2 spec completeness but not currently used in parsing/writing.
-/// They are retained as documentation of the full header structure.
-#[allow(dead_code)]
-mod offsets_v2 {
-    pub const SIZEOF_HDR: usize = 0;
-    pub const MAGIC: usize = 4;
-    pub const DATATYPE: usize = 12;
-    pub const BITPIX: usize = 14;
-    pub const DIM: usize = 16;
-    pub const INTENT_P1: usize = 80;
-    pub const INTENT_P2: usize = 88;
-    pub const INTENT_P3: usize = 96;
-    pub const PIXDIM: usize = 104;
-    pub const VOX_OFFSET: usize = 168;
-    pub const SCL_SLOPE: usize = 176;
-    pub const SCL_INTER: usize = 184;
-    pub const CAL_MAX: usize = 192;
-    pub const CAL_MIN: usize = 200;
-    pub const SLICE_DURATION: usize = 208;
-    pub const TOFFSET: usize = 216;
-    pub const SLICE_START: usize = 224;
-    pub const SLICE_END: usize = 232;
-    pub const DESCRIP: usize = 240;
-    pub const AUX_FILE: usize = 320;
-    pub const QFORM_CODE: usize = 344;
-    pub const SFORM_CODE: usize = 348;
-    pub const QUATERN_B: usize = 352;
-    pub const QUATERN_C: usize = 360;
-    pub const QUATERN_D: usize = 368;
-    pub const QOFFSET_X: usize = 376;
-    pub const QOFFSET_Y: usize = 384;
-    pub const QOFFSET_Z: usize = 392;
-    pub const SROW_X: usize = 400;
-    pub const SROW_Y: usize = 432;
-    pub const SROW_Z: usize = 464;
-    pub const SLICE_CODE: usize = 496;
-    pub const XYZT_UNITS: usize = 500;
-    pub const INTENT_CODE: usize = 504;
-    pub const INTENT_NAME: usize = 508;
-    pub const DIM_INFO: usize = 524;
-}
-
-/// `NIfTI` data type codes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// `Float16` (16384) and `BFloat16` (16385) are **medrs extensions**: they are
+/// not part of the NIfTI standard, so files that use them can only be read by
+/// medrs. Use them for caches and intermediate storage, not for interchange.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i16)]
+#[non_exhaustive]
 pub enum DataType {
-    /// Unsigned 8-bit integer
+    /// Unsigned 8-bit integer (`DT_UINT8`).
     UInt8 = 2,
-    /// Signed 16-bit integer
+    /// Signed 16-bit integer (`DT_INT16`).
     Int16 = 4,
-    /// Signed 32-bit integer
+    /// Signed 32-bit integer (`DT_INT32`).
     Int32 = 8,
-    /// 32-bit floating point
+    /// 32-bit IEEE float (`DT_FLOAT32`).
     Float32 = 16,
-    /// 64-bit floating point
+    /// 64-bit IEEE float (`DT_FLOAT64`).
     Float64 = 64,
-    /// Signed 8-bit integer
+    /// Signed 8-bit integer (`DT_INT8`).
     Int8 = 256,
-    /// Unsigned 16-bit integer
+    /// Unsigned 16-bit integer (`DT_UINT16`).
     UInt16 = 512,
-    /// Unsigned 32-bit integer
+    /// Unsigned 32-bit integer (`DT_UINT32`).
     UInt32 = 768,
-    /// Signed 64-bit integer
+    /// Signed 64-bit integer (`DT_INT64`).
     Int64 = 1024,
-    /// Unsigned 64-bit integer
+    /// Unsigned 64-bit integer (`DT_UINT64`).
     UInt64 = 1280,
-    /// IEEE 754 16-bit floating point (half precision)
+    /// 16-bit IEEE half-precision float (medrs extension, code 16384).
     Float16 = 16384,
-    /// Brain floating point 16-bit (bfloat16)
+    /// 16-bit brain float (medrs extension, code 16385).
     BFloat16 = 16385,
 }
 
 impl DataType {
-    /// Parse from `NIfTI` datatype code.
+    /// Parse a `NIfTI` datatype code.
     pub fn from_code(code: i16) -> Result<Self> {
-        match code {
-            2 => Ok(Self::UInt8),
-            4 => Ok(Self::Int16),
-            8 => Ok(Self::Int32),
-            16 => Ok(Self::Float32),
-            64 => Ok(Self::Float64),
-            256 => Ok(Self::Int8),
-            512 => Ok(Self::UInt16),
-            768 => Ok(Self::UInt32),
-            1024 => Ok(Self::Int64),
-            1280 => Ok(Self::UInt64),
-            16384 => Ok(Self::Float16),
-            16385 => Ok(Self::BFloat16),
-            _ => Err(Error::UnsupportedDataType(code)),
-        }
+        Ok(match code {
+            2 => Self::UInt8,
+            4 => Self::Int16,
+            8 => Self::Int32,
+            16 => Self::Float32,
+            64 => Self::Float64,
+            256 => Self::Int8,
+            512 => Self::UInt16,
+            768 => Self::UInt32,
+            1024 => Self::Int64,
+            1280 => Self::UInt64,
+            16384 => Self::Float16,
+            16385 => Self::BFloat16,
+            _ => return Err(Error::UnsupportedDataType(code)),
+        })
     }
 
-    /// Size of each element in bytes.
+    /// The `NIfTI` datatype code.
+    pub const fn code(self) -> i16 {
+        self as i16
+    }
+
+    /// Size of one element in bytes.
     pub const fn byte_size(self) -> usize {
         match self {
             Self::UInt8 | Self::Int8 => 1,
@@ -167,12 +106,20 @@ impl DataType {
         }
     }
 
-    /// Size of each element in bytes (alias for consistency).
-    pub const fn size(self) -> usize {
-        self.byte_size()
+    /// Whether this is a floating-point type.
+    pub const fn is_float(self) -> bool {
+        matches!(
+            self,
+            Self::Float16 | Self::BFloat16 | Self::Float32 | Self::Float64
+        )
     }
 
-    /// Get the Rust type name for documentation.
+    /// Whether this is an integer type.
+    pub const fn is_integer(self) -> bool {
+        !self.is_float()
+    }
+
+    /// Short Rust-style name (`u8`, `f32`, ...).
     pub const fn type_name(self) -> &'static str {
         match self {
             Self::UInt8 => "u8",
@@ -189,11 +136,29 @@ impl DataType {
             Self::Float64 => "f64",
         }
     }
+
+    /// NumPy-style name (`uint8`, `float32`, ...).
+    pub const fn numpy_name(self) -> &'static str {
+        match self {
+            Self::UInt8 => "uint8",
+            Self::Int8 => "int8",
+            Self::Int16 => "int16",
+            Self::UInt16 => "uint16",
+            Self::Int32 => "int32",
+            Self::UInt32 => "uint32",
+            Self::Int64 => "int64",
+            Self::UInt64 => "uint64",
+            Self::Float16 => "float16",
+            Self::BFloat16 => "bfloat16",
+            Self::Float32 => "float32",
+            Self::Float64 => "float64",
+        }
+    }
 }
 
 impl std::fmt::Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.type_name())
+        f.write_str(self.type_name())
     }
 }
 
@@ -201,43 +166,61 @@ impl std::str::FromStr for DataType {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self> {
-        match s.to_lowercase().as_str() {
-            "u8" | "uint8" => Ok(Self::UInt8),
-            "i8" | "int8" => Ok(Self::Int8),
-            "i16" | "int16" => Ok(Self::Int16),
-            "u16" | "uint16" => Ok(Self::UInt16),
-            "i32" | "int32" => Ok(Self::Int32),
-            "u32" | "uint32" => Ok(Self::UInt32),
-            "i64" | "int64" => Ok(Self::Int64),
-            "u64" | "uint64" => Ok(Self::UInt64),
-            "f16" | "float16" => Ok(Self::Float16),
-            "bf16" | "bfloat16" => Ok(Self::BFloat16),
-            "f32" | "float32" => Ok(Self::Float32),
-            "f64" | "float64" => Ok(Self::Float64),
-            _ => Err(Error::Configuration(format!(
-                "unknown data type: '{}' (expected u8, i16, f32, etc.)",
-                s
-            ))),
-        }
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "u8" | "uint8" => Self::UInt8,
+            "i8" | "int8" => Self::Int8,
+            "i16" | "int16" => Self::Int16,
+            "u16" | "uint16" => Self::UInt16,
+            "i32" | "int32" => Self::Int32,
+            "u32" | "uint32" => Self::UInt32,
+            "i64" | "int64" => Self::Int64,
+            "u64" | "uint64" => Self::UInt64,
+            "f16" | "float16" | "half" => Self::Float16,
+            "bf16" | "bfloat16" => Self::BFloat16,
+            "f32" | "float32" | "float" => Self::Float32,
+            "f64" | "float64" | "double" => Self::Float64,
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "unknown data type '{s}' (expected one of uint8, int8, int16, uint16, \
+                     int32, uint32, int64, uint64, float16, bfloat16, float32, float64)"
+                )))
+            }
+        })
     }
 }
 
-/// Spatial units for voxel dimensions.
+/// Describe a datatype code medrs cannot load, for error messages.
+pub(crate) fn describe_unsupported_code(code: i16) -> &'static str {
+    match code {
+        0 => "DT_UNKNOWN",
+        1 => "DT_BINARY",
+        32 => "DT_COMPLEX64",
+        128 => "DT_RGB24",
+        1536 => "DT_FLOAT128",
+        1792 => "DT_COMPLEX128",
+        2048 => "DT_COMPLEX256",
+        2304 => "DT_RGBA32",
+        _ => "an unknown code",
+    }
+}
+
+/// Spatial units of the voxel sizes (low 3 bits of `xyzt_units`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum SpatialUnits {
+    /// Units not specified.
     #[default]
-    /// Units are not specified.
     Unknown,
-    /// Voxel dimensions expressed in meters.
+    /// Meters.
     Meter,
-    /// Voxel dimensions expressed in millimeters.
+    /// Millimeters.
     Millimeter,
-    /// Voxel dimensions expressed in micrometers.
+    /// Micrometers.
     Micrometer,
 }
 
 impl SpatialUnits {
-    fn from_code(code: u8) -> Self {
+    const fn from_code(code: u8) -> Self {
         match code & 0x07 {
             1 => Self::Meter,
             2 => Self::Millimeter,
@@ -246,7 +229,7 @@ impl SpatialUnits {
         }
     }
 
-    fn to_code(self) -> u8 {
+    const fn to_code(self) -> u8 {
         match self {
             Self::Unknown => 0,
             Self::Meter => 1,
@@ -256,87 +239,160 @@ impl SpatialUnits {
     }
 }
 
-/// Temporal units for time dimensions.
+/// Temporal units (bits 3..=5 of `xyzt_units`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
 pub enum TemporalUnits {
+    /// Units not specified.
     #[default]
-    /// Temporal spacing unspecified.
     Unknown,
-    /// Temporal spacing in seconds.
+    /// Seconds.
     Second,
-    /// Temporal spacing in milliseconds.
+    /// Milliseconds.
     Millisecond,
-    /// Temporal spacing in microseconds.
+    /// Microseconds.
     Microsecond,
+    /// Hertz.
+    Hertz,
+    /// Parts per million.
+    Ppm,
+    /// Radians per second.
+    RadPerSecond,
 }
 
 impl TemporalUnits {
-    fn from_code(code: u8) -> Self {
+    const fn from_code(code: u8) -> Self {
         match code & 0x38 {
             0x08 => Self::Second,
             0x10 => Self::Millisecond,
             0x18 => Self::Microsecond,
+            0x20 => Self::Hertz,
+            0x28 => Self::Ppm,
+            0x30 => Self::RadPerSecond,
             _ => Self::Unknown,
         }
     }
 
-    fn to_code(self) -> u8 {
+    const fn to_code(self) -> u8 {
         match self {
             Self::Unknown => 0,
             Self::Second => 0x08,
             Self::Millisecond => 0x10,
             Self::Microsecond => 0x18,
+            Self::Hertz => 0x20,
+            Self::Ppm => 0x28,
+            Self::RadPerSecond => 0x30,
         }
     }
 }
 
-/// Unified NIfTI header supporting both NIfTI-1 and NIfTI-2 formats.
+/// A `NIfTI` header extension: an opaque payload tagged with an `ecode`
+/// (for example 4 = AFNI, 6 = comment, 32 = CIFTI).
 ///
-/// Internally uses 64-bit dimensions and f64 precision to accommodate NIfTI-2.
-/// When writing NIfTI-1, values are downcast (with validation that they fit).
-#[derive(Debug, Clone)]
+/// Extensions are preserved verbatim through load and save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NiftiExtension {
+    /// Extension code identifying the payload format.
+    pub ecode: i32,
+    /// Raw payload bytes (any trailing zero padding from the file is kept).
+    pub data: Vec<u8>,
+}
+
+impl NiftiExtension {
+    /// Create an extension from a code and payload.
+    pub fn new(ecode: i32, data: impl Into<Vec<u8>>) -> Self {
+        Self {
+            ecode,
+            data: data.into(),
+        }
+    }
+
+    /// On-disk size including the 8-byte `esize`/`ecode` prefix, padded to 16.
+    pub fn encoded_size(&self) -> usize {
+        (self.data.len() + 8).div_ceil(16) * 16
+    }
+}
+
+/// On-disk layout of a `NIfTI` dataset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FileLayout {
+    /// Header, extensions, and voxels in one file (`.nii`, magic `n+1`/`n+2`).
+    Single,
+    /// Header (and extensions) in `.hdr`, voxels in `.img` (magic `ni1`/`ni2`).
+    Pair,
+}
+
+/// A complete `NIfTI` header.
+///
+/// Internally every field is stored at NIfTI-2 width (64-bit dimensions and
+/// floats); NIfTI-1 files are widened on load and narrowed on save. A NIfTI-1
+/// header whose dimensions no longer fit in 16 bits is written as NIfTI-2.
+#[derive(Debug, Clone, PartialEq)]
 pub struct NiftiHeader {
-    /// NIfTI format version.
+    /// Format version used when this header was read (and preferred on save).
     pub version: NiftiVersion,
-    /// Number of dimensions (1-7).
+    /// Number of dimensions (1..=7).
     pub ndim: u8,
-    /// Size along each dimension (64-bit for NIfTI-2 compatibility).
+    /// Size along each dimension (`dim[1..=7]` in the file).
     pub dim: [i64; 7],
-    /// Data type.
+    /// Voxel datatype.
     pub datatype: DataType,
-    /// Voxel sizes (pixdim[1..=ndim]) and qfac at index 0 (f64 for NIfTI-2).
+    /// `pixdim[0]` is `qfac` (±1); `pixdim[1..=7]` are the grid spacings.
     pub pixdim: [f64; 8],
-    /// Data offset in file (i64 for NIfTI-2).
+    /// Byte offset of the voxel data. Recomputed on save.
     pub vox_offset: i64,
-    /// Data scaling slope (f64 for NIfTI-2).
+    /// Data scaling slope (`0` means "no scaling", as in the standard).
     pub scl_slope: f64,
-    /// Data scaling intercept (f64 for NIfTI-2).
+    /// Data scaling intercept.
     pub scl_inter: f64,
     /// Spatial units.
     pub spatial_units: SpatialUnits,
     /// Temporal units.
     pub temporal_units: TemporalUnits,
-    /// Intent code (i32 for NIfTI-2).
+    /// Statistical or other intent code.
     pub intent_code: i32,
-    /// Description string.
+    /// Intent parameters `intent_p1..=intent_p3`.
+    pub intent_p: [f64; 3],
+    /// Intent name (up to 16 bytes).
+    pub intent_name: String,
+    /// MRI slice ordering: frequency, phase, and slice dimensions packed in 2-bit fields.
+    pub dim_info: u8,
+    /// Slice timing order code.
+    pub slice_code: u8,
+    /// First slice index.
+    pub slice_start: i64,
+    /// Last slice index.
+    pub slice_end: i64,
+    /// Time taken to acquire one slice.
+    pub slice_duration: f64,
+    /// Time axis offset.
+    pub toffset: f64,
+    /// Display range maximum.
+    pub cal_max: f64,
+    /// Display range minimum.
+    pub cal_min: f64,
+    /// Free-form description (up to 80 bytes).
     pub descrip: String,
-    /// Auxiliary filename.
+    /// Auxiliary filename (up to 24 bytes).
     pub aux_file: String,
-    /// qform transform code (i32 for NIfTI-2).
+    /// qform transform code (`NIFTI_XFORM_*`).
     pub qform_code: i32,
-    /// sform transform code (i32 for NIfTI-2).
+    /// sform transform code (`NIFTI_XFORM_*`).
     pub sform_code: i32,
-    /// Quaternion parameters for qform (f64 for NIfTI-2).
+    /// qform quaternion parameters `b`, `c`, `d`.
     pub quatern: [f64; 3],
-    /// Offset parameters for qform (f64 for NIfTI-2).
+    /// qform translation.
     pub qoffset: [f64; 3],
-    /// First row of the sform affine matrix (f64 for NIfTI-2).
+    /// First row of the sform matrix.
     pub srow_x: [f64; 4],
-    /// Second row of the sform affine matrix (f64 for NIfTI-2).
+    /// Second row of the sform matrix.
     pub srow_y: [f64; 4],
-    /// Third row of the sform affine matrix (f64 for NIfTI-2).
+    /// Third row of the sform matrix.
     pub srow_z: [f64; 4],
-    /// File endianness (true = little endian).
+    /// Header extensions, preserved verbatim.
+    pub extensions: Vec<NiftiExtension>,
+    /// Byte order of the file this header was read from (writes are always
+    /// little-endian).
     pub(crate) little_endian: bool,
 }
 
@@ -345,7 +401,7 @@ impl Default for NiftiHeader {
         Self {
             version: NiftiVersion::Nifti1,
             ndim: 3,
-            dim: [1, 1, 1, 1, 1, 1, 1],
+            dim: [1; 7],
             datatype: DataType::Float32,
             pixdim: [1.0; 8],
             vox_offset: 352,
@@ -354,1060 +410,1504 @@ impl Default for NiftiHeader {
             spatial_units: SpatialUnits::Millimeter,
             temporal_units: TemporalUnits::Unknown,
             intent_code: 0,
+            intent_p: [0.0; 3],
+            intent_name: String::new(),
+            dim_info: 0,
+            slice_code: 0,
+            slice_start: 0,
+            slice_end: 0,
+            slice_duration: 0.0,
+            toffset: 0.0,
+            cal_max: 0.0,
+            cal_min: 0.0,
             descrip: String::new(),
             aux_file: String::new(),
-            qform_code: 0,
+            qform_code: 1,
             sform_code: 1,
             quatern: [0.0; 3],
             qoffset: [0.0; 3],
             srow_x: [1.0, 0.0, 0.0, 0.0],
             srow_y: [0.0, 1.0, 0.0, 0.0],
             srow_z: [0.0, 0.0, 1.0, 0.0],
+            extensions: Vec::new(),
             little_endian: true,
         }
     }
 }
 
-impl NiftiHeader {
-    /// Size of NIfTI-1 header in bytes.
-    pub const SIZE: usize = 348;
+/// NIfTI-1 field offsets.
+mod v1 {
+    pub const DIM_INFO: usize = 39;
+    pub const DIM: usize = 40;
+    pub const INTENT_P1: usize = 56;
+    pub const INTENT_CODE: usize = 68;
+    pub const DATATYPE: usize = 70;
+    pub const BITPIX: usize = 72;
+    pub const SLICE_START: usize = 74;
+    pub const PIXDIM: usize = 76;
+    pub const VOX_OFFSET: usize = 108;
+    pub const SCL_SLOPE: usize = 112;
+    pub const SCL_INTER: usize = 116;
+    pub const SLICE_END: usize = 120;
+    pub const SLICE_CODE: usize = 122;
+    pub const XYZT_UNITS: usize = 123;
+    pub const CAL_MAX: usize = 124;
+    pub const CAL_MIN: usize = 128;
+    pub const SLICE_DURATION: usize = 132;
+    pub const TOFFSET: usize = 136;
+    pub const DESCRIP: usize = 148;
+    pub const AUX_FILE: usize = 228;
+    pub const QFORM_CODE: usize = 252;
+    pub const SFORM_CODE: usize = 254;
+    pub const QUATERN_B: usize = 256;
+    pub const QOFFSET_X: usize = 268;
+    pub const SROW_X: usize = 280;
+    pub const INTENT_NAME: usize = 328;
+    pub const MAGIC: usize = 344;
+}
 
-    /// Size of NIfTI-2 header in bytes.
+/// NIfTI-2 field offsets.
+mod v2 {
+    pub const MAGIC: usize = 4;
+    pub const DATATYPE: usize = 12;
+    pub const BITPIX: usize = 14;
+    pub const DIM: usize = 16;
+    pub const INTENT_P1: usize = 80;
+    pub const PIXDIM: usize = 104;
+    pub const VOX_OFFSET: usize = 168;
+    pub const SCL_SLOPE: usize = 176;
+    pub const SCL_INTER: usize = 184;
+    pub const CAL_MAX: usize = 192;
+    pub const CAL_MIN: usize = 200;
+    pub const SLICE_DURATION: usize = 208;
+    pub const TOFFSET: usize = 216;
+    pub const SLICE_START: usize = 224;
+    pub const SLICE_END: usize = 232;
+    pub const DESCRIP: usize = 240;
+    pub const AUX_FILE: usize = 320;
+    pub const QFORM_CODE: usize = 344;
+    pub const SFORM_CODE: usize = 348;
+    pub const QUATERN_B: usize = 352;
+    pub const QOFFSET_X: usize = 376;
+    pub const SROW_X: usize = 400;
+    pub const SLICE_CODE: usize = 496;
+    pub const XYZT_UNITS: usize = 500;
+    pub const INTENT_CODE: usize = 504;
+    pub const INTENT_NAME: usize = 508;
+    pub const DIM_INFO: usize = 524;
+}
+
+const MAGIC_N1: &[u8; 4] = b"n+1\0";
+const MAGIC_NI1: &[u8; 4] = b"ni1\0";
+const MAGIC_N2: &[u8; 8] = b"n+2\0\r\n\x1a\n";
+const MAGIC_NI2: &[u8; 8] = b"ni2\0\r\n\x1a\n";
+
+/// Largest total size accepted for the extension block, as a sanity bound on
+/// attacker-controlled `vox_offset` values.
+const MAX_EXTENSION_BYTES: usize = 256 * 1024 * 1024;
+
+/// Read a NUL-terminated fixed-width string field.
+fn read_str(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// Write a string into a fixed-width field, truncating on a UTF-8 boundary.
+fn write_str(dst: &mut [u8], s: &str) {
+    let mut len = s.len().min(dst.len());
+    while len > 0 && !s.is_char_boundary(len) {
+        len -= 1;
+    }
+    dst[..len].copy_from_slice(&s.as_bytes()[..len]);
+}
+
+/// Detect version, byte order, and layout from the start of a header.
+pub(crate) fn sniff(bytes: &[u8]) -> Result<(NiftiVersion, bool)> {
+    if bytes.len() < 4 {
+        return Err(Error::InvalidFileFormat(
+            "file too short to contain a NIfTI header".into(),
+        ));
+    }
+    let le = LittleEndian::read_i32(&bytes[0..4]);
+    let be = BigEndian::read_i32(&bytes[0..4]);
+    match (le, be) {
+        (348, _) => Ok((NiftiVersion::Nifti1, true)),
+        (_, 348) => Ok((NiftiVersion::Nifti1, false)),
+        (540, _) => Ok((NiftiVersion::Nifti2, true)),
+        (_, 540) => Ok((NiftiVersion::Nifti2, false)),
+        _ => {
+            if bytes.starts_with(&[0x1f, 0x8b]) {
+                return Err(Error::InvalidFileFormat(
+                    "file is gzip-compressed but was read as uncompressed NIfTI".into(),
+                ));
+            }
+            Err(Error::InvalidMagic([
+                bytes[0], bytes[1], bytes[2], bytes[3],
+            ]))
+        }
+    }
+}
+
+impl NiftiHeader {
+    /// Size of a NIfTI-1 header in bytes.
+    pub const SIZE_V1: usize = 348;
+    /// Size of a NIfTI-2 header in bytes.
     pub const SIZE_V2: usize = 540;
 
-    /// Returns the header size for this header's version.
+    /// Size of the fixed header for this header's version.
     pub fn header_size(&self) -> usize {
         self.version.header_size()
     }
 
-    /// Read header from bytes with automatic version and endianness detection.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < 4 {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "header too short to detect version",
-            )));
-        }
-
-        // Detect version and endianness from sizeof_hdr field
-        let sizeof_hdr_le = LittleEndian::read_i32(&bytes[0..4]);
-        let sizeof_hdr_be = BigEndian::read_i32(&bytes[0..4]);
-
-        let (version, little_endian) = if sizeof_hdr_le == 348 {
-            (NiftiVersion::Nifti1, true)
-        } else if sizeof_hdr_be == 348 {
-            (NiftiVersion::Nifti1, false)
-        } else if sizeof_hdr_le == 540 {
-            (NiftiVersion::Nifti2, true)
-        } else if sizeof_hdr_be == 540 {
-            (NiftiVersion::Nifti2, false)
-        } else {
-            return Err(Error::InvalidMagic([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            ]));
-        };
-
-        let required_size = version.header_size();
-        if bytes.len() < required_size {
-            return Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "header too short: got {} bytes, need {} for {:?}",
-                    bytes.len(),
-                    required_size,
-                    version
-                ),
-            )));
-        }
-
-        match (version, little_endian) {
-            (NiftiVersion::Nifti1, true) => Self::parse_v1::<LittleEndian>(bytes, true),
-            (NiftiVersion::Nifti1, false) => Self::parse_v1::<BigEndian>(bytes, false),
-            (NiftiVersion::Nifti2, true) => Self::parse_v2::<LittleEndian>(bytes, true),
-            (NiftiVersion::Nifti2, false) => Self::parse_v2::<BigEndian>(bytes, false),
-        }
-    }
-
-    /// Parse NIfTI-1 header.
-    #[allow(clippy::wildcard_imports)]
-    fn parse_v1<E: ByteOrder>(bytes: &[u8], little_endian: bool) -> Result<Self> {
-        use offsets_v1::*;
-
-        // Validate magic
-        let magic = &bytes[MAGIC..MAGIC + 4];
-        if magic != b"n+1\0" && magic != b"ni1\0" {
-            return Err(Error::InvalidMagic([
-                magic[0], magic[1], magic[2], magic[3],
-            ]));
-        }
-
-        let ndim_raw = E::read_i16(&bytes[DIM..DIM + 2]);
-        if !(1..=7).contains(&ndim_raw) {
-            return Err(Error::InvalidDimensions(format!(
-                "ndim must be 1..=7, got {}",
-                ndim_raw
-            )));
-        }
-        let ndim = ndim_raw as u8;
-
-        let mut dim = [0i64; 7];
-        for (i, dim_val) in dim.iter_mut().enumerate() {
-            let offset = DIM + 2 + i * 2;
-            let dim_raw = E::read_i16(&bytes[offset..offset + 2]);
-            if dim_raw < 0 {
-                return Err(Error::InvalidDimensions(format!(
-                    "dimension {} has negative value: {}",
-                    i, dim_raw
-                )));
-            }
-            *dim_val = dim_raw as i64;
-        }
-
-        let datatype = DataType::from_code(E::read_i16(&bytes[DATATYPE..DATATYPE + 2]))?;
-        let bitpix = E::read_i16(&bytes[BITPIX..BITPIX + 2]);
-        let expected_bitpix = (datatype.byte_size() * 8) as i16;
-        if bitpix != expected_bitpix {
-            return Err(Error::InvalidDimensions(format!(
-                "bitpix {} does not match datatype {} (expected {})",
-                bitpix,
-                datatype.type_name(),
-                expected_bitpix
-            )));
-        }
-
-        let mut pixdim = [0.0f64; 8];
-        for (i, pix_val) in pixdim.iter_mut().enumerate() {
-            let offset = PIXDIM + i * 4;
-            *pix_val = E::read_f32(&bytes[offset..offset + 4]) as f64;
-        }
-
-        let xyzt_units = bytes[XYZT_UNITS];
-
-        let descrip = String::from_utf8_lossy(&bytes[DESCRIP..AUX_FILE])
-            .trim_end_matches('\0')
-            .to_string();
-        let aux_file = String::from_utf8_lossy(&bytes[AUX_FILE..QFORM_CODE])
-            .trim_end_matches('\0')
-            .to_string();
-
-        let vox_offset_raw = E::read_f32(&bytes[VOX_OFFSET..VOX_OFFSET + 4]);
-        if !vox_offset_raw.is_finite() {
-            return Err(Error::InvalidDimensions(format!(
-                "vox_offset must be finite, got {}",
-                vox_offset_raw
-            )));
-        }
-        if vox_offset_raw.fract() != 0.0 {
-            return Err(Error::InvalidDimensions(format!(
-                "vox_offset must be an integer, got {}",
-                vox_offset_raw
-            )));
-        }
-
-        let header = Self {
-            version: NiftiVersion::Nifti1,
-            ndim,
-            dim,
-            datatype,
-            pixdim,
-            vox_offset: vox_offset_raw as i64,
-            scl_slope: E::read_f32(&bytes[SCL_SLOPE..SCL_SLOPE + 4]) as f64,
-            scl_inter: E::read_f32(&bytes[SCL_INTER..SCL_INTER + 4]) as f64,
-            spatial_units: SpatialUnits::from_code(xyzt_units),
-            temporal_units: TemporalUnits::from_code(xyzt_units),
-            intent_code: E::read_i16(&bytes[INTENT_CODE..INTENT_CODE + 2]) as i32,
-            descrip,
-            aux_file,
-            qform_code: E::read_i16(&bytes[QFORM_CODE..QFORM_CODE + 2]) as i32,
-            sform_code: E::read_i16(&bytes[SFORM_CODE..SFORM_CODE + 2]) as i32,
-            quatern: [
-                E::read_f32(&bytes[QUATERN_B..QUATERN_B + 4]) as f64,
-                E::read_f32(&bytes[QUATERN_C..QUATERN_C + 4]) as f64,
-                E::read_f32(&bytes[QUATERN_D..QUATERN_D + 4]) as f64,
-            ],
-            qoffset: [
-                E::read_f32(&bytes[QOFFSET_X..QOFFSET_X + 4]) as f64,
-                E::read_f32(&bytes[QOFFSET_Y..QOFFSET_Y + 4]) as f64,
-                E::read_f32(&bytes[QOFFSET_Z..QOFFSET_Z + 4]) as f64,
-            ],
-            srow_x: [
-                E::read_f32(&bytes[SROW_X..SROW_X + 4]) as f64,
-                E::read_f32(&bytes[SROW_X + 4..SROW_X + 8]) as f64,
-                E::read_f32(&bytes[SROW_X + 8..SROW_X + 12]) as f64,
-                E::read_f32(&bytes[SROW_X + 12..SROW_X + 16]) as f64,
-            ],
-            srow_y: [
-                E::read_f32(&bytes[SROW_Y..SROW_Y + 4]) as f64,
-                E::read_f32(&bytes[SROW_Y + 4..SROW_Y + 8]) as f64,
-                E::read_f32(&bytes[SROW_Y + 8..SROW_Y + 12]) as f64,
-                E::read_f32(&bytes[SROW_Y + 12..SROW_Y + 16]) as f64,
-            ],
-            srow_z: [
-                E::read_f32(&bytes[SROW_Z..SROW_Z + 4]) as f64,
-                E::read_f32(&bytes[SROW_Z + 4..SROW_Z + 8]) as f64,
-                E::read_f32(&bytes[SROW_Z + 8..SROW_Z + 12]) as f64,
-                E::read_f32(&bytes[SROW_Z + 12..SROW_Z + 16]) as f64,
-            ],
-            little_endian,
-        };
-
-        header.validate()?;
-        Ok(header)
-    }
-
-    /// Parse NIfTI-2 header.
-    #[allow(clippy::wildcard_imports)]
-    fn parse_v2<E: ByteOrder>(bytes: &[u8], little_endian: bool) -> Result<Self> {
-        use offsets_v2::*;
-
-        // Validate magic (at offset 4 in NIfTI-2)
-        let magic = &bytes[MAGIC..MAGIC + 8];
-        if magic != b"n+2\0\r\n\x1a\n" && magic != b"ni2\0\r\n\x1a\n" {
-            return Err(Error::InvalidMagic([
-                magic[0], magic[1], magic[2], magic[3],
-            ]));
-        }
-
-        // dim[0] is ndim, stored as i64 at offset 16
-        let ndim_raw = E::read_i64(&bytes[DIM..DIM + 8]);
-        if !(1..=7).contains(&ndim_raw) {
-            return Err(Error::InvalidDimensions(format!(
-                "ndim must be 1..=7, got {}",
-                ndim_raw
-            )));
-        }
-        let ndim = ndim_raw as u8;
-
-        let mut dim = [0i64; 7];
-        for (i, dim_val) in dim.iter_mut().enumerate() {
-            let offset = DIM + 8 + i * 8;
-            *dim_val = E::read_i64(&bytes[offset..offset + 8]);
-            if *dim_val < 0 {
-                return Err(Error::InvalidDimensions(format!(
-                    "dimension {} has negative value: {}",
-                    i, *dim_val
-                )));
-            }
-        }
-
-        let datatype = DataType::from_code(E::read_i16(&bytes[DATATYPE..DATATYPE + 2]))?;
-        let bitpix = E::read_i16(&bytes[BITPIX..BITPIX + 2]);
-        let expected_bitpix = (datatype.byte_size() * 8) as i16;
-        if bitpix != expected_bitpix {
-            return Err(Error::InvalidDimensions(format!(
-                "bitpix {} does not match datatype {} (expected {})",
-                bitpix,
-                datatype.type_name(),
-                expected_bitpix
-            )));
-        }
-
-        let mut pixdim = [0.0f64; 8];
-        for (i, pix_val) in pixdim.iter_mut().enumerate() {
-            let offset = PIXDIM + i * 8;
-            *pix_val = E::read_f64(&bytes[offset..offset + 8]);
-        }
-
-        let xyzt_units_raw = E::read_i32(&bytes[XYZT_UNITS..XYZT_UNITS + 4]);
-        let xyzt_units = xyzt_units_raw as u8;
-
-        let descrip = String::from_utf8_lossy(&bytes[DESCRIP..DESCRIP + 80])
-            .trim_end_matches('\0')
-            .to_string();
-        let aux_file = String::from_utf8_lossy(&bytes[AUX_FILE..AUX_FILE + 24])
-            .trim_end_matches('\0')
-            .to_string();
-
-        let header = Self {
-            version: NiftiVersion::Nifti2,
-            ndim,
-            dim,
-            datatype,
-            pixdim,
-            vox_offset: E::read_i64(&bytes[VOX_OFFSET..VOX_OFFSET + 8]),
-            scl_slope: E::read_f64(&bytes[SCL_SLOPE..SCL_SLOPE + 8]),
-            scl_inter: E::read_f64(&bytes[SCL_INTER..SCL_INTER + 8]),
-            spatial_units: SpatialUnits::from_code(xyzt_units),
-            temporal_units: TemporalUnits::from_code(xyzt_units),
-            intent_code: E::read_i32(&bytes[INTENT_CODE..INTENT_CODE + 4]),
-            descrip,
-            aux_file,
-            qform_code: E::read_i32(&bytes[QFORM_CODE..QFORM_CODE + 4]),
-            sform_code: E::read_i32(&bytes[SFORM_CODE..SFORM_CODE + 4]),
-            quatern: [
-                E::read_f64(&bytes[QUATERN_B..QUATERN_B + 8]),
-                E::read_f64(&bytes[QUATERN_C..QUATERN_C + 8]),
-                E::read_f64(&bytes[QUATERN_D..QUATERN_D + 8]),
-            ],
-            qoffset: [
-                E::read_f64(&bytes[QOFFSET_X..QOFFSET_X + 8]),
-                E::read_f64(&bytes[QOFFSET_Y..QOFFSET_Y + 8]),
-                E::read_f64(&bytes[QOFFSET_Z..QOFFSET_Z + 8]),
-            ],
-            srow_x: [
-                E::read_f64(&bytes[SROW_X..SROW_X + 8]),
-                E::read_f64(&bytes[SROW_X + 8..SROW_X + 16]),
-                E::read_f64(&bytes[SROW_X + 16..SROW_X + 24]),
-                E::read_f64(&bytes[SROW_X + 24..SROW_X + 32]),
-            ],
-            srow_y: [
-                E::read_f64(&bytes[SROW_Y..SROW_Y + 8]),
-                E::read_f64(&bytes[SROW_Y + 8..SROW_Y + 16]),
-                E::read_f64(&bytes[SROW_Y + 16..SROW_Y + 24]),
-                E::read_f64(&bytes[SROW_Y + 24..SROW_Y + 32]),
-            ],
-            srow_z: [
-                E::read_f64(&bytes[SROW_Z..SROW_Z + 8]),
-                E::read_f64(&bytes[SROW_Z + 8..SROW_Z + 16]),
-                E::read_f64(&bytes[SROW_Z + 16..SROW_Z + 24]),
-                E::read_f64(&bytes[SROW_Z + 24..SROW_Z + 32]),
-            ],
-            little_endian,
-        };
-
-        header.validate()?;
-        Ok(header)
-    }
-
-    /// Write header to bytes.
+    /// Parse a header (and any extensions contained in `bytes`).
     ///
-    /// Writes NIfTI-1 format by default. Use `to_bytes_v2()` for NIfTI-2.
-    /// Returns an error for a NIfTI-1 header whose dimensions exceed the
-    /// format limit (`i16::MAX`); promote to NIfTI-2 first via
-    /// [`promoted_for_write`](Self::promoted_for_write).
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        match self.version {
-            NiftiVersion::Nifti1 => self.to_bytes_v1(),
-            NiftiVersion::Nifti2 => Ok(self.to_bytes_v2()),
-        }
+    /// `bytes` must start at the beginning of the file. Extensions are parsed
+    /// when present and fully contained in `bytes`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Self::parse(bytes).map(|(header, _)| header)
     }
 
-    /// Returns a copy promoted to NIfTI-2 when the dimensions do not fit
-    /// NIfTI-1. This keeps `save` lossless: a NIfTI-1 header carrying a
-    /// dimension above `i16::MAX` is widened rather than silently truncated.
-    pub fn promoted_for_write(&self) -> Self {
-        if self.version == NiftiVersion::Nifti1 && self.requires_nifti2() {
-            let mut promoted = self.clone();
-            promoted.version = NiftiVersion::Nifti2;
-            let min_offset = NiftiVersion::Nifti2.default_vox_offset();
-            if promoted.vox_offset < min_offset {
-                promoted.vox_offset = min_offset;
+    /// Parse a header, also reporting the file layout implied by its magic.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<(Self, FileLayout)> {
+        let (version, little_endian) = sniff(bytes)?;
+        let size = version.header_size();
+        if bytes.len() < size {
+            return Err(Error::InvalidFileFormat(format!(
+                "header truncated: {} bytes available, {size} required for {version:?}",
+                bytes.len()
+            )));
+        }
+        let (mut header, layout) = match (version, little_endian) {
+            (NiftiVersion::Nifti1, true) => Self::parse_v1::<LittleEndian>(bytes)?,
+            (NiftiVersion::Nifti1, false) => Self::parse_v1::<BigEndian>(bytes)?,
+            (NiftiVersion::Nifti2, true) => Self::parse_v2::<LittleEndian>(bytes)?,
+            (NiftiVersion::Nifti2, false) => Self::parse_v2::<BigEndian>(bytes)?,
+        };
+        header.little_endian = little_endian;
+        header.normalize_vox_offset(layout)?;
+        header.validate()?;
+        header.extensions = parse_extensions(bytes, &header, layout);
+        Ok((header, layout))
+    }
+
+    fn parse_v1<E: ByteOrder>(b: &[u8]) -> Result<(Self, FileLayout)> {
+        use v1::{
+            AUX_FILE, CAL_MAX, CAL_MIN, DATATYPE, DESCRIP, DIM, DIM_INFO, INTENT_CODE, INTENT_NAME,
+            INTENT_P1, MAGIC, PIXDIM, QFORM_CODE, QOFFSET_X, QUATERN_B, SCL_INTER, SCL_SLOPE,
+            SFORM_CODE, SLICE_CODE, SLICE_DURATION, SLICE_END, SLICE_START, SROW_X, TOFFSET,
+            VOX_OFFSET, XYZT_UNITS,
+        };
+        let layout = match &b[MAGIC..MAGIC + 4] {
+            m if m == MAGIC_N1 => FileLayout::Single,
+            m if m == MAGIC_NI1 => FileLayout::Pair,
+            m => return Err(bad_magic(m)),
+        };
+
+        let i16_at = |o: usize| E::read_i16(&b[o..o + 2]);
+        let f32_at = |o: usize| f64::from(E::read_f32(&b[o..o + 4]));
+
+        let ndim = parse_ndim(i64::from(i16_at(DIM)))?;
+        let mut dim = [1i64; 7];
+        for (i, d) in dim.iter_mut().enumerate() {
+            *d = i64::from(i16_at(DIM + 2 + 2 * i));
+        }
+        // bitpix is redundant with datatype; like nibabel, trust datatype.
+        let datatype = parse_datatype(i16_at(DATATYPE))?;
+
+        let mut pixdim = [0.0; 8];
+        for (i, p) in pixdim.iter_mut().enumerate() {
+            *p = f32_at(PIXDIM + 4 * i);
+        }
+
+        let vox_offset = f32_at(VOX_OFFSET);
+        if !vox_offset.is_finite() || vox_offset.fract() != 0.0 || vox_offset < 0.0 {
+            return Err(Error::InvalidFileFormat(format!(
+                "vox_offset must be a non-negative integer, got {vox_offset}"
+            )));
+        }
+
+        let units = b[XYZT_UNITS];
+        let srow =
+            |row: usize| -> [f64; 4] { std::array::from_fn(|j| f32_at(SROW_X + 16 * row + 4 * j)) };
+
+        Ok((
+            Self {
+                version: NiftiVersion::Nifti1,
+                ndim,
+                dim,
+                datatype,
+                pixdim,
+                vox_offset: vox_offset as i64,
+                scl_slope: f32_at(SCL_SLOPE),
+                scl_inter: f32_at(SCL_INTER),
+                spatial_units: SpatialUnits::from_code(units),
+                temporal_units: TemporalUnits::from_code(units),
+                intent_code: i32::from(i16_at(INTENT_CODE)),
+                intent_p: std::array::from_fn(|i| f32_at(INTENT_P1 + 4 * i)),
+                intent_name: read_str(&b[INTENT_NAME..INTENT_NAME + 16]),
+                dim_info: b[DIM_INFO],
+                slice_code: b[SLICE_CODE],
+                slice_start: i64::from(i16_at(SLICE_START)),
+                slice_end: i64::from(i16_at(SLICE_END)),
+                slice_duration: f32_at(SLICE_DURATION),
+                toffset: f32_at(TOFFSET),
+                cal_max: f32_at(CAL_MAX),
+                cal_min: f32_at(CAL_MIN),
+                descrip: read_str(&b[DESCRIP..DESCRIP + 80]),
+                aux_file: read_str(&b[AUX_FILE..AUX_FILE + 24]),
+                qform_code: i32::from(i16_at(QFORM_CODE)),
+                sform_code: i32::from(i16_at(SFORM_CODE)),
+                quatern: std::array::from_fn(|i| f32_at(QUATERN_B + 4 * i)),
+                qoffset: std::array::from_fn(|i| f32_at(QOFFSET_X + 4 * i)),
+                srow_x: srow(0),
+                srow_y: srow(1),
+                srow_z: srow(2),
+                extensions: Vec::new(),
+                little_endian: true,
+            },
+            layout,
+        ))
+    }
+
+    fn parse_v2<E: ByteOrder>(b: &[u8]) -> Result<(Self, FileLayout)> {
+        use v2::{
+            AUX_FILE, CAL_MAX, CAL_MIN, DATATYPE, DESCRIP, DIM, DIM_INFO, INTENT_CODE, INTENT_NAME,
+            INTENT_P1, MAGIC, PIXDIM, QFORM_CODE, QOFFSET_X, QUATERN_B, SCL_INTER, SCL_SLOPE,
+            SFORM_CODE, SLICE_CODE, SLICE_DURATION, SLICE_END, SLICE_START, SROW_X, TOFFSET,
+            VOX_OFFSET, XYZT_UNITS,
+        };
+        let layout = match &b[MAGIC..MAGIC + 8] {
+            m if m == MAGIC_N2 => FileLayout::Single,
+            m if m == MAGIC_NI2 => FileLayout::Pair,
+            m => return Err(bad_magic(m)),
+        };
+
+        let i32_at = |o: usize| E::read_i32(&b[o..o + 4]);
+        let i64_at = |o: usize| E::read_i64(&b[o..o + 8]);
+        let f64_at = |o: usize| E::read_f64(&b[o..o + 8]);
+
+        let ndim = parse_ndim(i64_at(DIM))?;
+        let mut dim = [1i64; 7];
+        for (i, d) in dim.iter_mut().enumerate() {
+            *d = i64_at(DIM + 8 + 8 * i);
+        }
+        // bitpix is redundant with datatype; like nibabel, trust datatype.
+        let datatype = parse_datatype(E::read_i16(&b[DATATYPE..DATATYPE + 2]))?;
+
+        let units = i32_at(XYZT_UNITS) as u8;
+        let srow =
+            |row: usize| -> [f64; 4] { std::array::from_fn(|j| f64_at(SROW_X + 32 * row + 8 * j)) };
+        let vox_offset = i64_at(VOX_OFFSET);
+        if vox_offset < 0 {
+            return Err(Error::InvalidFileFormat(format!(
+                "vox_offset must be non-negative, got {vox_offset}"
+            )));
+        }
+
+        Ok((
+            Self {
+                version: NiftiVersion::Nifti2,
+                ndim,
+                dim,
+                datatype,
+                pixdim: std::array::from_fn(|i| f64_at(PIXDIM + 8 * i)),
+                vox_offset,
+                scl_slope: f64_at(SCL_SLOPE),
+                scl_inter: f64_at(SCL_INTER),
+                spatial_units: SpatialUnits::from_code(units),
+                temporal_units: TemporalUnits::from_code(units),
+                intent_code: i32_at(INTENT_CODE),
+                intent_p: std::array::from_fn(|i| f64_at(INTENT_P1 + 8 * i)),
+                intent_name: read_str(&b[INTENT_NAME..INTENT_NAME + 16]),
+                dim_info: b[DIM_INFO],
+                slice_code: i32_at(SLICE_CODE) as u8,
+                slice_start: i64_at(SLICE_START),
+                slice_end: i64_at(SLICE_END),
+                slice_duration: f64_at(SLICE_DURATION),
+                toffset: f64_at(TOFFSET),
+                cal_max: f64_at(CAL_MAX),
+                cal_min: f64_at(CAL_MIN),
+                descrip: read_str(&b[DESCRIP..DESCRIP + 80]),
+                aux_file: read_str(&b[AUX_FILE..AUX_FILE + 24]),
+                qform_code: i32_at(QFORM_CODE),
+                sform_code: i32_at(SFORM_CODE),
+                quatern: std::array::from_fn(|i| f64_at(QUATERN_B + 8 * i)),
+                qoffset: std::array::from_fn(|i| f64_at(QOFFSET_X + 8 * i)),
+                srow_x: srow(0),
+                srow_y: srow(1),
+                srow_z: srow(2),
+                extensions: Vec::new(),
+                little_endian: true,
+            },
+            layout,
+        ))
+    }
+
+    /// Apply the reference implementation's leniency for `vox_offset`.
+    ///
+    /// A single file must place its voxels after the header; a zero offset
+    /// (written by some old tools) is interpreted as "immediately after the
+    /// header and extension flag".
+    fn normalize_vox_offset(&mut self, layout: FileLayout) -> Result<()> {
+        if layout == FileLayout::Single {
+            let size = self.header_size() as i64;
+            if self.vox_offset == 0 {
+                self.vox_offset = size + 4;
+            } else if self.vox_offset < size {
+                return Err(Error::InvalidFileFormat(format!(
+                    "vox_offset {} lies inside the {size}-byte header",
+                    self.vox_offset
+                )));
             }
-            promoted
-        } else {
-            self.clone()
+        }
+        Ok(())
+    }
+
+    /// Check the invariants required to safely address the voxel data.
+    ///
+    /// Only properties that matter for memory safety and shape consistency are
+    /// enforced; geometry fields (pixdim, quaternions, ...) are accepted as-is
+    /// so that imperfect real-world files still load.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=7).contains(&self.ndim) {
+            return Err(Error::InvalidDimensions(format!(
+                "ndim must be in 1..=7, got {}",
+                self.ndim
+            )));
+        }
+        let mut voxels: usize = 1;
+        for (i, &d) in self.dim[..self.ndim as usize].iter().enumerate() {
+            if d < 1 {
+                return Err(Error::InvalidDimensions(format!(
+                    "dim[{}] must be >= 1, got {d}",
+                    i + 1
+                )));
+            }
+            let d = usize::try_from(d).map_err(|_| {
+                Error::InvalidDimensions(format!("dim[{}] = {d} is too large", i + 1))
+            })?;
+            voxels = voxels
+                .checked_mul(d)
+                .ok_or_else(|| Error::InvalidDimensions("voxel count overflows".into()))?;
+        }
+        let bytes = voxels
+            .checked_mul(self.datatype.byte_size())
+            .ok_or_else(|| Error::InvalidDimensions("data size overflows".into()))?;
+        if self.vox_offset < 0 {
+            return Err(Error::InvalidFileFormat(format!(
+                "vox_offset must be non-negative, got {}",
+                self.vox_offset
+            )));
+        }
+        usize::try_from(self.vox_offset)
+            .ok()
+            .and_then(|o| o.checked_add(bytes))
+            .ok_or_else(|| Error::InvalidDimensions("vox_offset + data size overflows".into()))?;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Serialization
+    // ---------------------------------------------------------------------
+
+    /// Serialize the fixed-size header (348 or 540 bytes, little-endian) as a
+    /// single-file (`n+1` / `n+2`) header with the current `vox_offset`.
+    ///
+    /// Returns an error for a NIfTI-1 header whose dimensions exceed the
+    /// 16-bit limit; [`save`](crate::nifti::save) promotes such headers to
+    /// NIfTI-2 automatically.
+    pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.encode_fixed(FileLayout::Single)
+    }
+
+    /// Whether any field is out of range for NIfTI-1.
+    pub fn requires_nifti2(&self) -> bool {
+        let i16_range = i64::from(i16::MIN)..=i64::from(i16::MAX);
+        self.dim.iter().any(|&d| d > i64::from(i16::MAX))
+            || !i16_range.contains(&self.slice_start)
+            || !i16_range.contains(&self.slice_end)
+            || !i16_range.contains(&i64::from(self.intent_code))
+            || !i16_range.contains(&i64::from(self.qform_code))
+            || !i16_range.contains(&i64::from(self.sform_code))
+    }
+
+    /// Prepare a copy of this header for writing in `layout`: promote to
+    /// NIfTI-2 if required and recompute `vox_offset` from the extensions.
+    pub(crate) fn prepared_for_write(&self, layout: FileLayout) -> Self {
+        let mut h = self.clone();
+        if h.version == NiftiVersion::Nifti1 && h.requires_nifti2() {
+            h.version = NiftiVersion::Nifti2;
+        }
+        h.little_endian = true;
+        h.vox_offset = match layout {
+            FileLayout::Single => {
+                let ext: usize = h.extensions.iter().map(NiftiExtension::encoded_size).sum();
+                (h.header_size() + 4 + ext).div_ceil(16) as i64 * 16
+            }
+            FileLayout::Pair => 0,
+        };
+        h
+    }
+
+    /// Encode header, extension flag, extensions, and padding exactly as they
+    /// appear on disk. The header must come from [`Self::prepared_for_write`].
+    pub(crate) fn encode(&self, layout: FileLayout) -> Result<Vec<u8>> {
+        let mut out = self.encode_fixed(layout)?;
+        let flag = u8::from(!self.extensions.is_empty());
+        out.extend_from_slice(&[flag, 0, 0, 0]);
+        for ext in &self.extensions {
+            let size = ext.encoded_size();
+            let esize = i32::try_from(size).map_err(|_| {
+                Error::InvalidFileFormat(format!("extension of {size} bytes is too large"))
+            })?;
+            out.extend_from_slice(&esize.to_le_bytes());
+            out.extend_from_slice(&ext.ecode.to_le_bytes());
+            out.extend_from_slice(&ext.data);
+            out.resize(out.len() + size - 8 - ext.data.len(), 0);
+        }
+        if layout == FileLayout::Single {
+            let target = usize::try_from(self.vox_offset).unwrap_or(0);
+            if out.len() > target {
+                return Err(Error::InvalidFileFormat(format!(
+                    "header and extensions ({} bytes) exceed vox_offset {target}",
+                    out.len()
+                )));
+            }
+            out.resize(target, 0);
+        }
+        Ok(out)
+    }
+
+    fn encode_fixed(&self, layout: FileLayout) -> Result<Vec<u8>> {
+        match self.version {
+            NiftiVersion::Nifti1 => self.encode_v1(layout),
+            NiftiVersion::Nifti2 => Ok(self.encode_v2(layout)),
         }
     }
 
-    /// Write NIfTI-1 format header.
-    #[allow(clippy::wildcard_imports)]
-    fn to_bytes_v1(&self) -> Result<Vec<u8>> {
-        use offsets_v1::*;
-
+    fn encode_v1(&self, layout: FileLayout) -> Result<Vec<u8>> {
+        use v1::{
+            AUX_FILE, BITPIX, CAL_MAX, CAL_MIN, DATATYPE, DESCRIP, DIM, DIM_INFO, INTENT_CODE,
+            INTENT_NAME, INTENT_P1, MAGIC, PIXDIM, QFORM_CODE, QOFFSET_X, QUATERN_B, SCL_INTER,
+            SCL_SLOPE, SFORM_CODE, SLICE_CODE, SLICE_DURATION, SLICE_END, SLICE_START, SROW_X,
+            TOFFSET, VOX_OFFSET, XYZT_UNITS,
+        };
+        type E = LittleEndian;
         if self.requires_nifti2() {
             return Err(Error::InvalidDimensions(format!(
-                "dimensions {:?} exceed NIfTI-1 limit ({}); use NIfTI-2",
-                self.dim,
-                i16::MAX
+                "header fields exceed NIfTI-1 limits (dims {:?}); write as NIfTI-2",
+                &self.dim[..self.ndim as usize]
             )));
         }
+        let mut b = vec![0u8; Self::SIZE_V1];
+        let put_f32 = |b: &mut [u8], o: usize, v: f64| E::write_f32(&mut b[o..o + 4], v as f32);
 
-        let mut buf = vec![0u8; Self::SIZE];
-
-        LittleEndian::write_i32(&mut buf[SIZEOF_HDR..SIZEOF_HDR + 4], 348);
-
-        // dim
-        LittleEndian::write_i16(&mut buf[DIM..DIM + 2], self.ndim as i16);
+        E::write_i32(&mut b[0..4], Self::SIZE_V1 as i32);
+        b[DIM_INFO] = self.dim_info;
+        E::write_i16(&mut b[DIM..DIM + 2], i16::from(self.ndim));
         for i in 0..7 {
-            let offset = DIM + 2 + i * 2;
-            LittleEndian::write_i16(&mut buf[offset..offset + 2], self.dim[i] as i16);
+            let d = if i < self.ndim as usize {
+                self.dim[i]
+            } else {
+                1
+            };
+            E::write_i16(&mut b[DIM + 2 + 2 * i..DIM + 4 + 2 * i], d as i16);
         }
-
-        // intent_code (downcast from i32 to i16)
-        LittleEndian::write_i16(
-            &mut buf[INTENT_CODE..INTENT_CODE + 2],
+        for (i, &p) in self.intent_p.iter().enumerate() {
+            put_f32(&mut b, INTENT_P1 + 4 * i, p);
+        }
+        E::write_i16(
+            &mut b[INTENT_CODE..INTENT_CODE + 2],
             self.intent_code as i16,
         );
-
-        // datatype and bitpix
-        LittleEndian::write_i16(&mut buf[DATATYPE..DATATYPE + 2], self.datatype as i16);
-        LittleEndian::write_i16(
-            &mut buf[BITPIX..BITPIX + 2],
+        E::write_i16(&mut b[DATATYPE..DATATYPE + 2], self.datatype.code());
+        E::write_i16(
+            &mut b[BITPIX..BITPIX + 2],
             (self.datatype.byte_size() * 8) as i16,
         );
-
-        // pixdim (downcast from f64 to f32)
-        for (i, &value) in self.pixdim.iter().enumerate() {
-            let offset = PIXDIM + i * 4;
-            LittleEndian::write_f32(&mut buf[offset..offset + 4], value as f32);
+        E::write_i16(
+            &mut b[SLICE_START..SLICE_START + 2],
+            self.slice_start as i16,
+        );
+        for (i, &p) in self.pixdim.iter().enumerate() {
+            put_f32(&mut b, PIXDIM + 4 * i, p);
         }
-
-        // vox_offset (downcast from i64 to f32)
-        LittleEndian::write_f32(&mut buf[VOX_OFFSET..VOX_OFFSET + 4], self.vox_offset as f32);
-
-        // scl_slope, scl_inter (downcast from f64 to f32)
-        LittleEndian::write_f32(&mut buf[SCL_SLOPE..SCL_SLOPE + 4], self.scl_slope as f32);
-        LittleEndian::write_f32(&mut buf[SCL_INTER..SCL_INTER + 4], self.scl_inter as f32);
-
-        // xyzt_units
-        buf[XYZT_UNITS] = self.spatial_units.to_code() | self.temporal_units.to_code();
-
-        // descrip (80 bytes)
-        let descrip_bytes = self.descrip.as_bytes();
-        let len = descrip_bytes.len().min(79);
-        buf[DESCRIP..DESCRIP + len].copy_from_slice(&descrip_bytes[..len]);
-
-        // aux_file (24 bytes)
-        let aux_bytes = self.aux_file.as_bytes();
-        let len = aux_bytes.len().min(23);
-        buf[AUX_FILE..AUX_FILE + len].copy_from_slice(&aux_bytes[..len]);
-
-        // qform_code, sform_code (downcast from i32 to i16)
-        LittleEndian::write_i16(&mut buf[QFORM_CODE..QFORM_CODE + 2], self.qform_code as i16);
-        LittleEndian::write_i16(&mut buf[SFORM_CODE..SFORM_CODE + 2], self.sform_code as i16);
-
-        // quatern (downcast from f64 to f32)
-        LittleEndian::write_f32(&mut buf[QUATERN_B..QUATERN_B + 4], self.quatern[0] as f32);
-        LittleEndian::write_f32(&mut buf[QUATERN_C..QUATERN_C + 4], self.quatern[1] as f32);
-        LittleEndian::write_f32(&mut buf[QUATERN_D..QUATERN_D + 4], self.quatern[2] as f32);
-
-        // qoffset (downcast from f64 to f32)
-        LittleEndian::write_f32(&mut buf[QOFFSET_X..QOFFSET_X + 4], self.qoffset[0] as f32);
-        LittleEndian::write_f32(&mut buf[QOFFSET_Y..QOFFSET_Y + 4], self.qoffset[1] as f32);
-        LittleEndian::write_f32(&mut buf[QOFFSET_Z..QOFFSET_Z + 4], self.qoffset[2] as f32);
-
-        // srow (downcast from f64 to f32)
-        for (i, &v) in self.srow_x.iter().enumerate() {
-            let offset = SROW_X + i * 4;
-            LittleEndian::write_f32(&mut buf[offset..offset + 4], v as f32);
+        let vox_offset = match layout {
+            FileLayout::Single => self.vox_offset,
+            FileLayout::Pair => 0,
+        };
+        put_f32(&mut b, VOX_OFFSET, vox_offset as f64);
+        put_f32(&mut b, SCL_SLOPE, self.scl_slope);
+        put_f32(&mut b, SCL_INTER, self.scl_inter);
+        E::write_i16(&mut b[SLICE_END..SLICE_END + 2], self.slice_end as i16);
+        b[SLICE_CODE] = self.slice_code;
+        b[XYZT_UNITS] = self.spatial_units.to_code() | self.temporal_units.to_code();
+        put_f32(&mut b, CAL_MAX, self.cal_max);
+        put_f32(&mut b, CAL_MIN, self.cal_min);
+        put_f32(&mut b, SLICE_DURATION, self.slice_duration);
+        put_f32(&mut b, TOFFSET, self.toffset);
+        write_str(&mut b[DESCRIP..DESCRIP + 80], &self.descrip);
+        write_str(&mut b[AUX_FILE..AUX_FILE + 24], &self.aux_file);
+        E::write_i16(&mut b[QFORM_CODE..QFORM_CODE + 2], self.qform_code as i16);
+        E::write_i16(&mut b[SFORM_CODE..SFORM_CODE + 2], self.sform_code as i16);
+        for i in 0..3 {
+            put_f32(&mut b, QUATERN_B + 4 * i, self.quatern[i]);
+            put_f32(&mut b, QOFFSET_X + 4 * i, self.qoffset[i]);
         }
-        for (i, &v) in self.srow_y.iter().enumerate() {
-            let offset = SROW_Y + i * 4;
-            LittleEndian::write_f32(&mut buf[offset..offset + 4], v as f32);
+        for (row, values) in [self.srow_x, self.srow_y, self.srow_z].iter().enumerate() {
+            for (j, &v) in values.iter().enumerate() {
+                put_f32(&mut b, SROW_X + 16 * row + 4 * j, v);
+            }
         }
-        for (i, &v) in self.srow_z.iter().enumerate() {
-            let offset = SROW_Z + i * 4;
-            LittleEndian::write_f32(&mut buf[offset..offset + 4], v as f32);
-        }
-
-        // magic
-        buf[MAGIC..MAGIC + 4].copy_from_slice(b"n+1\0");
-
-        Ok(buf)
+        write_str(&mut b[INTENT_NAME..INTENT_NAME + 16], &self.intent_name);
+        b[MAGIC..MAGIC + 4].copy_from_slice(match layout {
+            FileLayout::Single => MAGIC_N1,
+            FileLayout::Pair => MAGIC_NI1,
+        });
+        Ok(b)
     }
 
-    /// Write NIfTI-2 format header.
-    #[allow(clippy::wildcard_imports)]
-    pub fn to_bytes_v2(&self) -> Vec<u8> {
-        use offsets_v2::*;
+    fn encode_v2(&self, layout: FileLayout) -> Vec<u8> {
+        use v2::{
+            AUX_FILE, BITPIX, CAL_MAX, CAL_MIN, DATATYPE, DESCRIP, DIM, DIM_INFO, INTENT_CODE,
+            INTENT_NAME, INTENT_P1, MAGIC, PIXDIM, QFORM_CODE, QOFFSET_X, QUATERN_B, SCL_INTER,
+            SCL_SLOPE, SFORM_CODE, SLICE_CODE, SLICE_DURATION, SLICE_END, SLICE_START, SROW_X,
+            TOFFSET, VOX_OFFSET, XYZT_UNITS,
+        };
+        type E = LittleEndian;
+        let mut b = vec![0u8; Self::SIZE_V2];
+        let put_f64 = |b: &mut [u8], o: usize, v: f64| E::write_f64(&mut b[o..o + 8], v);
+        let put_i64 = |b: &mut [u8], o: usize, v: i64| E::write_i64(&mut b[o..o + 8], v);
 
-        let mut buf = vec![0u8; Self::SIZE_V2];
-
-        LittleEndian::write_i32(&mut buf[SIZEOF_HDR..SIZEOF_HDR + 4], 540);
-
-        // magic (8 bytes for NIfTI-2)
-        buf[MAGIC..MAGIC + 8].copy_from_slice(b"n+2\0\r\n\x1a\n");
-
-        // datatype and bitpix
-        LittleEndian::write_i16(&mut buf[DATATYPE..DATATYPE + 2], self.datatype as i16);
-        LittleEndian::write_i16(
-            &mut buf[BITPIX..BITPIX + 2],
+        E::write_i32(&mut b[0..4], Self::SIZE_V2 as i32);
+        b[MAGIC..MAGIC + 8].copy_from_slice(match layout {
+            FileLayout::Single => MAGIC_N2,
+            FileLayout::Pair => MAGIC_NI2,
+        });
+        E::write_i16(&mut b[DATATYPE..DATATYPE + 2], self.datatype.code());
+        E::write_i16(
+            &mut b[BITPIX..BITPIX + 2],
             (self.datatype.byte_size() * 8) as i16,
         );
-
-        // dim (i64 array)
-        LittleEndian::write_i64(&mut buf[DIM..DIM + 8], self.ndim as i64);
+        put_i64(&mut b, DIM, i64::from(self.ndim));
         for i in 0..7 {
-            let offset = DIM + 8 + i * 8;
-            LittleEndian::write_i64(&mut buf[offset..offset + 8], self.dim[i]);
+            let d = if i < self.ndim as usize {
+                self.dim[i]
+            } else {
+                1
+            };
+            put_i64(&mut b, DIM + 8 + 8 * i, d);
         }
-
-        // pixdim (f64 array)
-        for (i, &value) in self.pixdim.iter().enumerate() {
-            let offset = PIXDIM + i * 8;
-            LittleEndian::write_f64(&mut buf[offset..offset + 8], value);
+        for (i, &p) in self.intent_p.iter().enumerate() {
+            put_f64(&mut b, INTENT_P1 + 8 * i, p);
         }
-
-        // vox_offset (i64)
-        LittleEndian::write_i64(&mut buf[VOX_OFFSET..VOX_OFFSET + 8], self.vox_offset);
-
-        // scl_slope, scl_inter (f64)
-        LittleEndian::write_f64(&mut buf[SCL_SLOPE..SCL_SLOPE + 8], self.scl_slope);
-        LittleEndian::write_f64(&mut buf[SCL_INTER..SCL_INTER + 8], self.scl_inter);
-
-        // xyzt_units (i32 in NIfTI-2)
-        let xyzt_code = (self.spatial_units.to_code() | self.temporal_units.to_code()) as i32;
-        LittleEndian::write_i32(&mut buf[XYZT_UNITS..XYZT_UNITS + 4], xyzt_code);
-
-        // descrip (80 bytes)
-        let descrip_bytes = self.descrip.as_bytes();
-        let len = descrip_bytes.len().min(79);
-        buf[DESCRIP..DESCRIP + len].copy_from_slice(&descrip_bytes[..len]);
-
-        // aux_file (24 bytes)
-        let aux_bytes = self.aux_file.as_bytes();
-        let len = aux_bytes.len().min(23);
-        buf[AUX_FILE..AUX_FILE + len].copy_from_slice(&aux_bytes[..len]);
-
-        // qform_code, sform_code (i32)
-        LittleEndian::write_i32(&mut buf[QFORM_CODE..QFORM_CODE + 4], self.qform_code);
-        LittleEndian::write_i32(&mut buf[SFORM_CODE..SFORM_CODE + 4], self.sform_code);
-
-        // quatern (f64)
-        LittleEndian::write_f64(&mut buf[QUATERN_B..QUATERN_B + 8], self.quatern[0]);
-        LittleEndian::write_f64(&mut buf[QUATERN_C..QUATERN_C + 8], self.quatern[1]);
-        LittleEndian::write_f64(&mut buf[QUATERN_D..QUATERN_D + 8], self.quatern[2]);
-
-        // qoffset (f64)
-        LittleEndian::write_f64(&mut buf[QOFFSET_X..QOFFSET_X + 8], self.qoffset[0]);
-        LittleEndian::write_f64(&mut buf[QOFFSET_Y..QOFFSET_Y + 8], self.qoffset[1]);
-        LittleEndian::write_f64(&mut buf[QOFFSET_Z..QOFFSET_Z + 8], self.qoffset[2]);
-
-        // srow (f64 arrays)
-        for (i, &v) in self.srow_x.iter().enumerate() {
-            let offset = SROW_X + i * 8;
-            LittleEndian::write_f64(&mut buf[offset..offset + 8], v);
+        for (i, &p) in self.pixdim.iter().enumerate() {
+            put_f64(&mut b, PIXDIM + 8 * i, p);
         }
-        for (i, &v) in self.srow_y.iter().enumerate() {
-            let offset = SROW_Y + i * 8;
-            LittleEndian::write_f64(&mut buf[offset..offset + 8], v);
+        let vox_offset = match layout {
+            FileLayout::Single => self.vox_offset,
+            FileLayout::Pair => 0,
+        };
+        put_i64(&mut b, VOX_OFFSET, vox_offset);
+        put_f64(&mut b, SCL_SLOPE, self.scl_slope);
+        put_f64(&mut b, SCL_INTER, self.scl_inter);
+        put_f64(&mut b, CAL_MAX, self.cal_max);
+        put_f64(&mut b, CAL_MIN, self.cal_min);
+        put_f64(&mut b, SLICE_DURATION, self.slice_duration);
+        put_f64(&mut b, TOFFSET, self.toffset);
+        put_i64(&mut b, SLICE_START, self.slice_start);
+        put_i64(&mut b, SLICE_END, self.slice_end);
+        write_str(&mut b[DESCRIP..DESCRIP + 80], &self.descrip);
+        write_str(&mut b[AUX_FILE..AUX_FILE + 24], &self.aux_file);
+        E::write_i32(&mut b[QFORM_CODE..QFORM_CODE + 4], self.qform_code);
+        E::write_i32(&mut b[SFORM_CODE..SFORM_CODE + 4], self.sform_code);
+        for i in 0..3 {
+            put_f64(&mut b, QUATERN_B + 8 * i, self.quatern[i]);
+            put_f64(&mut b, QOFFSET_X + 8 * i, self.qoffset[i]);
         }
-        for (i, &v) in self.srow_z.iter().enumerate() {
-            let offset = SROW_Z + i * 8;
-            LittleEndian::write_f64(&mut buf[offset..offset + 8], v);
+        for (row, values) in [self.srow_x, self.srow_y, self.srow_z].iter().enumerate() {
+            for (j, &v) in values.iter().enumerate() {
+                put_f64(&mut b, SROW_X + 32 * row + 8 * j, v);
+            }
         }
-
-        // intent_code (i32)
-        LittleEndian::write_i32(&mut buf[INTENT_CODE..INTENT_CODE + 4], self.intent_code);
-
-        buf
+        E::write_i32(
+            &mut b[SLICE_CODE..SLICE_CODE + 4],
+            i32::from(self.slice_code),
+        );
+        E::write_i32(
+            &mut b[XYZT_UNITS..XYZT_UNITS + 4],
+            i32::from(self.spatial_units.to_code() | self.temporal_units.to_code()),
+        );
+        E::write_i32(&mut b[INTENT_CODE..INTENT_CODE + 4], self.intent_code);
+        write_str(&mut b[INTENT_NAME..INTENT_NAME + 16], &self.intent_name);
+        b[DIM_INFO] = self.dim_info;
+        b
     }
 
-    /// Get the 4x4 affine transformation matrix (sform or qform).
-    /// Returns f32 for API compatibility; use `affine_f64()` for full precision.
-    pub fn affine(&self) -> [[f32; 4]; 4] {
-        let aff64 = self.affine_f64();
+    // ---------------------------------------------------------------------
+    // Shape and scaling
+    // ---------------------------------------------------------------------
+
+    /// Image shape (`dim[1..=ndim]`).
+    pub fn shape(&self) -> Vec<usize> {
+        self.dim[..self.ndim as usize]
+            .iter()
+            .map(|&d| usize::try_from(d).unwrap_or(0))
+            .collect()
+    }
+
+    /// Total number of voxels.
+    pub fn num_voxels(&self) -> usize {
+        self.shape().iter().product()
+    }
+
+    /// Size of the voxel data in bytes.
+    pub fn data_size(&self) -> usize {
+        self.num_voxels() * self.datatype.byte_size()
+    }
+
+    /// Whether the file was stored little-endian.
+    pub fn is_little_endian(&self) -> bool {
+        self.little_endian
+    }
+
+    /// Effective scaling `(slope, intercept)`: a slope of 0 (or a non-finite
+    /// slope) means "no scaling", as specified by the standard.
+    pub fn scaling(&self) -> (f64, f64) {
+        if self.scl_slope == 0.0 || !self.scl_slope.is_finite() {
+            (1.0, 0.0)
+        } else {
+            let inter = if self.scl_inter.is_finite() {
+                self.scl_inter
+            } else {
+                0.0
+            };
+            (self.scl_slope, inter)
+        }
+    }
+
+    /// Whether reading the data applies a non-identity scaling.
+    pub fn has_scaling(&self) -> bool {
+        self.scaling() != (1.0, 0.0)
+    }
+
+    // ---------------------------------------------------------------------
+    // Geometry
+    // ---------------------------------------------------------------------
+
+    /// The voxel-to-world affine used for this image: the sform when
+    /// `sform_code > 0`, else the qform when `qform_code > 0`, else a diagonal
+    /// matrix of the voxel sizes.
+    pub fn affine(&self) -> Affine {
+        if self.sform_code > 0 {
+            self.sform_matrix()
+        } else if self.qform_code > 0 {
+            self.qform_matrix()
+        } else {
+            self.fallback_matrix()
+        }
+    }
+
+    /// The sform matrix, if `sform_code > 0`.
+    pub fn sform(&self) -> Option<Affine> {
+        (self.sform_code > 0).then(|| self.sform_matrix())
+    }
+
+    /// The qform matrix, if `qform_code > 0`.
+    pub fn qform(&self) -> Option<Affine> {
+        (self.qform_code > 0).then(|| self.qform_matrix())
+    }
+
+    fn sform_matrix(&self) -> Affine {
+        [self.srow_x, self.srow_y, self.srow_z, [0.0, 0.0, 0.0, 1.0]]
+    }
+
+    /// Voxel sizes along the first three axes as used by the qform: values
+    /// that are not positive are replaced by 1, following `nifti1_io.c`.
+    fn qform_zooms(&self) -> [f64; 3] {
+        std::array::from_fn(|i| {
+            let p = self.pixdim[i + 1];
+            if p > 0.0 && p.is_finite() {
+                p
+            } else {
+                1.0
+            }
+        })
+    }
+
+    fn fallback_matrix(&self) -> Affine {
+        let [x, y, z] = self.qform_zooms();
         [
-            [
-                aff64[0][0] as f32,
-                aff64[0][1] as f32,
-                aff64[0][2] as f32,
-                aff64[0][3] as f32,
-            ],
-            [
-                aff64[1][0] as f32,
-                aff64[1][1] as f32,
-                aff64[1][2] as f32,
-                aff64[1][3] as f32,
-            ],
-            [
-                aff64[2][0] as f32,
-                aff64[2][1] as f32,
-                aff64[2][2] as f32,
-                aff64[2][3] as f32,
-            ],
-            [
-                aff64[3][0] as f32,
-                aff64[3][1] as f32,
-                aff64[3][2] as f32,
-                aff64[3][3] as f32,
-            ],
+            [x, 0.0, 0.0, 0.0],
+            [0.0, y, 0.0, 0.0],
+            [0.0, 0.0, z, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
         ]
     }
 
-    /// Get the 4x4 affine transformation matrix with f64 precision.
-    pub fn affine_f64(&self) -> [[f64; 4]; 4] {
-        if self.sform_code > 0 {
-            [self.srow_x, self.srow_y, self.srow_z, [0.0, 0.0, 0.0, 1.0]]
-        } else if self.qform_code > 0 {
-            self.qform_to_affine_f64()
+    /// Build the qform matrix from the quaternion (`nifti_quatern_to_mat44`).
+    fn qform_matrix(&self) -> Affine {
+        let [mut b, mut c, mut d] = self.quatern;
+        let mut a = 1.0 - (b * b + c * c + d * d);
+        if a < 1e-7 {
+            // 180-degree rotation: renormalise (b, c, d) and set a = 0.
+            let norm = (b * b + c * c + d * d).sqrt();
+            if norm > 0.0 {
+                b /= norm;
+                c /= norm;
+                d /= norm;
+            }
+            a = 0.0;
         } else {
-            // Default: identity scaled by pixdim
-            [
-                [self.pixdim[1], 0.0, 0.0, 0.0],
-                [0.0, self.pixdim[2], 0.0, 0.0],
-                [0.0, 0.0, self.pixdim[3], 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ]
+            a = a.sqrt();
         }
-    }
-
-    /// Set affine from 4x4 matrix (f32 input for API compatibility).
-    pub fn set_affine(&mut self, affine: [[f32; 4]; 4]) {
-        let mut a = [[0.0f64; 4]; 4];
-        for i in 0..4 {
-            for j in 0..4 {
-                a[i][j] = affine[i][j] as f64;
-            }
+        let [xd, yd, mut zd] = self.qform_zooms();
+        if self.pixdim[0] < 0.0 {
+            zd = -zd;
         }
-        self.set_affine_f64(a);
-    }
-
-    /// Set affine from 4x4 matrix with f64 precision.
-    ///
-    /// Writes the sform rows, recomputes pixdim from the column norms, and
-    /// recomputes the qform quaternion from the same matrix so both the sform
-    /// and qform describe the new geometry. A reader that trusts either
-    /// representation sees consistent coordinates.
-    pub fn set_affine_f64(&mut self, affine: [[f64; 4]; 4]) {
-        self.srow_x = affine[0];
-        self.srow_y = affine[1];
-        self.srow_z = affine[2];
-        self.sform_code = 1;
-
-        let spacing = [
-            (affine[0][0] * affine[0][0]
-                + affine[1][0] * affine[1][0]
-                + affine[2][0] * affine[2][0])
-                .sqrt(),
-            (affine[0][1] * affine[0][1]
-                + affine[1][1] * affine[1][1]
-                + affine[2][1] * affine[2][1])
-                .sqrt(),
-            (affine[0][2] * affine[0][2]
-                + affine[1][2] * affine[1][2]
-                + affine[2][2] * affine[2][2])
-                .sqrt(),
-        ];
-        self.pixdim[1] = spacing[0];
-        self.pixdim[2] = spacing[1];
-        self.pixdim[3] = spacing[2];
-
-        self.set_qform_from_affine(affine, spacing);
-    }
-
-    /// Recompute the qform quaternion, offset, and qfac from a 4x4 affine.
-    ///
-    /// Follows the NIfTI-1 `nifti_mat44_to_quatern` decomposition: normalise the
-    /// direction columns, take `qfac` from the sign of the determinant, and
-    /// convert the resulting proper rotation to a unit quaternion. Keeps the
-    /// qform in sync with the sform written by [`Self::set_affine_f64`].
-    #[allow(clippy::many_single_char_names)]
-    fn set_qform_from_affine(&mut self, affine: [[f64; 4]; 4], spacing: [f64; 3]) {
-        // Normalised rotation columns (fall back to identity for a zero column).
-        let mut r = [[0.0f64; 3]; 3];
-        for j in 0..3 {
-            if spacing[j] > 0.0 {
-                for i in 0..3 {
-                    r[i][j] = affine[i][j] / spacing[j];
-                }
-            } else {
-                r[j][j] = 1.0;
-            }
-        }
-
-        // qfac from the determinant sign; negate the k column for a left-handed
-        // system so the remaining matrix is a proper rotation.
-        let det = r[0][0] * (r[1][1] * r[2][2] - r[2][1] * r[1][2])
-            - r[0][1] * (r[1][0] * r[2][2] - r[2][0] * r[1][2])
-            + r[0][2] * (r[1][0] * r[2][1] - r[2][0] * r[1][1]);
-        let qfac = if det < 0.0 { -1.0 } else { 1.0 };
-        if det < 0.0 {
-            for row in &mut r {
-                row[2] = -row[2];
-            }
-        }
-
-        // Rotation matrix to quaternion (a, b, c, d), a >= 0.
-        let trace = r[0][0] + r[1][1] + r[2][2];
-        let (a, b, c, d) = if trace > 0.0 {
-            let s = 0.5 / (trace + 1.0).sqrt();
-            (
-                0.25 / s,
-                (r[2][1] - r[1][2]) * s,
-                (r[0][2] - r[2][0]) * s,
-                (r[1][0] - r[0][1]) * s,
-            )
-        } else if r[0][0] > r[1][1] && r[0][0] > r[2][2] {
-            let s = 2.0 * (1.0 + r[0][0] - r[1][1] - r[2][2]).sqrt();
-            (
-                (r[2][1] - r[1][2]) / s,
-                0.25 * s,
-                (r[0][1] + r[1][0]) / s,
-                (r[0][2] + r[2][0]) / s,
-            )
-        } else if r[1][1] > r[2][2] {
-            let s = 2.0 * (1.0 + r[1][1] - r[0][0] - r[2][2]).sqrt();
-            (
-                (r[0][2] - r[2][0]) / s,
-                (r[0][1] + r[1][0]) / s,
-                0.25 * s,
-                (r[1][2] + r[2][1]) / s,
-            )
-        } else {
-            let s = 2.0 * (1.0 + r[2][2] - r[0][0] - r[1][1]).sqrt();
-            (
-                (r[1][0] - r[0][1]) / s,
-                (r[0][2] + r[2][0]) / s,
-                (r[1][2] + r[2][1]) / s,
-                0.25 * s,
-            )
-        };
-
-        // NIfTI stores b, c, d with a >= 0 (a is recovered as sqrt(1-b^2-c^2-d^2)).
-        let sign = if a < 0.0 { -1.0 } else { 1.0 };
-        self.quatern = [sign * b, sign * c, sign * d];
-        self.qoffset = [affine[0][3], affine[1][3], affine[2][3]];
-        self.pixdim[0] = qfac;
-        self.qform_code = 1;
-    }
-
-    /// Convert quaternion representation to affine matrix (f64 precision).
-    #[allow(clippy::many_single_char_names)]
-    fn qform_to_affine_f64(&self) -> [[f64; 4]; 4] {
-        let [b, c, d] = self.quatern;
-        let a = (1.0 - b * b - c * c - d * d).max(0.0).sqrt();
-
-        let qfac = if self.pixdim[0] < 0.0 { -1.0 } else { 1.0 };
-        let [i, j, k] = [self.pixdim[1].abs(), self.pixdim[2], self.pixdim[3] * qfac];
-
         [
             [
-                (a * a + b * b - c * c - d * d) * i,
-                2.0 * (b * c - a * d) * j,
-                2.0 * (b * d + a * c) * k,
+                (a * a + b * b - c * c - d * d) * xd,
+                2.0 * (b * c - a * d) * yd,
+                2.0 * (b * d + a * c) * zd,
                 self.qoffset[0],
             ],
             [
-                2.0 * (b * c + a * d) * i,
-                (a * a - b * b + c * c - d * d) * j,
-                2.0 * (c * d - a * b) * k,
+                2.0 * (b * c + a * d) * xd,
+                (a * a + c * c - b * b - d * d) * yd,
+                2.0 * (c * d - a * b) * zd,
                 self.qoffset[1],
             ],
             [
-                2.0 * (b * d - a * c) * i,
-                2.0 * (c * d + a * b) * j,
-                (a * a - b * b - c * c + d * d) * k,
+                2.0 * (b * d - a * c) * xd,
+                2.0 * (c * d + a * b) * yd,
+                (a * a + d * d - c * c - b * b) * zd,
                 self.qoffset[2],
             ],
             [0.0, 0.0, 0.0, 1.0],
         ]
     }
 
-    /// Get image shape as a Vec<usize> (up to ndim elements).
-    /// Returns owned Vec to accommodate both NIfTI-1 and NIfTI-2 dimensions.
-    pub fn shape(&self) -> Vec<usize> {
-        self.dim[..self.ndim as usize]
-            .iter()
-            .map(|&d| d as usize)
+    /// Set both the sform and the qform to `affine`.
+    ///
+    /// Existing positive `sform_code`/`qform_code` values are kept; a code of
+    /// 0 becomes 1 (`NIFTI_XFORM_SCANNER_ANAT`). The qform stores the closest
+    /// rigid-plus-scaling approximation of `affine`, and `pixdim[0..=3]` are
+    /// updated to match it.
+    pub fn set_affine(&mut self, affine: Affine) {
+        if self.sform_code <= 0 {
+            self.sform_code = 1;
+        }
+        if self.qform_code <= 0 {
+            self.qform_code = 1;
+        }
+        self.set_sform_matrix(&affine);
+        self.set_qform_matrix(&affine);
+    }
+
+    /// Set both transforms and their codes explicitly.
+    pub fn set_affine_with_codes(&mut self, affine: Affine, sform_code: i32, qform_code: i32) {
+        self.set_sform_matrix(&affine);
+        self.set_qform_matrix(&affine);
+        self.sform_code = sform_code;
+        self.qform_code = qform_code;
+    }
+
+    fn set_sform_matrix(&mut self, affine: &Affine) {
+        self.srow_x = affine[0];
+        self.srow_y = affine[1];
+        self.srow_z = affine[2];
+    }
+
+    /// Update the geometry after a voxel-space transform.
+    ///
+    /// `voxel_map` maps *new* voxel indices to *old* voxel indices
+    /// (homogeneous 4x4, acting on the first three axes). Both the sform and
+    /// the qform are updated so that every voxel keeps its world position and
+    /// both transform codes are preserved. An image with neither transform
+    /// gains an sform and qform (code 1) describing the transformed grid.
+    pub fn transform_voxels(&mut self, voxel_map: &Affine) {
+        let has_sform = self.sform_code > 0;
+        let has_qform = self.qform_code > 0;
+        if !has_sform && !has_qform {
+            let affine = matmul(&self.fallback_matrix(), voxel_map);
+            self.set_affine_with_codes(affine, 1, 1);
+            return;
+        }
+        if has_sform {
+            let sform = matmul(&self.sform_matrix(), voxel_map);
+            self.set_sform_matrix(&sform);
+            if !has_qform {
+                let [x, y, z] = column_norms(&sform);
+                self.pixdim[1] = x;
+                self.pixdim[2] = y;
+                self.pixdim[3] = z;
+            }
+        }
+        if has_qform {
+            let qform = matmul(&self.qform_matrix(), voxel_map);
+            self.set_qform_matrix(&qform);
+        }
+    }
+
+    /// Store `affine` as the qform (`nifti_mat44_to_quatern`), updating the
+    /// quaternion, offsets, voxel sizes, and `qfac`.
+    fn set_qform_matrix(&mut self, affine: &Affine) {
+        let (quatern, zooms, qfac) = matrix_to_quaternion(affine);
+        self.quatern = quatern;
+        self.qoffset = [affine[0][3], affine[1][3], affine[2][3]];
+        self.pixdim[0] = qfac;
+        self.pixdim[1] = zooms[0];
+        self.pixdim[2] = zooms[1];
+        self.pixdim[3] = zooms[2];
+    }
+
+    /// Voxel sizes along each axis: the column norms of [`affine`](Self::affine)
+    /// for the first three axes, and `pixdim` for any further axes.
+    pub fn spacing(&self) -> Vec<f64> {
+        let norms = column_norms(&self.affine());
+        (0..self.ndim as usize)
+            .map(|i| if i < 3 { norms[i] } else { self.pixdim[i + 1] })
             .collect()
     }
+}
 
-    /// Get voxel spacing as a Vec<f32> (up to ndim elements).
-    /// Returns owned Vec; spacing is stored at pixdim[1..=ndim].
-    pub fn spacing(&self) -> Vec<f32> {
-        let end = (self.ndim as usize + 1).min(self.pixdim.len());
-        self.pixdim[1..end].iter().map(|&p| p as f32).collect()
+fn bad_magic(m: &[u8]) -> Error {
+    if m.iter().all(|&b| b == 0) {
+        Error::InvalidFileFormat(
+            "missing NIfTI magic: this looks like an Analyze 7.5 header, which is not supported"
+                .into(),
+        )
+    } else {
+        Error::InvalidMagic([m[0], m[1], m[2], m[3]])
     }
+}
 
-    /// Get voxel spacing with f64 precision.
-    pub fn spacing_f64(&self) -> Vec<f64> {
-        let end = (self.ndim as usize + 1).min(self.pixdim.len());
-        self.pixdim[1..end].to_vec()
+fn parse_ndim(raw: i64) -> Result<u8> {
+    if (1..=7).contains(&raw) {
+        Ok(raw as u8)
+    } else {
+        Err(Error::InvalidDimensions(format!(
+            "dim[0] (ndim) must be in 1..=7, got {raw}"
+        )))
     }
+}
 
-    /// Total number of voxels.
-    pub fn num_voxels(&self) -> usize {
-        self.dim[..self.ndim as usize]
-            .iter()
-            .map(|&d| d as usize)
-            .product()
+fn parse_datatype(code: i16) -> Result<DataType> {
+    DataType::from_code(code).map_err(|_| {
+        Error::InvalidFileFormat(format!(
+            "unsupported NIfTI datatype {code} ({})",
+            describe_unsupported_code(code)
+        ))
+    })
+}
+
+/// Parse the extension block that follows the fixed header.
+///
+/// Parsing is lenient: a malformed extension ends the list instead of failing
+/// the load, mirroring nibabel, because extensions never affect voxel data.
+fn parse_extensions(bytes: &[u8], header: &NiftiHeader, layout: FileLayout) -> Vec<NiftiExtension> {
+    let start = header.header_size();
+    let limit = match layout {
+        FileLayout::Single => usize::try_from(header.vox_offset).unwrap_or(0),
+        FileLayout::Pair => bytes.len(),
     }
+    .min(bytes.len())
+    .min(start + 4 + MAX_EXTENSION_BYTES);
 
-    /// Total size of image data in bytes.
-    pub fn data_size(&self) -> usize {
-        self.num_voxels() * self.datatype.byte_size()
+    let mut out = Vec::new();
+    if limit < start + 4 || bytes[start] == 0 {
+        return out;
     }
-
-    /// Returns true if file is little endian.
-    pub fn is_little_endian(&self) -> bool {
-        self.little_endian
-    }
-
-    /// Returns true if this header requires NIfTI-2 format.
-    /// NIfTI-2 is required if any dimension exceeds 32767.
-    pub fn requires_nifti2(&self) -> bool {
-        self.dim.iter().any(|&d| d > i16::MAX as i64)
-    }
-
-    /// Validate header fields for basic NIfTI invariants.
-    pub fn validate(&self) -> Result<()> {
-        if self.ndim == 0 || self.ndim > 7 {
-            return Err(Error::InvalidDimensions(format!(
-                "ndim must be 1..=7, got {}",
-                self.ndim
-            )));
+    let mut pos = start + 4;
+    while pos + 8 <= limit {
+        let (esize, ecode) = if header.little_endian {
+            (
+                LittleEndian::read_i32(&bytes[pos..pos + 4]),
+                LittleEndian::read_i32(&bytes[pos + 4..pos + 8]),
+            )
+        } else {
+            (
+                BigEndian::read_i32(&bytes[pos..pos + 4]),
+                BigEndian::read_i32(&bytes[pos + 4..pos + 8]),
+            )
+        };
+        let Ok(esize) = usize::try_from(esize) else {
+            break;
+        };
+        if esize < 8 || pos + esize > limit {
+            break;
         }
+        out.push(NiftiExtension {
+            ecode,
+            data: bytes[pos + 8..pos + esize].to_vec(),
+        });
+        pos += esize;
+    }
+    out
+}
 
-        for i in 0..self.ndim as usize {
-            if self.dim[i] == 0 {
-                return Err(Error::InvalidDimensions(format!("dimension {} is zero", i)));
+/// Row-major 4x4 matrix product `a * b`.
+pub(crate) fn matmul(a: &Affine, b: &Affine) -> Affine {
+    let mut out = [[0.0; 4]; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            out[i][j] = (0..4).map(|k| a[i][k] * b[k][j]).sum();
+        }
+    }
+    out
+}
+
+/// A 4x4 translation by `t`.
+pub(crate) fn translation(t: [f64; 3]) -> Affine {
+    [
+        [1.0, 0.0, 0.0, t[0]],
+        [0.0, 1.0, 0.0, t[1]],
+        [0.0, 0.0, 1.0, t[2]],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+}
+
+/// Euclidean norms of the first three columns of the 3x3 block.
+pub(crate) fn column_norms(a: &Affine) -> [f64; 3] {
+    std::array::from_fn(|j| (0..3).map(|i| a[i][j] * a[i][j]).sum::<f64>().sqrt())
+}
+
+/// Invert a 4x4 affine (with last row `[0, 0, 0, 1]`). Returns `None` when the
+/// 3x3 block is singular.
+pub(crate) fn invert_affine(a: &Affine) -> Option<Affine> {
+    let m = [
+        [a[0][0], a[0][1], a[0][2]],
+        [a[1][0], a[1][1], a[1][2]],
+        [a[2][0], a[2][1], a[2][2]],
+    ];
+    let inv = invert3(&m)?;
+    let t = [a[0][3], a[1][3], a[2][3]];
+    let mut out = [[0.0; 4]; 4];
+    for i in 0..3 {
+        for j in 0..3 {
+            out[i][j] = inv[i][j];
+        }
+        out[i][3] = -(0..3).map(|k| inv[i][k] * t[k]).sum::<f64>();
+    }
+    out[3][3] = 1.0;
+    Some(out)
+}
+
+pub(crate) type Mat3 = [[f64; 3]; 3];
+
+fn det3(m: &Mat3) -> f64 {
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+        - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+        + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+}
+
+fn invert3(m: &Mat3) -> Option<Mat3> {
+    let det = det3(m);
+    if det == 0.0 || !det.is_finite() {
+        return None;
+    }
+    let inv_det = 1.0 / det;
+    Some([
+        [
+            (m[1][1] * m[2][2] - m[1][2] * m[2][1]) * inv_det,
+            (m[0][2] * m[2][1] - m[0][1] * m[2][2]) * inv_det,
+            (m[0][1] * m[1][2] - m[0][2] * m[1][1]) * inv_det,
+        ],
+        [
+            (m[1][2] * m[2][0] - m[1][0] * m[2][2]) * inv_det,
+            (m[0][0] * m[2][2] - m[0][2] * m[2][0]) * inv_det,
+            (m[0][2] * m[1][0] - m[0][0] * m[1][2]) * inv_det,
+        ],
+        [
+            (m[1][0] * m[2][1] - m[1][1] * m[2][0]) * inv_det,
+            (m[0][1] * m[2][0] - m[0][0] * m[2][1]) * inv_det,
+            (m[0][0] * m[1][1] - m[0][1] * m[1][0]) * inv_det,
+        ],
+    ])
+}
+
+fn row_norm(m: &Mat3) -> f64 {
+    m.iter()
+        .map(|r| r.iter().map(|v| v.abs()).sum::<f64>())
+        .fold(0.0, f64::max)
+}
+
+fn col_norm(m: &Mat3) -> f64 {
+    (0..3)
+        .map(|j| (0..3).map(|i| m[i][j].abs()).sum::<f64>())
+        .fold(0.0, f64::max)
+}
+
+/// Closest orthogonal matrix (polar decomposition), as `nifti_mat33_polar`.
+pub(crate) fn polar(a: &Mat3) -> Mat3 {
+    let mut x = *a;
+    let mut det = det3(&x);
+    let mut guard = 0;
+    while det == 0.0 && guard < 100 {
+        let g = 1e-5 * (1e-3 + row_norm(&x));
+        for (i, row) in x.iter_mut().enumerate() {
+            row[i] += g;
+        }
+        det = det3(&x);
+        guard += 1;
+    }
+    let mut diff = 1.0;
+    let mut z = x;
+    for _ in 0..100 {
+        let Some(y) = invert3(&x) else { break };
+        let (gam, gmi) = if diff > 0.3 {
+            let alp = (row_norm(&x) * col_norm(&x)).sqrt();
+            let bet = (row_norm(&y) * col_norm(&y)).sqrt();
+            let gam = (bet / alp).sqrt();
+            (gam, 1.0 / gam)
+        } else {
+            (1.0, 1.0)
+        };
+        for i in 0..3 {
+            for j in 0..3 {
+                z[i][j] = 0.5 * (gam * x[i][j] + gmi * y[j][i]);
             }
-            let spacing = self.pixdim[i + 1];
-            if !spacing.is_finite() {
-                return Err(Error::InvalidDimensions(format!(
-                    "pixdim[{}] must be finite, got {}",
-                    i + 1,
-                    spacing
-                )));
-            }
-            // Positivity is only meaningful for spatial dimensions. Higher
-            // dimensions (e.g. time) commonly carry a zero pixdim to mean
-            // "unspecified", which is valid.
-            if i < 3 && spacing <= 0.0 {
-                return Err(Error::InvalidDimensions(format!(
-                    "pixdim[{}] must be > 0 for spatial dimensions, got {}",
-                    i + 1,
-                    spacing
-                )));
-            }
         }
-
-        if self.vox_offset < 0 {
-            return Err(Error::InvalidDimensions(format!(
-                "vox_offset must be non-negative, got {}",
-                self.vox_offset
-            )));
+        diff = (0..3)
+            .flat_map(|i| (0..3).map(move |j| (i, j)))
+            .map(|(i, j)| (z[i][j] - x[i][j]).abs())
+            .sum();
+        if diff < 3e-12 {
+            break;
         }
-
-        let min_offset = self.version.header_size() as i64;
-        if self.vox_offset < min_offset {
-            return Err(Error::InvalidDimensions(format!(
-                "vox_offset {} before header end ({})",
-                self.vox_offset, min_offset
-            )));
-        }
-
-        // Check that voxel count and byte size don't overflow usize
-        let mut voxels: usize = 1;
-        for i in 0..self.ndim as usize {
-            voxels = voxels
-                .checked_mul(self.dim[i] as usize)
-                .ok_or_else(|| Error::InvalidDimensions("dimension product overflow".into()))?;
-        }
-
-        let data_bytes = voxels
-            .checked_mul(self.datatype.byte_size())
-            .ok_or_else(|| Error::InvalidDimensions("data size overflow".into()))?;
-
-        // Bound vox_offset: an attacker-controlled vox_offset (e.g. 1e18) must
-        // not overflow when combined with the data size at the read sites.
-        (self.vox_offset as usize)
-            .checked_add(data_bytes)
-            .ok_or_else(|| Error::InvalidDimensions("vox_offset + data size overflow".into()))?;
-
-        Ok(())
+        x = z;
     }
+    z
+}
+
+/// Decompose an affine into `(quaternion b,c,d; voxel sizes; qfac)` following
+/// `nifti_mat44_to_quatern`.
+fn matrix_to_quaternion(affine: &Affine) -> ([f64; 3], [f64; 3], f64) {
+    let mut r: Mat3 = [
+        [affine[0][0], affine[0][1], affine[0][2]],
+        [affine[1][0], affine[1][1], affine[1][2]],
+        [affine[2][0], affine[2][1], affine[2][2]],
+    ];
+    let mut zooms = column_norms(affine);
+    for j in 0..3 {
+        if zooms[j] == 0.0 || !zooms[j].is_finite() {
+            for (i, row) in r.iter_mut().enumerate() {
+                row[j] = if i == j { 1.0 } else { 0.0 };
+            }
+            zooms[j] = 1.0;
+        }
+        for row in &mut r {
+            row[j] /= zooms[j];
+        }
+    }
+    let mut r = polar(&r);
+    let qfac = if det3(&r) > 0.0 {
+        1.0
+    } else {
+        for row in &mut r {
+            row[2] = -row[2];
+        }
+        -1.0
+    };
+
+    let (r11, r12, r13) = (r[0][0], r[0][1], r[0][2]);
+    let (r21, r22, r23) = (r[1][0], r[1][1], r[1][2]);
+    let (r31, r32, r33) = (r[2][0], r[2][1], r[2][2]);
+    let mut a = r11 + r22 + r33 + 1.0;
+    let (mut b, mut c, mut d);
+    if a > 0.5 {
+        a = 0.5 * a.sqrt();
+        b = 0.25 * (r32 - r23) / a;
+        c = 0.25 * (r13 - r31) / a;
+        d = 0.25 * (r21 - r12) / a;
+    } else {
+        let xd = 1.0 + r11 - (r22 + r33);
+        let yd = 1.0 + r22 - (r11 + r33);
+        let zd = 1.0 + r33 - (r11 + r22);
+        if xd > 1.0 {
+            b = 0.5 * xd.sqrt();
+            c = 0.25 * (r12 + r21) / b;
+            d = 0.25 * (r13 + r31) / b;
+            a = 0.25 * (r32 - r23) / b;
+        } else if yd > 1.0 {
+            c = 0.5 * yd.sqrt();
+            b = 0.25 * (r12 + r21) / c;
+            d = 0.25 * (r23 + r32) / c;
+            a = 0.25 * (r13 - r31) / c;
+        } else {
+            d = 0.5 * zd.sqrt();
+            b = 0.25 * (r13 + r31) / d;
+            c = 0.25 * (r23 + r32) / d;
+            a = 0.25 * (r21 - r12) / d;
+        }
+        if a < 0.0 {
+            b = -b;
+            c = -c;
+            d = -d;
+        }
+    }
+    ([b, c, d], zooms, qfac)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_set_affine_syncs_qform_with_sform() {
-        // An oblique affine: rotation about z by 30 degrees, anisotropic
-        // spacing, and a translation. After set_affine_f64 the qform (via
-        // qform_to_affine_f64) must reproduce the same matrix as the sform.
-        let (cos, sin) = (30.0_f64.to_radians().cos(), 30.0_f64.to_radians().sin());
-        let sp = [1.5, 2.0, 3.0];
-        let affine = [
-            [cos * sp[0], -sin * sp[1], 0.0, 10.0],
-            [sin * sp[0], cos * sp[1], 0.0, -5.0],
-            [0.0, 0.0, sp[2], 7.5],
-            [0.0, 0.0, 0.0, 1.0],
-        ];
-
-        let mut header = NiftiHeader::default();
-        header.set_affine_f64(affine);
-
-        assert!(header.qform_code > 0, "qform should be populated");
-        let from_qform = header.qform_to_affine_f64();
-        for i in 0..3 {
+    fn assert_affine_close(a: &Affine, b: &Affine, tol: f64) {
+        for i in 0..4 {
             for j in 0..4 {
                 assert!(
-                    (from_qform[i][j] - affine[i][j]).abs() < 1e-9,
-                    "qform[{i}][{j}]={} != affine {}",
-                    from_qform[i][j],
-                    affine[i][j]
+                    (a[i][j] - b[i][j]).abs() <= tol,
+                    "[{i}][{j}]: {} != {}\n{a:?}\n{b:?}",
+                    a[i][j],
+                    b[i][j]
                 );
             }
         }
     }
 
+    fn oblique() -> Affine {
+        let (c, s) = (30f64.to_radians().cos(), 30f64.to_radians().sin());
+        [
+            [c * 1.5, -s * 2.0, 0.0, 10.0],
+            [s * 1.5, c * 2.0, 0.0, -5.0],
+            [0.0, 0.0, 3.0, 7.5],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    }
+
     #[test]
-    fn test_set_affine_qform_handles_left_handed() {
-        // A left-handed system (negative determinant) must round-trip through
-        // qfac = -1 rather than producing a bogus rotation.
+    fn qform_roundtrips_oblique_and_left_handed_affines() {
+        let mut lh = oblique();
+        for row in lh.iter_mut().take(3) {
+            row[2] = -row[2];
+        }
+        for affine in [oblique(), lh] {
+            let mut h = NiftiHeader::default();
+            h.set_affine(affine);
+            assert_affine_close(&h.qform_matrix(), &affine, 1e-9);
+            assert_affine_close(&h.affine(), &affine, 1e-12);
+        }
+    }
+
+    #[test]
+    fn qform_handles_180_degree_rotations() {
+        // Rotation by pi about x: quaternion a = 0.
         let affine = [
-            [1.0, 0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0, 1.0],
+            [0.0, -2.0, 0.0, 2.0],
+            [0.0, 0.0, -2.0, 3.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        let mut h = NiftiHeader::default();
+        h.set_affine(affine);
+        assert_affine_close(&h.qform_matrix(), &affine, 1e-9);
+    }
+
+    #[test]
+    fn qform_of_sheared_matrix_is_nearest_rigid() {
+        let sheared = [
+            [1.0, 0.2, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
-            [0.0, 0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
             [0.0, 0.0, 0.0, 1.0],
         ];
-        let mut header = NiftiHeader::default();
-        header.set_affine_f64(affine);
-        assert!(header.pixdim[0] < 0.0, "qfac should be negative");
-        let from_qform = header.qform_to_affine_f64();
-        for i in 0..3 {
-            for j in 0..4 {
-                assert!(
-                    (from_qform[i][j] - affine[i][j]).abs() < 1e-9,
-                    "left-handed qform[{i}][{j}] mismatch"
-                );
-            }
-        }
+        let mut h = NiftiHeader::default();
+        h.set_affine(sheared);
+        let q = h.qform_matrix();
+        // Columns of the qform rotation are orthogonal.
+        let dot: f64 = (0..3).map(|i| q[i][0] * q[i][1]).sum();
+        assert!(dot.abs() < 1e-9, "qform columns not orthogonal: {dot}");
+        // The sform keeps the exact matrix.
+        assert_affine_close(&h.affine(), &sheared, 0.0);
     }
 
     #[test]
-    fn test_temporal_units_from_code() {
-        assert_eq!(TemporalUnits::from_code(0x08), TemporalUnits::Second);
-        assert_eq!(TemporalUnits::from_code(0x10), TemporalUnits::Millisecond);
-        assert_eq!(TemporalUnits::from_code(0x18), TemporalUnits::Microsecond);
-        assert_eq!(TemporalUnits::from_code(0x00), TemporalUnits::Unknown);
-        assert_eq!(TemporalUnits::from_code(0x0A), TemporalUnits::Second);
-        assert_eq!(TemporalUnits::from_code(0x11), TemporalUnits::Millisecond);
+    fn transform_voxels_preserves_codes_and_both_spaces() {
+        let mut h = NiftiHeader::default();
+        h.set_affine_with_codes(oblique(), 4, 1);
+        // Shift by one voxel along axis 0.
+        let shift = [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        h.transform_voxels(&shift);
+        assert_eq!((h.sform_code, h.qform_code), (4, 1));
+        let expected = matmul(&oblique(), &shift);
+        assert_affine_close(&h.affine(), &expected, 1e-12);
+        assert_affine_close(&h.qform_matrix(), &expected, 1e-9);
     }
 
     #[test]
-    fn test_temporal_units_to_code() {
-        assert_eq!(TemporalUnits::Second.to_code(), 0x08);
-        assert_eq!(TemporalUnits::Millisecond.to_code(), 0x10);
-        assert_eq!(TemporalUnits::Microsecond.to_code(), 0x18);
-        assert_eq!(TemporalUnits::Unknown.to_code(), 0x00);
+    fn zero_pixdim_uses_unit_spacing_in_qform() {
+        let h = NiftiHeader {
+            sform_code: 0,
+            qform_code: 1,
+            pixdim: [1.0, 2.0, 2.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        let q = h.affine();
+        assert_eq!([q[0][0], q[1][1], q[2][2]], [2.0, 2.0, 1.0]);
     }
 
     #[test]
-    fn test_temporal_units_roundtrip() {
-        for unit in [
+    fn units_roundtrip_including_frequency_units() {
+        for t in [
             TemporalUnits::Unknown,
             TemporalUnits::Second,
             TemporalUnits::Millisecond,
             TemporalUnits::Microsecond,
+            TemporalUnits::Hertz,
+            TemporalUnits::Ppm,
+            TemporalUnits::RadPerSecond,
         ] {
-            let code = unit.to_code();
-            assert_eq!(TemporalUnits::from_code(code), unit);
+            assert_eq!(TemporalUnits::from_code(t.to_code() | 2), t);
+        }
+        for s in [
+            SpatialUnits::Unknown,
+            SpatialUnits::Meter,
+            SpatialUnits::Millimeter,
+            SpatialUnits::Micrometer,
+        ] {
+            assert_eq!(SpatialUnits::from_code(s.to_code() | 0x18), s);
         }
     }
 
-    #[test]
-    fn test_spatial_units_from_code() {
-        assert_eq!(SpatialUnits::from_code(0x00), SpatialUnits::Unknown);
-        assert_eq!(SpatialUnits::from_code(0x01), SpatialUnits::Meter);
-        assert_eq!(SpatialUnits::from_code(0x02), SpatialUnits::Millimeter);
-        assert_eq!(SpatialUnits::from_code(0x03), SpatialUnits::Micrometer);
+    fn rich_header(version: NiftiVersion) -> NiftiHeader {
+        let mut h = NiftiHeader {
+            version,
+            ndim: 4,
+            dim: [5, 6, 7, 3, 1, 1, 1],
+            datatype: DataType::Int16,
+            scl_slope: 2.0,
+            scl_inter: -1024.0,
+            temporal_units: TemporalUnits::Second,
+            intent_code: 3,
+            intent_p: [12.0, 0.5, 0.0],
+            intent_name: "t-test".into(),
+            dim_info: 57,
+            slice_code: 1,
+            slice_start: 0,
+            slice_end: 6,
+            slice_duration: 0.5,
+            toffset: 1.25,
+            cal_max: 20.0,
+            cal_min: 1.0,
+            descrip: "medrs round trip".into(),
+            aux_file: "aux".into(),
+            extensions: vec![
+                NiftiExtension::new(6, b"a comment".to_vec()),
+                NiftiExtension::new(4, vec![7u8; 40]),
+            ],
+            ..Default::default()
+        };
+        h.set_affine_with_codes(oblique(), 4, 2);
+        h.pixdim[4] = 2.5;
+        h
     }
 
     #[test]
-    fn test_spacing_returns_vec() {
-        let header = NiftiHeader {
-            ndim: 3,
-            pixdim: [-1.0, 2.0, 3.0, 4.0, 0.0, 0.0, 0.0, 0.0],
-            ..Default::default()
+    fn every_field_roundtrips_in_both_versions_and_layouts() {
+        for version in [NiftiVersion::Nifti1, NiftiVersion::Nifti2] {
+            for layout in [FileLayout::Single, FileLayout::Pair] {
+                let h = rich_header(version).prepared_for_write(layout);
+                let bytes = h.encode(layout).unwrap();
+                let (parsed, parsed_layout) = NiftiHeader::parse(&bytes).unwrap();
+                assert_eq!(parsed_layout, layout);
+                // Extension payloads are padded to 16-byte blocks on disk.
+                let mut expected = h.clone();
+                for ext in &mut expected.extensions {
+                    let padded = ext.encoded_size() - 8;
+                    ext.data.resize(padded, 0);
+                }
+                if version == NiftiVersion::Nifti1 {
+                    assert_nifti1_close(&parsed, &expected);
+                } else {
+                    assert_eq!(parsed, expected);
+                }
+            }
+        }
+    }
+
+    /// NIfTI-1 stores floats as f32, so compare with f32 precision.
+    fn assert_nifti1_close(a: &NiftiHeader, b: &NiftiHeader) {
+        let round = |h: &NiftiHeader| {
+            let mut h = h.clone();
+            let r = |v: f64| f64::from(v as f32);
+            h.pixdim = h.pixdim.map(r);
+            h.quatern = h.quatern.map(r);
+            h.qoffset = h.qoffset.map(r);
+            h.srow_x = h.srow_x.map(r);
+            h.srow_y = h.srow_y.map(r);
+            h.srow_z = h.srow_z.map(r);
+            h.intent_p = h.intent_p.map(r);
+            h
         };
-        assert_eq!(header.spacing(), vec![2.0f32, 3.0, 4.0]);
+        assert_eq!(round(a), round(b));
     }
 
     #[test]
-    fn test_shape_returns_vec() {
-        let header = NiftiHeader {
-            ndim: 3,
-            dim: [100, 200, 300, 1, 1, 1, 1],
-            ..Default::default()
-        };
-        assert_eq!(header.shape(), vec![100usize, 200, 300]);
+    fn single_file_vox_offset_accounts_for_extensions() {
+        let h = rich_header(NiftiVersion::Nifti1).prepared_for_write(FileLayout::Single);
+        // 348 + 4 + 32 ("a comment": 8 + 9 bytes, padded) + 48 (8 + 40) = 432.
+        assert_eq!(h.vox_offset, 432);
+        let bytes = h.encode(FileLayout::Single).unwrap();
+        assert_eq!(bytes.len(), 432);
     }
 
     #[test]
-    fn test_nifti1_roundtrip() {
-        let header = NiftiHeader {
-            ndim: 3,
-            dim: [64, 64, 64, 1, 1, 1, 1],
-            pixdim: [-1.0, 1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0],
+    fn large_dims_promote_to_nifti2() {
+        let h = NiftiHeader {
+            dim: [40_000, 2, 2, 1, 1, 1, 1],
             ..Default::default()
         };
+        assert!(h.requires_nifti2());
+        assert!(h.to_bytes().is_err());
+        let p = h.prepared_for_write(FileLayout::Single);
+        assert_eq!(p.version, NiftiVersion::Nifti2);
+        assert_eq!(p.vox_offset, 544);
+        let parsed = NiftiHeader::from_bytes(&p.encode(FileLayout::Single).unwrap()).unwrap();
+        assert_eq!(parsed.dim[0], 40_000);
+    }
 
-        let bytes = header.to_bytes().unwrap();
-        assert_eq!(bytes.len(), 348);
+    #[test]
+    fn big_endian_headers_parse() {
+        let h = rich_header(NiftiVersion::Nifti1).prepared_for_write(FileLayout::Single);
+        let mut le = h.encode(FileLayout::Single).unwrap();
+        // Byte-swap the fields we check to build a big-endian header by hand.
+        let swap = |b: &mut [u8], o: usize, n: usize| b[o..o + n].reverse();
+        swap(&mut le, 0, 4);
+        swap(&mut le, v1::DIM, 2);
+        for i in 0..7 {
+            swap(&mut le, v1::DIM + 2 + 2 * i, 2);
+        }
+        swap(&mut le, v1::DATATYPE, 2);
+        swap(&mut le, v1::BITPIX, 2);
+        for i in 0..8 {
+            swap(&mut le, v1::PIXDIM + 4 * i, 4);
+        }
+        swap(&mut le, v1::VOX_OFFSET, 4);
+        // Drop the extensions: their sizes are little-endian in `le`.
+        le[348] = 0;
+        let parsed = NiftiHeader::from_bytes(&le).unwrap();
+        assert!(!parsed.is_little_endian());
+        assert_eq!(parsed.shape(), vec![5, 6, 7, 3]);
+        assert_eq!(parsed.datatype, DataType::Int16);
+    }
 
+    #[test]
+    fn lenient_parsing_of_real_world_quirks() {
+        let mut h = NiftiHeader {
+            pixdim: [0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            ..Default::default()
+        };
+        h.dim = [4, 4, 1, 1, 1, 1, 1];
+        let mut bytes = h
+            .prepared_for_write(FileLayout::Single)
+            .encode(FileLayout::Single)
+            .unwrap();
+        // vox_offset = 0 in a single file means "right after the header".
+        LittleEndian::write_f32(&mut bytes[v1::VOX_OFFSET..v1::VOX_OFFSET + 4], 0.0);
+        // Wrong bitpix is ignored in favour of datatype.
+        LittleEndian::write_i16(&mut bytes[v1::BITPIX..v1::BITPIX + 2], 8);
         let parsed = NiftiHeader::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed.version, NiftiVersion::Nifti1);
-        assert_eq!(parsed.ndim, 3);
-        assert_eq!(parsed.dim[..3], [64, 64, 64]);
+        assert_eq!(parsed.vox_offset, 352);
+        assert_eq!(parsed.spacing(), vec![1.0, 1.0, 1.0]);
     }
 
     #[test]
-    fn test_nifti2_roundtrip() {
-        let header = NiftiHeader {
-            version: NiftiVersion::Nifti2,
-            ndim: 3,
-            dim: [100000, 100000, 100, 1, 1, 1, 1], // Exceeds NIfTI-1 limit
-            pixdim: [-1.0, 0.5, 0.5, 1.0, 0.0, 0.0, 0.0, 0.0],
-            vox_offset: 544,
-            ..Default::default()
-        };
+    fn corrupt_headers_are_rejected_with_clear_errors() {
+        let good = NiftiHeader::default()
+            .prepared_for_write(FileLayout::Single)
+            .encode(FileLayout::Single)
+            .unwrap();
 
-        assert!(header.requires_nifti2());
+        let mut b = good.clone();
+        b[v1::MAGIC..v1::MAGIC + 4].copy_from_slice(b"XYZ\0");
+        assert!(matches!(
+            NiftiHeader::from_bytes(&b),
+            Err(Error::InvalidMagic(_))
+        ));
 
-        let bytes = header.to_bytes_v2();
-        assert_eq!(bytes.len(), 540);
+        let mut b = good.clone();
+        b[v1::MAGIC..v1::MAGIC + 4].copy_from_slice(&[0; 4]);
+        let msg = NiftiHeader::from_bytes(&b).unwrap_err().to_string();
+        assert!(msg.contains("Analyze"), "{msg}");
 
+        let mut b = good.clone();
+        LittleEndian::write_i16(&mut b[v1::DATATYPE..v1::DATATYPE + 2], 128);
+        let msg = NiftiHeader::from_bytes(&b).unwrap_err().to_string();
+        assert!(msg.contains("DT_RGB24"), "{msg}");
+
+        let mut b = good.clone();
+        LittleEndian::write_i16(&mut b[v1::DIM + 2..v1::DIM + 4], -3);
+        assert!(NiftiHeader::from_bytes(&b).is_err());
+
+        let mut b = good.clone();
+        LittleEndian::write_f32(&mut b[v1::VOX_OFFSET..v1::VOX_OFFSET + 4], 352.5);
+        assert!(NiftiHeader::from_bytes(&b).is_err());
+
+        let mut b = good;
+        LittleEndian::write_f32(&mut b[v1::VOX_OFFSET..v1::VOX_OFFSET + 4], 100.0);
+        assert!(NiftiHeader::from_bytes(&b).is_err());
+
+        assert!(NiftiHeader::from_bytes(&[0x1f, 0x8b, 8, 0])
+            .unwrap_err()
+            .to_string()
+            .contains("gzip"));
+    }
+
+    #[test]
+    fn malformed_extensions_are_skipped_not_fatal() {
+        let h = rich_header(NiftiVersion::Nifti1).prepared_for_write(FileLayout::Single);
+        let mut bytes = h.encode(FileLayout::Single).unwrap();
+        // Corrupt the second extension's esize so it runs past vox_offset.
+        let second = 352 + h.extensions[0].encoded_size();
+        LittleEndian::write_i32(&mut bytes[second..second + 4], 10_000);
         let parsed = NiftiHeader::from_bytes(&bytes).unwrap();
-        assert_eq!(parsed.version, NiftiVersion::Nifti2);
-        assert_eq!(parsed.ndim, 3);
-        assert_eq!(parsed.dim[0], 100000);
-        assert_eq!(parsed.dim[1], 100000);
+        assert_eq!(parsed.extensions.len(), 1);
+        assert_eq!(parsed.extensions[0].ecode, 6);
     }
 
     #[test]
-    fn test_version_detection() {
-        // NIfTI-1 header starts with 348
-        let mut v1_bytes = vec![0u8; 348];
-        LittleEndian::write_i32(&mut v1_bytes[0..4], 348);
-        v1_bytes[344..348].copy_from_slice(b"n+1\0");
-        // Set minimal valid header fields
-        LittleEndian::write_i16(&mut v1_bytes[40..42], 3); // ndim
-        LittleEndian::write_i16(&mut v1_bytes[42..44], 10); // dim[0]
-        LittleEndian::write_i16(&mut v1_bytes[44..46], 10); // dim[1]
-        LittleEndian::write_i16(&mut v1_bytes[46..48], 10); // dim[2]
-        LittleEndian::write_i16(&mut v1_bytes[70..72], 16); // datatype = Float32
-        LittleEndian::write_i16(&mut v1_bytes[72..74], 32); // bitpix = 32 (4 bytes * 8)
-        LittleEndian::write_f32(&mut v1_bytes[80..84], 1.0); // pixdim[1]
-        LittleEndian::write_f32(&mut v1_bytes[84..88], 1.0); // pixdim[2]
-        LittleEndian::write_f32(&mut v1_bytes[88..92], 1.0); // pixdim[3]
-        LittleEndian::write_f32(&mut v1_bytes[108..112], 352.0); // vox_offset
-
-        let h1 = NiftiHeader::from_bytes(&v1_bytes).unwrap();
-        assert_eq!(h1.version, NiftiVersion::Nifti1);
-
-        // NIfTI-2 header starts with 540
-        let mut v2_bytes = vec![0u8; 540];
-        LittleEndian::write_i32(&mut v2_bytes[0..4], 540);
-        v2_bytes[4..12].copy_from_slice(b"n+2\0\r\n\x1a\n");
-        LittleEndian::write_i16(&mut v2_bytes[12..14], 16); // datatype = Float32
-        LittleEndian::write_i16(&mut v2_bytes[14..16], 32); // bitpix = 32 (4 bytes * 8)
-        LittleEndian::write_i64(&mut v2_bytes[16..24], 3); // ndim
-        LittleEndian::write_i64(&mut v2_bytes[24..32], 10); // dim[0]
-        LittleEndian::write_i64(&mut v2_bytes[32..40], 10); // dim[1]
-        LittleEndian::write_i64(&mut v2_bytes[40..48], 10); // dim[2]
-        LittleEndian::write_f64(&mut v2_bytes[112..120], 1.0); // pixdim[1]
-        LittleEndian::write_f64(&mut v2_bytes[120..128], 1.0); // pixdim[2]
-        LittleEndian::write_f64(&mut v2_bytes[128..136], 1.0); // pixdim[3]
-        LittleEndian::write_i64(&mut v2_bytes[168..176], 544); // vox_offset
-
-        let h2 = NiftiHeader::from_bytes(&v2_bytes).unwrap();
-        assert_eq!(h2.version, NiftiVersion::Nifti2);
-    }
-
-    #[test]
-    fn test_requires_nifti2() {
-        let mut header = NiftiHeader {
-            dim: [100, 100, 100, 1, 1, 1, 1],
+    fn strings_truncate_on_char_boundaries() {
+        let h = NiftiHeader {
+            intent_name: "é".repeat(10), // 20 bytes, field holds 16
             ..Default::default()
         };
-        assert!(!header.requires_nifti2());
+        let parsed = NiftiHeader::from_bytes(
+            &h.prepared_for_write(FileLayout::Single)
+                .encode(FileLayout::Single)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(parsed.intent_name, "é".repeat(8));
+    }
 
-        header.dim[0] = 50000; // Exceeds i16::MAX (32767)
-        assert!(header.requires_nifti2());
+    #[test]
+    fn spacing_follows_the_affine() {
+        let mut h = NiftiHeader::default();
+        h.set_affine(oblique());
+        let s = h.spacing();
+        assert!((s[0] - 1.5).abs() < 1e-12 && (s[1] - 2.0).abs() < 1e-12);
+        assert!((s[2] - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn invert_affine_roundtrips() {
+        let a = oblique();
+        let inv = invert_affine(&a).unwrap();
+        let id = matmul(&a, &inv);
+        let eye = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        assert_affine_close(&id, &eye, 1e-12);
+        assert!(invert_affine(&[[0.0; 4]; 4]).is_none());
     }
 }
