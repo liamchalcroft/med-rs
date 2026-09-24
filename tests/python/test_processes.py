@@ -39,6 +39,56 @@ def test_forked_children_can_run_parallel_work(tmp_path):
     assert np.isfinite(queue.get(timeout=5))
 
 
+def _jvol_sum(path):
+    return float(medrs.load(path).to_numpy().sum())
+
+
+def _jvol_files(tmp_path):
+    """Write chunked .jvol files, so encoding and decoding use the thread pool."""
+    paths = []
+    for i, quality in enumerate([80, None, 60, None]):
+        path = tmp_path / f"vol{i}.jvol"
+        image = medrs.NiftiImage(ramp((64, 64, 48)) + i)
+        image.save(path, quality=quality, chunk_shape=(32, 32, 16))
+        paths.append(path)
+    return paths
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="fork start method")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+@pytest.mark.filterwarnings("ignore:os.fork:RuntimeWarning")
+def test_forked_pool_loads_jvol_after_the_parent_did(tmp_path):
+    paths = _jvol_files(tmp_path)
+    expected = [_jvol_sum(p) for p in paths]  # the parent's thread pool is now running
+    with multiprocessing.get_context("fork").Pool(2) as pool:
+        # A deadlocked worker raises TimeoutError here instead of hanging.
+        sums = pool.map_async(_jvol_sum, paths * 2).get(timeout=60)
+    assert sums == expected * 2
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="fork start method")
+@pytest.mark.filterwarnings("ignore:This process .* is multi-threaded:DeprecationWarning")
+@pytest.mark.filterwarnings("ignore:os.fork:RuntimeWarning")
+def test_dataloader_workers_load_jvol_after_the_parent_did(tmp_path):
+    torch = pytest.importorskip("torch")
+    paths = _jvol_files(tmp_path)
+    expected = [_jvol_sum(p) for p in paths]
+
+    class Volumes(torch.utils.data.Dataset):
+        def __len__(self):
+            return len(paths)
+
+        def __getitem__(self, i):
+            return medrs.load(paths[i]).to_torch().double().sum()
+
+    loader = torch.utils.data.DataLoader(
+        Volumes(), batch_size=None, num_workers=2, multiprocessing_context="fork", timeout=60
+    )
+    for _ in range(2):  # a second epoch forks new workers
+        sums = [float(s) for s in loader]
+        assert sums == pytest.approx(expected, rel=1e-6)
+
+
 def test_thread_count_is_configurable():
     before = medrs.num_threads()
     medrs.set_num_threads(2)
