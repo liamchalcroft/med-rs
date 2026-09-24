@@ -64,7 +64,6 @@ known-first-party = ["medrs"]
 known-local-folder = ["conftest"]
 
 [tool.mypy]
-python_version = "3.10"
 strict = true
 files = ["python/medrs"]
 

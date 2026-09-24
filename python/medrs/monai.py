@@ -24,6 +24,7 @@ from collections.abc import Sequence
 from typing import Any, Literal
 
 import numpy as np
+import numpy.typing as npt
 from monai.data import ImageReader
 from monai.utils import SpaceKeys, ensure_tuple
 
@@ -62,7 +63,7 @@ class MedrsReader(ImageReader):  # type: ignore[misc]  # MONAI is untyped
 
     def get_data(
         self, img: medrs.NiftiImage | Sequence[medrs.NiftiImage]
-    ) -> tuple[np.ndarray, dict[str, Any]]:
+    ) -> tuple[npt.NDArray[Any], dict[str, Any]]:
         images = ensure_tuple(img)
         meta = self._meta(images[0])
         for other in images[1:]:
@@ -101,7 +102,7 @@ class MedrsReader(ImageReader):  # type: ignore[misc]  # MONAI is untyped
         }
 
 
-def _writable_c_array(image: medrs.NiftiImage) -> np.ndarray:
+def _writable_c_array(image: medrs.NiftiImage) -> npt.NDArray[Any]:
     """The image's voxels as a writable, C-contiguous array.
 
     MONAI wraps reader output in tensors that transforms may modify in place,
