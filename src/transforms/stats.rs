@@ -4,7 +4,8 @@ use rayon::prelude::*;
 
 const CHUNK: usize = 1 << 16;
 
-/// Count, mean, and sum of squared deviations (Welford / Chan et al.).
+/// Count, mean, and sum of squared deviations, merged with Chan et al.'s
+/// pairwise update.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub(crate) struct Moments {
     pub n: f64,
@@ -13,13 +14,6 @@ pub(crate) struct Moments {
 }
 
 impl Moments {
-    fn push(&mut self, x: f64) {
-        self.n += 1.0;
-        let delta = x - self.mean;
-        self.mean += delta / self.n;
-        self.m2 += delta * (x - self.mean);
-    }
-
     fn merge(a: Self, b: Self) -> Self {
         if a.n == 0.0 {
             return b;
@@ -54,13 +48,26 @@ where
     crate::parallel::install(|| {
         data.par_chunks(CHUNK)
             .map(|chunk| {
-                let mut m = Moments::default();
-                for &v in chunk {
-                    if let Some(x) = f(v) {
-                        m.push(f64::from(x));
-                    }
+                // Two passes over a cache-sized chunk: the sum, then squared
+                // deviations from the chunk mean. Chunks merge exactly below.
+                let (n, sum) = chunk.iter().fold((0u64, 0f64), |(n, s), &v| match f(v) {
+                    Some(x) => (n + 1, s + f64::from(x)),
+                    None => (n, s),
+                });
+                if n == 0 {
+                    return Moments::default();
                 }
-                m
+                let mean = sum / n as f64;
+                let m2 = chunk
+                    .iter()
+                    .filter_map(|&v| f(v))
+                    .map(|x| (f64::from(x) - mean).powi(2))
+                    .sum();
+                Moments {
+                    n: n as f64,
+                    mean,
+                    m2,
+                }
             })
             .reduce(Moments::default, Moments::merge)
     })

@@ -32,7 +32,7 @@ pub(crate) mod sealed {
         fn to_f64(self) -> f64;
         /// Convert to `f32`.
         fn to_f32(self) -> f32;
-        /// Convert from `f64`: integers round to nearest and saturate, NaN
+        /// Convert from `f64`: integers round half to even and saturate, NaN
         /// becomes 0.
         fn from_f64(v: f64) -> Self;
     }
@@ -68,8 +68,9 @@ macro_rules! impl_int_element {
             }
             #[inline]
             fn from_f64(v: f64) -> Self {
-                // `as` saturates and maps NaN to 0.
-                v.round() as $ty
+                // Round half to even (like `numpy.rint`); `as` saturates and
+                // maps NaN to 0.
+                v.round_ties_even() as $ty
             }
         }
     };
@@ -369,7 +370,7 @@ pub(crate) fn is_fortran<T>(a: &ArrayD<T>) -> bool {
 }
 
 /// Copy `a` into Fortran order unless it already is (then it is moved).
-pub(crate) fn into_fortran<T: Clone>(a: ArrayD<T>) -> ArrayD<T> {
+pub(crate) fn into_fortran<T: Clone + Default>(a: ArrayD<T>) -> ArrayD<T> {
     if is_fortran(&a) {
         a
     } else {
@@ -378,11 +379,16 @@ pub(crate) fn into_fortran<T: Clone>(a: ArrayD<T>) -> ArrayD<T> {
 }
 
 /// Copy any view into a new Fortran-ordered array.
-pub(crate) fn to_fortran<T: Clone>(view: &ArrayViewD<'_, T>) -> ArrayD<T> {
-    // Iterating the transposed view in logical order visits the elements with
-    // the first axis varying fastest, which is exactly Fortran order.
-    let data: Vec<T> = view.t().iter().cloned().collect();
-    fortran_from_vec(view.shape(), data)
+pub(crate) fn to_fortran<T: Clone + Default>(view: &ArrayViewD<'_, T>) -> ArrayD<T> {
+    if view.t().is_standard_layout() {
+        // Already Fortran-contiguous: a straight copy keeps the layout.
+        return view.to_owned();
+    }
+    // `assign` walks the output in memory order with tight strided inner
+    // loops, far faster than collecting a generic element iterator.
+    let mut out = ArrayD::from_elem(IxDyn(view.shape()).f(), T::default());
+    out.assign(view);
+    out
 }
 
 /// Build a Fortran-ordered array from data already in Fortran order.
@@ -670,7 +676,8 @@ mod tests {
         assert_eq!(as_f32, vec![9.223_372e18]);
         assert_eq!(<u8 as sealed::Sealed>::from_f64(f64::NAN), 0);
         assert_eq!(<i16 as sealed::Sealed>::from_f64(1e9), i16::MAX);
-        assert_eq!(<i16 as sealed::Sealed>::from_f64(-2.5), -3);
+        assert_eq!(<i16 as sealed::Sealed>::from_f64(-2.5), -2);
+        assert_eq!(<i16 as sealed::Sealed>::from_f64(3.5), 4);
     }
 
     #[test]

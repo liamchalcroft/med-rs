@@ -48,25 +48,41 @@ fn zstd_decompress(frame: &[u8], len: usize) -> Result<Vec<u8>> {
 
 /// Transpose `[element][byte]` into `[byte][element]`.
 fn shuffle(data: &[u8], width: usize) -> Vec<u8> {
-    let n = data.len() / width;
-    let mut out = vec![0u8; data.len()];
-    for (i, element) in data.chunks_exact(width).enumerate() {
-        for (b, &byte) in element.iter().enumerate() {
-            out[b * n + i] = byte;
+    fn run<const W: usize>(data: &[u8]) -> Vec<u8> {
+        let n = data.len() / W;
+        let mut out = vec![0u8; data.len()];
+        for (i, element) in data.chunks_exact(W).enumerate() {
+            for b in 0..W {
+                out[b * n + i] = element[b];
+            }
         }
+        out
     }
-    out
+    match width {
+        2 => run::<2>(data),
+        4 => run::<4>(data),
+        8 => run::<8>(data),
+        _ => data.to_vec(),
+    }
 }
 
 fn unshuffle(data: &[u8], width: usize) -> Vec<u8> {
-    let n = data.len() / width;
-    let mut out = vec![0u8; data.len()];
-    for (i, element) in out.chunks_exact_mut(width).enumerate() {
-        for (b, byte) in element.iter_mut().enumerate() {
-            *byte = data[b * n + i];
+    fn run<const W: usize>(data: &[u8]) -> Vec<u8> {
+        let n = data.len() / W;
+        let mut out = vec![0u8; data.len()];
+        for (i, element) in out.chunks_exact_mut(W).enumerate() {
+            for b in 0..W {
+                element[b] = data[b * n + i];
+            }
         }
+        out
     }
-    out
+    match width {
+        2 => run::<2>(data),
+        4 => run::<4>(data),
+        8 => run::<8>(data),
+        _ => data.to_vec(),
+    }
 }
 
 fn read_uint(bytes: &[u8]) -> u64 {
@@ -75,31 +91,50 @@ fn read_uint(bytes: &[u8]) -> u64 {
     u64::from_le_bytes(v)
 }
 
-fn write_uint(bytes: &mut [u8], v: u64) {
-    let n = bytes.len();
-    bytes.copy_from_slice(&v.to_le_bytes()[..n]);
+/// Apply `f(previous, current) -> new` along each row of `row` elements,
+/// treating elements as little-endian unsigned integers of their width.
+macro_rules! delta_rows {
+    ($data:expr, $width:expr, $row:expr, |$prev:ident, $cur:ident| $update:expr, $next_prev:expr) => {
+        match $width {
+            1 => delta_rows!(@ u8, $data, $row, |$prev, $cur| $update, $next_prev),
+            2 => delta_rows!(@ u16, $data, $row, |$prev, $cur| $update, $next_prev),
+            4 => delta_rows!(@ u32, $data, $row, |$prev, $cur| $update, $next_prev),
+            _ => delta_rows!(@ u64, $data, $row, |$prev, $cur| $update, $next_prev),
+        }
+    };
+    (@ $t:ty, $data:expr, $row:expr, |$prev:ident, $cur:ident| $update:expr, $next_prev:expr) => {{
+        const W: usize = std::mem::size_of::<$t>();
+        for r in $data.chunks_exact_mut($row * W) {
+            let mut $prev: $t = 0;
+            for e in r.chunks_exact_mut(W) {
+                let $cur = <$t>::from_le_bytes(e.try_into().unwrap_or([0; W]));
+                let new: $t = $update;
+                e.copy_from_slice(&new.to_le_bytes());
+                $prev = $next_prev(new, $cur);
+            }
+        }
+    }};
 }
 
 /// Replace each element with its difference from the previous one along x.
 fn delta_encode(data: &mut [u8], width: usize, row: usize) {
-    for r in data.chunks_exact_mut(row * width) {
-        let mut prev = 0u64;
-        for e in r.chunks_exact_mut(width) {
-            let v = read_uint(e);
-            write_uint(e, v.wrapping_sub(prev));
-            prev = v;
-        }
-    }
+    delta_rows!(
+        data,
+        width,
+        row,
+        |prev, cur| cur.wrapping_sub(prev),
+        |_new, cur| cur
+    );
 }
 
 fn delta_decode(data: &mut [u8], width: usize, row: usize) {
-    for r in data.chunks_exact_mut(row * width) {
-        let mut prev = 0u64;
-        for e in r.chunks_exact_mut(width) {
-            prev = prev.wrapping_add(read_uint(e));
-            write_uint(e, prev);
-        }
-    }
+    delta_rows!(
+        data,
+        width,
+        row,
+        |prev, cur| prev.wrapping_add(cur),
+        |new, _cur| new
+    );
 }
 
 fn is_constant(data: &[u8], width: usize) -> bool {

@@ -404,7 +404,7 @@ impl NiftiImage {
     }
 
     /// Voxel values with scaling applied, converted to `T` (integers are
-    /// rounded to nearest and saturated; NaN becomes 0).
+    /// rounded half to even and saturated; NaN becomes 0).
     pub fn to_scaled<T: NiftiElement>(&self) -> Result<ArrayD<T>> {
         let (slope, inter) = self.header.scaling();
         let v = dispatch_dtype!(self.dtype(), S => scaled_as::<S, T>(&self.elements::<S>()?, slope, inter));
@@ -615,7 +615,7 @@ mod tests {
                 .unwrap()
                 .as_slice_memory_order()
                 .unwrap(),
-            &[0, 0, 3, 255]
+            &[0, 0, 2, 255]
         );
         let bf = img.with_dtype(DataType::BFloat16).unwrap();
         assert_eq!(bf.header().datatype, DataType::BFloat16);

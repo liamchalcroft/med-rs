@@ -1,13 +1,13 @@
 [package]
 name = "medrs"
-version = "0.3.0"
-edition = "2021"
-rust-version = "1.83"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Fast medical image I/O, transforms, and training patch loading (NIfTI, crop-first reads, parallel gzip)"
-license = "MIT OR Apache-2.0"
-repository = "https://github.com/liamchalcroft/med-rs"
+license.workspace = true
+repository.workspace = true
 documentation = "https://docs.rs/medrs"
-authors = ["Liam Chalcroft <liam.chalcroft.20@ucl.ac.uk>"]
+authors.workspace = true
 keywords = ["medical-imaging", "nifti", "neuroimaging", "deep-learning", "mri"]
 categories = ["science", "encoding", "multimedia::images"]
 readme = "README.md"
@@ -54,6 +54,14 @@ workspace = true
 [workspace]
 members = [".", "python"]
 resolver = "2"
+
+[workspace.package]
+version = "0.3.0"
+edition = "2021"
+rust-version = "1.83"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/liamchalcroft/med-rs"
+authors = ["Liam Chalcroft <liam.chalcroft.20@ucl.ac.uk>"]
 
 [workspace.lints.rust]
 missing_docs = "warn"

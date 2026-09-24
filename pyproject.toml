@@ -1,147 +1,69 @@
 [build-system]
-requires = ["maturin>=1.4,<2.0"]
+requires = ["maturin>=1.8,<2"]
 build-backend = "maturin"
 
 [project]
 name = "medrs"
-version = "0.2.0"
-description = "Ultra-high-performance medical imaging I/O for deep learning"
+dynamic = ["version"]
+description = "Fast medical image I/O, transforms, and training patch loading"
 readme = "README.md"
-license = { text = "MIT OR Apache-2.0" }
-authors = [
-    { name = "Liam Chalcroft", email = "liam.chalcroft.20@ucl.ac.uk" }
-]
-maintainers = [
-    { name = "Liam Chalcroft", email = "liam.chalcroft.20@ucl.ac.uk" }
-]
-homepage = "https://github.com/liamchalcroft/med-rs"
-repository = "https://github.com/liamchalcroft/med-rs"
-documentation = "https://medrs.readthedocs.io"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "Liam Chalcroft", email = "liam.chalcroft.20@ucl.ac.uk" }]
 requires-python = ">=3.10"
+keywords = ["medical-imaging", "nifti", "neuroimaging", "deep-learning", "pytorch", "monai"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "Intended Audience :: Healthcare Industry",
-    "License :: OSI Approved :: MIT License",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
-    "Topic :: Scientific/Engineering :: Medical Science Apps.",
     "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Typing :: Typed",
 ]
-keywords = ["medical-imaging", "nifti", "neuroimaging", "deep-learning", "pytorch", "jax", "monai"]
-dependencies = [
-    "numpy>=1.25.0",
-]
+dependencies = ["numpy>=1.24"]
 
 [project.optional-dependencies]
-dev = [
-    "pytest>=7.0",
-    "pytest-benchmark>=4.0",
-    "psutil>=5.9",
-    "nibabel>=5.0",
-    "torch>=2.0",
-    "monai>=1.5",
-    "jax>=0.4",
-    "jaxlib>=0.4",
-    "hypothesis>=6.0",
-]
-monai = [
-    "monai>=1.5",
-    "torch>=2.0",
-    "nibabel>=5.0",
-]
-jax = [
-    "jax>=0.4",
-    "jaxlib>=0.4",
-]
-torch = [
-    "torch>=2.0",
-]
-examples = [
-    "torch>=2.0",
-    "monai>=1.5",
-    "nibabel>=5.0",
-    "jax>=0.4",
-    "torchio>=0.20",
-    "matplotlib>=3.5",
-]
-docs = [
-    "sphinx>=7.0",
-    "sphinx-rtd-theme>=1.3",
-    "sphinx-tabs>=3.4",
-    "sphinx-copybutton>=0.5",
-    "sphinx-design>=0.5",
-    "myst-parser>=2.0",
-    "sphinx-autodoc-typehints>=1.24",
-    "numpy>=1.25.0",
-]
-test = [
-    "pytest>=7.0",
-    "pytest-benchmark>=4.0",
-    "pytest-xdist>=3.0",
-    "psutil>=5.9",
-    "nibabel>=5.0",
-    "hypothesis>=6.0",
-]
+monai = ["monai>=1.3"]
+test = ["pytest>=8", "nibabel>=5"]
 
 [project.urls]
-"Homepage" = "https://github.com/liamchalcroft/med-rs"
-"Documentation" = "https://medrs.readthedocs.io"
-"Repository" = "https://github.com/liamchalcroft/med-rs"
-"Bug Tracker" = "https://github.com/liamchalcroft/med-rs/issues"
+Repository = "https://github.com/liamchalcroft/med-rs"
+Documentation = "https://github.com/liamchalcroft/med-rs/tree/main/docs"
+Changelog = "https://github.com/liamchalcroft/med-rs/blob/main/CHANGELOG.md"
+
+[project.scripts]
+medrs = "medrs.cli:main"
 
 [tool.maturin]
-features = ["python"]
+manifest-path = "python/Cargo.toml"
+python-source = "python"
 module-name = "medrs._medrs"
-python-source = "src/python"
+features = ["pyo3/extension-module"]
 
 [tool.pytest.ini_options]
-minversion = "7.0"
-addopts = "-ra -q --strict-markers --strict-config"
-testpaths = ["tests"]
-python_files = ["test_*.py", "*_test.py"]
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "integration: marks tests as integration tests",
-    "benchmark: marks tests as benchmarks",
-]
-
-[tool.coverage.run]
-source = ["src/python"]
-omit = ["*/tests/*", "*/test_*"]
-
-[tool.black]
-line-length = 100
-target-version = ['py310', 'py311', 'py312']
-
-[tool.isort]
-profile = "black"
-line_length = 100
-
-[tool.mypy]
-python_version = "3.10"
-ignore_missing_imports = true
+testpaths = ["tests/python"]
+addopts = ["-ra", "--strict-markers"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py310"
 
 [tool.ruff.lint]
-select = ["E", "F", "W"]
-ignore = [
-    "E501",  # Line too long (handled by formatter)
-    "F841",  # Local variable assigned but never used (intentional in tests)
-    "E402",  # Module level import not at top (intentional for conditional imports)
-    "E722",  # Bare except (used in availability checks)
-]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PT"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["F401", "F841"]  # Unused imports/vars in tests are intentional
-"benchmarks/*" = ["F401", "F841"]  # Unused imports/vars in benchmarks are intentional
-"examples/*" = ["F401", "F841"]  # Unused imports/vars in examples are intentional
-"src/python/medrs/*" = ["F401"]  # Unused imports for availability checking are intentional
+"*.pyi" = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["medrs"]
+known-local-folder = ["conftest"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["python/medrs"]
+
+[[tool.mypy.overrides]]
+module = ["monai.*"]
+ignore_missing_imports = true

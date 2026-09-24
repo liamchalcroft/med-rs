@@ -1,1 +1,1 @@
-doc-valid-idents = ["NIfTI", "PyTorch", "DataLoader", "MONAI", "SimpleITK", "TorchIO", "..", "BFloat16"]
+doc-valid-idents = ["NIfTI", "NumPy", "JAX", "PyTorch", "DataLoader", "MONAI", "SimpleITK", "TorchIO", "..", "BFloat16"]

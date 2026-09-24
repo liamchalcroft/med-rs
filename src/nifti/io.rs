@@ -96,8 +96,8 @@ fn pair_partner(path: &Path, to: &str) -> PathBuf {
 // `stem_and_gz` lower-cases the name, so these comparisons ignore case.
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn detect_format(path: &Path) -> Format {
-    let (stem, _) = stem_and_gz(path);
-    if stem.ends_with(".jvol") {
+    let (stem, gz) = stem_and_gz(path);
+    if stem.ends_with(".jvol") && !gz {
         Format::Jvol
     } else if stem.ends_with(".hdr") {
         Format::Pair {
@@ -783,6 +783,45 @@ pub fn save_with_options<P: AsRef<Path>>(
     }
 }
 
+/// Encode an image as the bytes of a `.nii` file, gzip-compressed when
+/// `gzip_level` is given (0 to 9).
+pub fn to_bytes(image: &NiftiImage, gzip_level: Option<u32>) -> Result<Vec<u8>> {
+    let header = image.header().prepared_for_write(FileLayout::Single);
+    header.validate()?;
+    let prefix = header.encode(FileLayout::Single)?;
+    let data = image.data_bytes_le()?;
+    if let Some(level) = gzip_level {
+        let options = GzipOptions {
+            level,
+            mgzip: false,
+            threads: 0,
+        };
+        return gzip::compress_to(&[&prefix, &data], Vec::new(), options);
+    }
+    let mut out = prefix;
+    out.extend_from_slice(&data);
+    Ok(out)
+}
+
+/// Decode the bytes of a `.nii` or `.nii.gz` file.
+pub fn from_bytes(bytes: Vec<u8>) -> Result<NiftiImage> {
+    let bytes = if gzip::is_gzip(&bytes) {
+        gzip::decompress(&bytes)?
+    } else {
+        bytes
+    };
+    let buf = Buffer::Heap(Arc::new(bytes));
+    let (header, layout) = NiftiHeader::parse(&buf)?;
+    if layout == FileLayout::Pair {
+        return Err(Error::InvalidFileFormat(
+            "the bytes hold a two-file (.hdr/.img) header without voxel data".into(),
+        ));
+    }
+    let offset = usize::try_from(header.vox_offset)
+        .map_err(|_| Error::InvalidFileFormat("invalid vox_offset".into()))?;
+    NiftiImage::from_raw(header, buf, offset)
+}
+
 #[cfg(feature = "jvol")]
 fn save_jvol(image: &NiftiImage, path: &Path) -> Result<()> {
     crate::jvol::save(image, path, &crate::jvol::JvolOptions::default())
@@ -873,32 +912,6 @@ pub fn is_mgzip<P: AsRef<Path>>(path: P) -> Result<bool> {
     Ok(gzip::block_format(&head[..n]).is_some())
 }
 
-/// `<name>.mgz.nii.gz` next to `input`.
-fn mgzip_name(input: &Path) -> PathBuf {
-    let name = input
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let lower = name.to_ascii_lowercase();
-    let stem = [".nii.gz", ".nii", ".gz"]
-        .iter()
-        .find_map(|ext| lower.strip_suffix(ext).map(|s| &name[..s.len()]))
-        .unwrap_or(&name);
-    input.with_file_name(format!("{stem}.mgz.nii.gz"))
-}
-
-/// Re-save a `NIfTI` file as Mgzip for parallel decompression.
-///
-/// Without `output`, writes `<name>.mgz.nii.gz` next to the input (still a
-/// valid `.nii.gz` for every reader). Returns the output path.
-pub fn convert_to_mgzip<P: AsRef<Path>>(input: P, output: Option<&Path>) -> Result<PathBuf> {
-    let input = input.as_ref();
-    let output = output.map_or_else(|| mgzip_name(input), Path::to_path_buf);
-    let image = load(input)?;
-    save_mgzip(&image, &output)?;
-    Ok(output)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -967,14 +980,14 @@ mod tests {
     }
 
     #[test]
-    fn mgzip_roundtrip_detection_and_conversion() {
+    fn mgzip_roundtrip_and_detection() {
         let dir = tempdir().unwrap();
         let img = NiftiImage::from_array(ramp(&[64, 64, 80]), affine()).unwrap();
         let path = dir.path().join("x.nii.gz");
         save(&img, &path).unwrap();
         assert!(!is_mgzip(&path).unwrap());
-        let out = convert_to_mgzip(&path, None).unwrap();
-        assert_eq!(out, dir.path().join("x.mgz.nii.gz"));
+        let out = dir.path().join("x.mgz.nii.gz");
+        save_mgzip(&load(&path).unwrap(), &out).unwrap();
         assert!(is_mgzip(&out).unwrap());
         assert_eq!(load(&out).unwrap().to_f32().unwrap(), img.to_f32().unwrap());
     }
@@ -1117,6 +1130,18 @@ mod tests {
             load_cached(&path).unwrap().to_f32().unwrap(),
             img2.to_f32().unwrap()
         );
+    }
+
+    #[test]
+    fn in_memory_roundtrip() {
+        let mut img = NiftiImage::from_array(ramp(&[5, 4, 3]), affine()).unwrap();
+        img.header_mut().descrip = "bytes".into();
+        for level in [None, Some(1)] {
+            let back = from_bytes(to_bytes(&img, level).unwrap()).unwrap();
+            assert_eq!(back.to_f32().unwrap(), img.to_f32().unwrap());
+            assert_eq!(back.header().descrip, "bytes");
+        }
+        assert!(from_bytes(b"nonsense".to_vec()).is_err());
     }
 
     #[test]

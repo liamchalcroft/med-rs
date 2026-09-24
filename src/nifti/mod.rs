@@ -16,7 +16,7 @@ pub use header::{
 };
 pub use image::{HeaderMut, NiftiImage};
 pub use io::{
-    cache_usage, clear_decompression_cache, convert_to_mgzip, is_mgzip, load, load_cached,
-    load_cropped, load_header, load_multi, save, save_mgzip, save_with_options,
-    set_cache_max_bytes, set_cache_size, SaveOptions, DEFAULT_CACHE_BYTES, DEFAULT_CACHE_ENTRIES,
+    cache_usage, clear_decompression_cache, from_bytes, is_mgzip, load, load_cached, load_cropped,
+    load_header, load_multi, save, save_mgzip, save_with_options, set_cache_max_bytes,
+    set_cache_size, to_bytes, SaveOptions, DEFAULT_CACHE_BYTES, DEFAULT_CACHE_ENTRIES,
 };

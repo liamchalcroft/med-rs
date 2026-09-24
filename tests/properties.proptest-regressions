@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a103aa67a8f2cf9073946eb4115deadd74e4b3d2339a558474f3a6c4f9ee85d9 # shrinks to shape = [2, 1], target = Orientation([A, S, R])
+cc dc22db9296eb63f6b0ac5ed922b899a65db700f6de91b6833046720573ee68db # shrinks to shape = [2, 2, 2], fractions = [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0)], name = "x.nii"

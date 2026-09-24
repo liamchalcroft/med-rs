@@ -175,10 +175,10 @@ impl std::str::FromStr for DataType {
             "u32" | "uint32" => Self::UInt32,
             "i64" | "int64" => Self::Int64,
             "u64" | "uint64" => Self::UInt64,
-            "f16" | "float16" | "half" => Self::Float16,
+            "f16" | "float16" => Self::Float16,
             "bf16" | "bfloat16" => Self::BFloat16,
-            "f32" | "float32" | "float" => Self::Float32,
-            "f64" | "float64" | "double" => Self::Float64,
+            "f32" | "float32" => Self::Float32,
+            "f64" | "float64" => Self::Float64,
             _ => {
                 return Err(Error::InvalidArgument(format!(
                     "unknown data type '{s}' (expected one of uint8, int8, int16, uint16, \
