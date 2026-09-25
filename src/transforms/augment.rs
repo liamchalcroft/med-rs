@@ -9,7 +9,7 @@ use super::spatial::{flip, rotate_90};
 use crate::error::{Error, Result};
 use crate::nifti::element::{fortran_from_vec, ArrayData};
 use crate::nifti::NiftiImage;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rand_distr::StandardNormal;
 use rayon::prelude::*;

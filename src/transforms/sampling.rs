@@ -9,7 +9,7 @@ use super::geometry::split_shape;
 use crate::error::{Error, Result};
 use crate::nifti::element::dispatch_dtype;
 use crate::nifti::NiftiImage;
-use rand::Rng;
+use rand::{Rng, RngExt};
 use rayon::prelude::*;
 
 /// A box of voxels: `shape` voxels starting at `offset` along the first three

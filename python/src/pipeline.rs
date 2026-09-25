@@ -235,7 +235,7 @@ impl PyPipeline {
         label: Option<&PyNiftiImage>,
         seed: Option<u64>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        let mut rng = seed.map_or_else(ChaCha8Rng::from_os_rng, ChaCha8Rng::seed_from_u64);
+        let mut rng = seed.map_or_else(rand::make_rng::<ChaCha8Rng>, ChaCha8Rng::seed_from_u64);
         let pipeline = &self.inner;
         match label {
             None => {
