@@ -69,12 +69,12 @@ jobs:
         run: cargo run --example preprocess --locked -- tests/fixtures/mprage_img.nii.gz "$RUNNER_TEMP/out.nii.gz"
 
   msrv:
-    name: Rust 1.83 (MSRV)
+    name: Rust 1.85 (MSRV)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: dtolnay/rust-toolchain@1.85.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-features --locked
 

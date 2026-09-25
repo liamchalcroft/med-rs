@@ -13,11 +13,11 @@ crate-type = ["cdylib"]
 [dependencies]
 half = "2.4"
 medrs = { path = "..", features = ["jvol"] }
-ndarray = "0.16"
+ndarray = "0.17"
 numpy = { version = "0.29", features = ["half"] }
 pyo3 = { version = "0.29", features = ["abi3-py310"] }
-rand = "0.9"
-rand_chacha = "0.9"
+rand = "0.10"
+rand_chacha = "0.10"
 
 [lints]
 workspace = true

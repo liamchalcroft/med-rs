@@ -50,7 +50,7 @@ use crate::transforms::{
     add_noise, adjust_gamma, crop_or_pad, orientation_from_affine, reorient_plan, sample_gamma,
     scale_map, shift_map, z_normalization_nonzero, Interpolation, Orientation,
 };
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 /// An ordered list of transforms, applied with fused passes.
 #[derive(Debug, Clone, Default, PartialEq)]

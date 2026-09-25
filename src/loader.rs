@@ -48,7 +48,7 @@ use crate::transforms::{crop, crop_or_pad, random_region, ForegroundSampler, Reg
 use rand::distr::weighted::WeightedIndex;
 use rand::distr::Distribution;
 use rand::seq::SliceRandom;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;

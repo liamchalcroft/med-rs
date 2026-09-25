@@ -21,10 +21,10 @@ gzp = { version = "2.0.4", default-features = false, features = ["deflate_zlib_n
 half = { version = "2.4", features = ["bytemuck"] }
 libdeflater = "1.25"
 memmap2 = "0.9.11"
-ndarray = "0.16"
-rand = "0.9"
-rand_chacha = "0.9"
-rand_distr = "0.5"
+ndarray = "0.17"
+rand = "0.10"
+rand_chacha = "0.10"
+rand_distr = "0.6"
 rayon = "1.10"
 thiserror = "2.0"
 zstd = { version = "0.13", optional = true }
@@ -58,7 +58,7 @@ resolver = "2"
 [workspace.package]
 version = "0.3.0"
 edition = "2021"
-rust-version = "1.83"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/liamchalcroft/med-rs"
 authors = ["Liam Chalcroft <liam.chalcroft.20@ucl.ac.uk>"]

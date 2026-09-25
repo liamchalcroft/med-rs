@@ -20,7 +20,7 @@ please include the output of `medrs info` for it.
 
 ## Setup
 
-You need a Rust toolchain (1.83 or newer) and Python 3.10 or newer.
+You need a Rust toolchain (1.85 or newer) and Python 3.10 or newer.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate

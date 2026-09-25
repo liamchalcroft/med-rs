@@ -4,6 +4,9 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    ignore:
+      # Its ref names the Rust toolchain, which CI pins on purpose.
+      - dependency-name: dtolnay/rust-toolchain
     groups:
       actions:
         patterns: ["*"]
@@ -12,7 +15,13 @@ updates:
     directory: /
     schedule:
       interval: monthly
+    # A dependency joins the first group that matches it. The first two
+    # groups hold crates that only build when updated together.
     groups:
+      rand:
+        patterns: ["rand", "rand_*"]
+      python-bindings:
+        patterns: ["pyo3", "numpy"]
       cargo:
         patterns: ["*"]
         update-types: [minor, patch]
