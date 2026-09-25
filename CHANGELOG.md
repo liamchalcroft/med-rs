@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.3.0 (2026-09-24)
+## 0.3.0 (2026-09-25)
 
 A rewrite focused on correctness, with a smaller, consistent API. The previous
 release silently produced wrong results in several common cases (listed
