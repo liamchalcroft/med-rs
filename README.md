@@ -143,6 +143,8 @@ smaller and supports crop-first reads.
 - [Rust API](https://docs.rs/medrs), including the `.jvol` file format
 - [Changelog](https://medrs.readthedocs.io/en/stable/changelog/)
 
+Research context and related libraries: [medical imaging software](https://liamchalcroft.com/software/).
+
 ## Contributing
 
 See [CONTRIBUTING.md](https://github.com/liamchalcroft/med-rs/blob/main/CONTRIBUTING.md).
