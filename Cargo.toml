@@ -30,7 +30,7 @@ thiserror = "2.0"
 zstd = { version = "0.13", optional = true }
 
 [dev-dependencies]
-criterion = "0.7"
+criterion = "0.8"
 proptest = "1.5"
 tempfile = "3.14"
 
